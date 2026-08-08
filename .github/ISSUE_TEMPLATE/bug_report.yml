@@ -1,0 +1,40 @@
+name: Bug report
+description: A wrong answer, a crash, or a resolution that should have succeeded
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For anything security-sensitive, please use a
+        [private advisory](https://github.com/sylvinus/recursive-resolver/security/advisories/new)
+        instead of a public issue.
+  - type: input
+    id: domain
+    attributes:
+      label: Domain and record type
+      description: The exact query, so the behaviour can be reproduced.
+      placeholder: "s1._domainkey.example.com TXT"
+    validations:
+      required: true
+  - type: textarea
+    id: trace
+    attributes:
+      label: Delegation trace
+      description: Output of `recursive-resolver --trace <domain> <type>`. This is usually enough to diagnose the problem on its own.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected versus actual
+      description: What you expected, what happened, and what a reference resolver says (`dig +dnssec <domain> <type>`).
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `recursive-resolver --version` and your Python version.
+    validations:
+      required: true

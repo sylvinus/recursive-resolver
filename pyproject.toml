@@ -5,36 +5,55 @@ build-backend = "hatchling.build"
 [project]
 name = "recursive-resolver"
 version = "0.1.0"
-description = "Pure-Python DNS recursive resolver — iterates from root servers, bypassing all caches"
+description = "Pure-Python iterative DNS resolver: resolves from the root servers with DNSSEC validation"
 readme = "README.md"
 license = "MIT"
+license-files = ["LICENSE", "THIRD-PARTY.md"]
 requires-python = ">=3.10"
 authors = [
     { name = "Sylvain Zimmer", email = "sylvain@sylvainzimmer.com" },
 ]
-keywords = ["dns", "resolver", "recursive", "nameserver", "iterative", "root-servers"]
+keywords = ["dns", "resolver", "recursive", "nameserver", "iterative", "root-servers", "dnssec", "dkim"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: System Administrators",
-    "License :: OSI Approved :: MIT License",
+    # No "License ::" classifier: PEP 639 deprecates them in favour of the
+    # `license = "MIT"` expression above, which PyPI reads instead.
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Internet :: Name Service (DNS)",
     "Topic :: System :: Networking",
+    "Topic :: Security",
     "Typing :: Typed",
 ]
 dependencies = [
-    "dnspython>=2.6",
+    # >=2.6.1 is a security floor: 2.6.0 and earlier are affected by
+    # CVE-2023-29483 (TuDoor), and 2.6.0 additionally regressed truncation
+    # handling, which breaks UDP->TCP failover. 2.7.0 is the first release
+    # with the EDNS and DNSSEC behaviour this package relies on; 2.8.0 (Sep 2025)
+    # is the current release and there are no advisories after 2.6.1.
+    # The dnssec extra pulls in `cryptography` (DNSSEC validation) and the
+    # idna extra pulls in `idna` (IDNA 2008; without it, internationalised
+    # names fall back to IDNA 2003 and resolve to different domains).
+    "dnspython[dnssec,idna]>=2.8.0",
 ]
+
+[project.optional-dependencies]
+# Kept as an explicit extra so `pip install recursive-resolver[dnssec]` works
+# for anyone pinning the base dnspython without extras.
+dnssec = ["cryptography>=42"]
 
 [project.urls]
 Homepage = "https://github.com/sylvinus/recursive-resolver"
 Repository = "https://github.com/sylvinus/recursive-resolver"
 Issues = "https://github.com/sylvinus/recursive-resolver/issues"
+Changelog = "https://github.com/sylvinus/recursive-resolver/blob/main/CHANGELOG.md"
 
 [project.scripts]
 recursive-resolver = "recursive_resolver.cli:main"
@@ -50,10 +69,40 @@ dev = [
 [tool.hatch.build.targets.wheel]
 packages = ["src/recursive_resolver"]
 
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/tests",
+    "/scripts",
+    "/README.md",
+    "/LICENSE",
+    "/CHANGELOG.md",
+    "/SECURITY.md",
+    "/CONTRIBUTING.md",
+    "/THIRD-PARTY.md",
+    "/Makefile",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "--strict-markers --strict-config -ra"
 markers = [
     "integration: marks tests that require network access (deselect with '-m \"not integration\"')",
+]
+filterwarnings = ["error"]
+
+[tool.coverage.run]
+source = ["recursive_resolver"]
+branch = true
+
+[tool.coverage.report]
+# The suite covers every statement and every branch, including the error paths
+# a hostile zone drives. Regressions in that are treated as build failures.
+fail_under = 100
+show_missing = true
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
 ]
 
 [tool.ruff]

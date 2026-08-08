@@ -3,7 +3,7 @@
 
 Tranco is a research-oriented top sites ranking that combines multiple lists
 (Alexa, Chrome UX, Majestic, Umbrella). Downloads the latest list and samples
-domains across the full popularity spectrum — top, middle, and tail.
+domains across the full popularity spectrum: top, middle, and tail.
 """
 
 from __future__ import annotations

@@ -11,10 +11,10 @@ WORKDIR /app
 
 # Install deps first for caching
 COPY pyproject.toml ./
-RUN uv sync --no-install-project
+RUN uv sync --no-install-project --all-extras
 
 # Copy source
 COPY . .
-RUN uv sync
+RUN uv sync --all-extras
 
 CMD ["bash"]

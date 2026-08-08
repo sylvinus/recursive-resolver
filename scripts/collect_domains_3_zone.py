@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Strategy 3: Public DNS zone data and RDAP/WHOIS enumeration.
+"""Strategy 3: public zone and popularity data.
 
 Combines multiple public sources:
-- Public suffix list (all known TLDs/eTLDs)
-- Wikipedia's list of most-visited websites
+- Public Suffix List (all known TLDs/eTLDs)
+- Cisco Umbrella top 1M (a popularity list built from resolver traffic)
 - Hardcoded "interesting" domains with unusual DNS setups
 - DNS infrastructure domains (root servers, TLD nameservers, CDNs)
 """
@@ -13,48 +13,90 @@ from __future__ import annotations
 import csv
 import io
 import random
-from urllib.request import urlopen, Request
 from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 OUTPUT = "domains_extra3.csv"
 
 # Domains known for interesting/complex DNS configurations
 INTERESTING_DOMAINS = [
     # Multi-level CNAME chains
-    "www.github.com", "www.heroku.com", "www.shopify.com",
-    "www.squarespace.com", "www.wix.com", "www.wordpress.com",
+    "www.github.com",
+    "www.heroku.com",
+    "www.shopify.com",
+    "www.squarespace.com",
+    "www.wix.com",
+    "www.wordpress.com",
     # Anycast / GeoDNS
-    "www.google.com", "www.facebook.com", "www.amazon.com",
-    "www.netflix.com", "www.cloudflare.com", "www.akamai.com",
+    "www.google.com",
+    "www.facebook.com",
+    "www.amazon.com",
+    "www.netflix.com",
+    "www.cloudflare.com",
+    "www.akamai.com",
     # DNSSEC-signed domains
-    "dnssec-failed.org", "good.dnssec-or-not.com",
-    "internetsociety.org", "ietf.org", "ripe.net",
+    "dnssec-failed.org",
+    "good.dnssec-or-not.com",
+    "internetsociety.org",
+    "ietf.org",
+    "ripe.net",
     # IDN / punycode
-    "münchen.de", "中国.cn", "日本.jp",
+    "münchen.de",
+    "中国.cn",
+    "日本.jp",
     # Long delegation chains
-    "bbc.co.uk", "gov.uk", "nhs.uk", "ac.uk",
-    "csiro.au", "defence.gov.au",
+    "bbc.co.uk",
+    "gov.uk",
+    "nhs.uk",
+    "ac.uk",
+    "csiro.au",
+    "defence.gov.au",
     # Infrastructure
-    "ns1.google.com", "dns.google", "one.one.one.one",
-    "resolver1.opendns.com", "dns.quad9.net",
+    "ns1.google.com",
+    "dns.google",
+    "one.one.one.one",
+    "resolver1.opendns.com",
+    "dns.quad9.net",
     # Email infrastructure (MX-heavy)
-    "gmail.com", "outlook.com", "yahoo.com", "protonmail.com",
-    "zoho.com", "fastmail.com", "tutanota.com",
+    "gmail.com",
+    "outlook.com",
+    "yahoo.com",
+    "protonmail.com",
+    "zoho.com",
+    "fastmail.com",
+    "tutanota.com",
     # CDN endpoints
-    "d1234.cloudfront.net", "cdn.jsdelivr.net",
-    "unpkg.com", "cdnjs.cloudflare.com",
+    "d1234.cloudfront.net",
+    "cdn.jsdelivr.net",
+    "unpkg.com",
+    "cdnjs.cloudflare.com",
     # Government / institutional
-    "whitehouse.gov", "nasa.gov", "cern.ch", "mit.edu",
-    "stanford.edu", "ox.ac.uk", "cam.ac.uk",
-    "elysee.fr", "bundeskanzler.de", "gov.cn",
+    "whitehouse.gov",
+    "nasa.gov",
+    "cern.ch",
+    "mit.edu",
+    "stanford.edu",
+    "ox.ac.uk",
+    "cam.ac.uk",
+    "elysee.fr",
+    "bundeskanzler.de",
+    "gov.cn",
     # TLD nameservers themselves
-    "a.gtld-servers.net", "a.nic.fr", "dns1.nic.uk",
+    "a.gtld-servers.net",
+    "a.nic.fr",
+    "dns1.nic.uk",
     # Large hosting (many NS configurations)
-    "aws.amazon.com", "cloud.google.com", "azure.microsoft.com",
-    "pages.github.com", "netlify.app", "vercel.app",
+    "aws.amazon.com",
+    "cloud.google.com",
+    "azure.microsoft.com",
+    "pages.github.com",
+    "netlify.app",
+    "vercel.app",
     # Unusual record types
-    "_dmarc.google.com", "_spf.google.com",
-    "meet.google.com", "chat.google.com",
+    "_dmarc.google.com",
+    "_spf.google.com",
+    "meet.google.com",
+    "chat.google.com",
 ]
 
 # Public suffix list URL
@@ -86,7 +128,7 @@ def fetch_public_suffixes() -> list[str]:
         if "." in line:
             suffixes.append(line)
 
-    # Sample — there are thousands
+    # Sample: there are thousands
     random.shuffle(suffixes)
     return suffixes[:500]
 
@@ -94,6 +136,7 @@ def fetch_public_suffixes() -> list[str]:
 def fetch_umbrella_sample() -> list[str]:
     """Fetch a sample from Cisco Umbrella top 1M."""
     import zipfile
+
     print("Fetching Cisco Umbrella top-1M...")
     try:
         with urlopen(UMBRELLA_URL, timeout=30) as resp:

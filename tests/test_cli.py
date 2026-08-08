@@ -1,224 +1,240 @@
-"""Tests for the CLI interface."""
+"""Tests for the command-line interface."""
 
 from __future__ import annotations
 
 import json
-from unittest import mock
+from unittest.mock import patch
 
 import pytest
 
-from recursive_resolver import NXDOMAINError, __version__
+from recursive_resolver import Answer, NXDOMAINError, TraceStep, ValidationState, __version__
 from recursive_resolver.cli import main
-from recursive_resolver.resolver import TraceStep
 
 
-class TestCLIBasic:
-    """Test CLI argument parsing and basic output."""
+def _answer(records: str = "1.2.3.4", rdtype: str = "A", dnssec=ValidationState.SECURE) -> Answer:
+    import dns.rdata
+    import dns.rdataclass
+    import dns.rrset
 
-    def test_version(self, capsys: pytest.CaptureFixture[str]) -> None:
-        with pytest.raises(SystemExit, match="0"):
+    rdt = dns.rdatatype.from_text(rdtype)
+    rrset = dns.rrset.RRset(dns.name.from_text("example.com."), dns.rdataclass.IN, rdt)
+    rrset.add(dns.rdata.from_text(dns.rdataclass.IN, rdt, records))
+    rrset.ttl = 300
+    return Answer(
+        qname=dns.name.from_text("example.com."),
+        canonical_name=dns.name.from_text("example.com."),
+        rdtype=rdt,
+        rrset=rrset,
+        ttl=300,
+        dnssec=dnssec,
+    )
+
+
+class TestBasicInvocation:
+    def test_plain_output(self, capsys: pytest.CaptureFixture) -> None:
+        with patch("recursive_resolver.cli.RecursiveResolver") as cls:
+            cls.return_value.resolve_answer.return_value = _answer()
+            assert main(["example.com"]) == 0
+        assert capsys.readouterr().out.strip() == "1.2.3.4"
+
+    def test_json_output(self, capsys: pytest.CaptureFixture) -> None:
+        with patch("recursive_resolver.cli.RecursiveResolver") as cls:
+            cls.return_value.resolve_answer.return_value = _answer()
+            assert main(["--json", "example.com"]) == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["records"] == ["1.2.3.4"]
+        assert payload["dnssec"] == "secure"
+        assert payload["ttl"] == 300
+
+    def test_record_type_argument(self) -> None:
+        with patch("recursive_resolver.cli.RecursiveResolver") as cls:
+            cls.return_value.resolve_answer.return_value = _answer("10 mail.example.com.", "MX")
+            assert main(["example.com", "MX"]) == 0
+        cls.return_value.resolve_answer.assert_called_once_with("example.com", "MX")
+
+    def test_version(self, capsys: pytest.CaptureFixture) -> None:
+        with pytest.raises(SystemExit) as exc:
             main(["--version"])
+        assert exc.value.code == 0
         assert __version__ in capsys.readouterr().out
 
-    def test_help(self, capsys: pytest.CaptureFixture[str]) -> None:
-        with pytest.raises(SystemExit, match="0"):
-            main(["--help"])
-        out = capsys.readouterr().out
-        assert "recursive-resolver" in out
-        assert "domain" in out
-
-    def test_no_args(self, capsys: pytest.CaptureFixture[str]) -> None:
-        with pytest.raises(SystemExit, match="2"):
+    def test_missing_argument_exits(self) -> None:
+        with pytest.raises(SystemExit):
             main([])
 
-    @mock.patch("recursive_resolver.cli.RecursiveResolver")
-    def test_simple_resolve(self, mock_cls: mock.MagicMock, capsys: pytest.CaptureFixture[str]) -> None:
-        mock_cls.return_value.resolve.return_value = ["93.184.216.34"]
-        ret = main(["example.com"])
-        assert ret == 0
-        assert "93.184.216.34" in capsys.readouterr().out
-        mock_cls.return_value.resolve.assert_called_once_with("example.com", "A")
 
-    @mock.patch("recursive_resolver.cli.RecursiveResolver")
-    def test_explicit_rdtype(self, mock_cls: mock.MagicMock, capsys: pytest.CaptureFixture[str]) -> None:
-        mock_cls.return_value.resolve.return_value = ["10 mail.example.com."]
-        ret = main(["example.com", "MX"])
-        assert ret == 0
-        assert "10 mail.example.com." in capsys.readouterr().out
-        mock_cls.return_value.resolve.assert_called_once_with("example.com", "MX")
+class TestErrorHandling:
+    def test_resolver_error_returns_1(self, capsys: pytest.CaptureFixture) -> None:
+        with patch("recursive_resolver.cli.RecursiveResolver") as cls:
+            cls.return_value.resolve_answer.side_effect = NXDOMAINError("nope.com.")
+            assert main(["nope.com"]) == 1
+        assert "NXDOMAINError" in capsys.readouterr().err
 
-    @mock.patch("recursive_resolver.cli.RecursiveResolver")
-    def test_multiple_results(self, mock_cls: mock.MagicMock, capsys: pytest.CaptureFixture[str]) -> None:
-        mock_cls.return_value.resolve.return_value = ["1.2.3.4", "5.6.7.8"]
-        ret = main(["example.com"])
-        assert ret == 0
+    def test_json_error_output(self, capsys: pytest.CaptureFixture) -> None:
+        with patch("recursive_resolver.cli.RecursiveResolver") as cls:
+            cls.return_value.resolve_answer.side_effect = NXDOMAINError("nope.com.")
+            assert main(["--json", "nope.com"]) == 1
+        payload = json.loads(capsys.readouterr().err)
+        assert payload["error"] == "NXDOMAINError"
+
+    def test_unknown_rdtype_is_reported_cleanly(self, capsys: pytest.CaptureFixture) -> None:
+        """Regression: this used to print a raw dnspython traceback."""
+        assert main(["example.com", "BOGUSTYPE"]) == 1
+        assert "UnsupportedRdtypeError" in capsys.readouterr().err
+
+    def test_invalid_name_is_reported_cleanly(self, capsys: pytest.CaptureFixture) -> None:
+        assert main(["foo..com"]) == 1
+        assert "InvalidNameError" in capsys.readouterr().err
+
+
+class TestTextMode:
+    def test_text_mode_concatenates_txt_chunks(self, capsys: pytest.CaptureFixture) -> None:
+        with patch("recursive_resolver.cli.RecursiveResolver") as cls:
+            cls.return_value.resolve_answer.return_value = _answer('"part-one" "part-two"', "TXT")
+            assert main(["--text", "example.com", "TXT"]) == 0
+        assert capsys.readouterr().out.strip() == "part-onepart-two"
+
+    def test_default_mode_keeps_presentation_format(self, capsys: pytest.CaptureFixture) -> None:
+        with patch("recursive_resolver.cli.RecursiveResolver") as cls:
+            cls.return_value.resolve_answer.return_value = _answer('"part-one" "part-two"', "TXT")
+            assert main(["example.com", "TXT"]) == 0
+        assert '" "' in capsys.readouterr().out
+
+    def test_text_mode_on_non_text_type_errors(self, capsys: pytest.CaptureFixture) -> None:
+        with patch("recursive_resolver.cli.RecursiveResolver") as cls:
+            cls.return_value.resolve_answer.return_value = _answer()
+            assert main(["--text", "example.com"]) == 2
+        assert "character-string" in capsys.readouterr().err
+
+
+class TestTrace:
+    def test_trace_output(self, capsys: pytest.CaptureFixture) -> None:
+        step = TraceStep(
+            server="198.41.0.4",
+            qname="example.com.",
+            rdtype="A",
+            response_type="referral",
+            detail="NS: a.gtld-servers.net.",
+            zone=".",
+            dnssec="secure",
+        )
+        with patch("recursive_resolver.cli.RecursiveResolver") as cls:
+            cls.return_value.trace_answer.return_value = (_answer(), [step])
+            assert main(["--trace", "example.com"]) == 0
         out = capsys.readouterr().out
-        assert "1.2.3.4" in out
-        assert "5.6.7.8" in out
+        assert "198.41.0.4" in out and "referral" in out
+
+    def test_trace_json(self, capsys: pytest.CaptureFixture) -> None:
+        step = TraceStep(server="1.2.3.4", qname="example.com.", rdtype="A", response_type="answer")
+        with patch("recursive_resolver.cli.RecursiveResolver") as cls:
+            cls.return_value.trace_answer.return_value = (_answer(), [step])
+            assert main(["--trace", "--json", "example.com"]) == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["trace"][0]["server"] == "1.2.3.4"
+        assert payload["records"] == ["1.2.3.4"]
+
+    def test_trace_failure_returns_1(self) -> None:
+        with patch("recursive_resolver.cli.RecursiveResolver") as cls:
+            cls.return_value.trace_answer.return_value = (None, [])
+            assert main(["--trace", "nope.com"]) == 1
 
 
-class TestCLIJson:
-    """Test JSON output mode."""
+class TestOptionPlumbing:
+    def test_security_options_reach_the_resolver(self) -> None:
+        with patch("recursive_resolver.cli.RecursiveResolver") as cls:
+            cls.return_value.resolve_answer.return_value = _answer()
+            main(
+                [
+                    "--no-dnssec",
+                    "--allow-private",
+                    "--no-cache",
+                    "--cache-depth",
+                    "tld",
+                    "--edns-payload",
+                    "512",
+                    "example.com",
+                ]
+            )
+        kwargs = cls.call_args.kwargs
+        assert kwargs["dnssec"] is False
+        assert kwargs["allow_private_addresses"] is True
+        assert kwargs["cache_enabled"] is False
+        assert kwargs["max_delegation_cache_depth"] == "tld"
+        assert kwargs["edns_payload"] == 512
 
-    @mock.patch("recursive_resolver.cli.RecursiveResolver")
-    def test_json_output(self, mock_cls: mock.MagicMock, capsys: pytest.CaptureFixture[str]) -> None:
-        mock_cls.return_value.resolve.return_value = ["93.184.216.34"]
-        ret = main(["--json", "example.com"])
-        assert ret == 0
-        data = json.loads(capsys.readouterr().out)
-        assert data == ["93.184.216.34"]
+    def test_defaults_are_secure(self) -> None:
+        with patch("recursive_resolver.cli.RecursiveResolver") as cls:
+            cls.return_value.resolve_answer.return_value = _answer()
+            main(["example.com"])
+        kwargs = cls.call_args.kwargs
+        assert kwargs["dnssec"] is True
+        assert kwargs["allow_private_addresses"] is False
+        assert kwargs["cache_enabled"] is True
 
-    @mock.patch("recursive_resolver.cli.RecursiveResolver")
-    def test_json_error(self, mock_cls: mock.MagicMock, capsys: pytest.CaptureFixture[str]) -> None:
-        mock_cls.return_value.resolve.side_effect = NXDOMAINError("no.example.com", "A")
-        ret = main(["--json", "no.example.com"])
-        assert ret == 1
-        data = json.loads(capsys.readouterr().err)
-        assert data["error"] == "NXDOMAINError"
-        assert "message" in data
+    def test_cache_depth_accepts_a_plain_number_too(self) -> None:
+        with patch("recursive_resolver.cli.RecursiveResolver") as cls:
+            cls.return_value.resolve_answer.return_value = _answer()
+            main(["--cache-depth", "2", "example.com"])
+        assert cls.call_args.kwargs["max_delegation_cache_depth"] == "2"
 
-
-class TestCLITrace:
-    """Test --trace mode."""
-
-    @mock.patch("recursive_resolver.cli.RecursiveResolver")
-    def test_trace_text(self, mock_cls: mock.MagicMock, capsys: pytest.CaptureFixture[str]) -> None:
-        mock_cls.return_value.resolve_with_trace.return_value = [
-            TraceStep(
-                server="198.41.0.4",
-                qname="example.com.",
-                rdtype="A",
-                response_type="referral",
-                detail="NS: a.gtld-servers.net.",
-                rcode=0,
-            ),
-            TraceStep(
-                server="192.5.6.30",
-                qname="example.com.",
-                rdtype="A",
-                response_type="answer",
-                detail="93.184.216.34",
-                rcode=0,
-            ),
-        ]
-        ret = main(["--trace", "example.com"])
-        assert ret == 0
-        out = capsys.readouterr().out
-        assert "198.41.0.4" in out
-        assert "referral" in out
-        assert "answer" in out
-
-    @mock.patch("recursive_resolver.cli.RecursiveResolver")
-    def test_trace_json(self, mock_cls: mock.MagicMock, capsys: pytest.CaptureFixture[str]) -> None:
-        mock_cls.return_value.resolve_with_trace.return_value = [
-            TraceStep(
-                server="198.41.0.4",
-                qname="example.com.",
-                rdtype="A",
-                response_type="referral",
-                detail="NS: a.gtld-servers.net.",
-                rcode=0,
-            ),
-        ]
-        ret = main(["--trace", "--json", "example.com"])
-        assert ret == 0
-        data = json.loads(capsys.readouterr().out)
-        assert isinstance(data, list)
-        assert data[0]["server"] == "198.41.0.4"
-        assert data[0]["response_type"] == "referral"
+    def test_an_unknown_cache_depth_is_reported_cleanly(self, capsys: pytest.CaptureFixture) -> None:
+        assert main(["--cache-depth", "sometimes", "example.com"]) == 2
+        assert "unknown cache depth" in capsys.readouterr().err
 
 
-class TestCLIErrors:
-    """Test error handling."""
+class TestDNSSECVerdictOnStderr:
+    """Plain output must never look validated when it is not.
 
-    @mock.patch("recursive_resolver.cli.RecursiveResolver")
-    def test_nxdomain_error(self, mock_cls: mock.MagicMock, capsys: pytest.CaptureFixture[str]) -> None:
-        mock_cls.return_value.resolve.side_effect = NXDOMAINError("no.example.com", "A")
-        ret = main(["no.example.com"])
-        assert ret == 1
-        err = capsys.readouterr().err
-        assert "NXDOMAINError" in err
+    The verdict goes to stderr so that stdout stays a clean list of values;
+    the wording matches delv, BIND's validating lookup utility.
+    """
 
-    @mock.patch("recursive_resolver.cli.RecursiveResolver")
-    def test_trace_error(self, mock_cls: mock.MagicMock, capsys: pytest.CaptureFixture[str]) -> None:
-        mock_cls.return_value.resolve_with_trace.side_effect = NXDOMAINError("no.example.com", "A")
-        ret = main(["--trace", "no.example.com"])
-        assert ret == 1
-        err = capsys.readouterr().err
-        assert "NXDOMAINError" in err
+    def _run(self, argv: list[str], answer: Answer, capsys: pytest.CaptureFixture) -> tuple[str, str]:
+        with patch("recursive_resolver.cli.RecursiveResolver") as cls:
+            cls.return_value.resolve_answer.return_value = answer
+            assert main(argv) == 0
+        captured = capsys.readouterr()
+        return captured.out, captured.err
 
+    @pytest.mark.parametrize(
+        ("state", "note"),
+        [
+            (ValidationState.SECURE, "; fully validated"),
+            (ValidationState.INSECURE, "; unsigned answer"),
+            (ValidationState.BOGUS, "; validation failed"),
+        ],
+    )
+    def test_each_state_is_reported(self, state: ValidationState, note: str, capsys: pytest.CaptureFixture) -> None:
+        out, err = self._run(["example.com"], _answer(dnssec=state), capsys)
+        assert err.strip() == note
+        assert out.strip() == "1.2.3.4"
 
-class TestCLIOptions:
-    """Test that CLI options are passed through to the resolver."""
+    def test_stdout_carries_only_values(self, capsys: pytest.CaptureFixture) -> None:
+        """Piping the output must not require filtering out a comment line."""
+        out, _ = self._run(["example.com"], _answer(), capsys)
+        assert out == "1.2.3.4\n"
 
-    @mock.patch("recursive_resolver.cli.RecursiveResolver")
-    def test_timeout_option(self, mock_cls: mock.MagicMock) -> None:
-        mock_cls.return_value.resolve.return_value = []
-        main(["--timeout", "10", "example.com"])
-        mock_cls.assert_called_once_with(
-            timeout=10.0,
-            max_depth=20,
-            cache_enabled=True,
-            ipv4_only=True,
-            max_resolution_time=30.0,
-        )
+    def test_no_dnssec_says_so_rather_than_claiming_unsigned(self, capsys: pytest.CaptureFixture) -> None:
+        """--no-dnssec leaves the default INSECURE state, which is not a proof."""
+        _, err = self._run(["--no-dnssec", "example.com"], _answer(dnssec=ValidationState.INSECURE), capsys)
+        assert err.strip() == "; dnssec validation disabled"
 
-    @mock.patch("recursive_resolver.cli.RecursiveResolver")
-    def test_no_cache_option(self, mock_cls: mock.MagicMock) -> None:
-        mock_cls.return_value.resolve.return_value = []
-        main(["--no-cache", "example.com"])
-        mock_cls.assert_called_once_with(
-            timeout=5.0,
-            max_depth=20,
-            cache_enabled=False,
-            ipv4_only=True,
-            max_resolution_time=30.0,
-        )
+    def test_json_output_has_no_note(self, capsys: pytest.CaptureFixture) -> None:
+        out, err = self._run(["--json", "example.com"], _answer(), capsys)
+        assert err == ""
+        assert json.loads(out)["dnssec"] == "secure"
 
-    @mock.patch("recursive_resolver.cli.RecursiveResolver")
-    def test_ipv6_option(self, mock_cls: mock.MagicMock) -> None:
-        mock_cls.return_value.resolve.return_value = []
-        main(["--ipv6", "example.com"])
-        mock_cls.assert_called_once_with(
-            timeout=5.0,
-            max_depth=20,
-            cache_enabled=True,
-            ipv4_only=False,
-            max_resolution_time=30.0,
-        )
+    def test_text_mode_still_reports(self, capsys: pytest.CaptureFixture) -> None:
+        out, err = self._run(["--text", "example.com", "TXT"], _answer('"v=spf1 -all"', "TXT"), capsys)
+        assert err.strip() == "; fully validated"
+        assert out.strip() == "v=spf1 -all"
 
-    @mock.patch("recursive_resolver.cli.RecursiveResolver")
-    def test_max_time_option(self, mock_cls: mock.MagicMock) -> None:
-        mock_cls.return_value.resolve.return_value = []
-        main(["--max-time", "15", "example.com"])
-        mock_cls.assert_called_once_with(
-            timeout=5.0,
-            max_depth=20,
-            cache_enabled=True,
-            ipv4_only=True,
-            max_resolution_time=15.0,
-        )
-
-    @mock.patch("recursive_resolver.cli.RecursiveResolver")
-    def test_max_depth_option(self, mock_cls: mock.MagicMock) -> None:
-        mock_cls.return_value.resolve.return_value = []
-        main(["--max-depth", "5", "example.com"])
-        mock_cls.assert_called_once_with(
-            timeout=5.0,
-            max_depth=5,
-            cache_enabled=True,
-            ipv4_only=True,
-            max_resolution_time=30.0,
-        )
-
-    @mock.patch("recursive_resolver.cli.RecursiveResolver")
-    def test_combined_options(self, mock_cls: mock.MagicMock) -> None:
-        mock_cls.return_value.resolve.return_value = []
-        main(["--timeout", "8", "--max-depth", "10", "--no-cache", "--ipv6", "--max-time", "20", "example.com"])
-        mock_cls.assert_called_once_with(
-            timeout=8.0,
-            max_depth=10,
-            cache_enabled=False,
-            ipv4_only=False,
-            max_resolution_time=20.0,
-        )
+    def test_trace_mode_reports_before_the_records(self, capsys: pytest.CaptureFixture) -> None:
+        answer = _answer()
+        step = TraceStep(server="1.2.3.4", qname="example.com.", rdtype="A", response_type="answer")
+        with patch("recursive_resolver.cli.RecursiveResolver") as cls:
+            cls.return_value.trace_answer.return_value = (answer, [step])
+            assert main(["--trace", "example.com"]) == 0
+        captured = capsys.readouterr()
+        assert captured.err.strip() == "; fully validated"
+        assert captured.out.strip().endswith("1.2.3.4")

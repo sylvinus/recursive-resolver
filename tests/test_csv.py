@@ -1,4 +1,25 @@
-"""Bulk CSV testing: compare our resolver results against dig."""
+"""Bulk differential testing: compare this resolver against dig on real domains.
+
+Which record types are comparable
+---------------------------------
+Any type can be *asked* of an apex domain, and a type the domain does not
+publish yields NODATA on both sides, still a meaningful agreement. So the
+default set covers every type the resolver supports that is answerable from a
+plain list of domain names:
+
+    A, AAAA, MX, TXT, NS, SOA, CAA, CNAME, DS, DNSKEY
+
+Three supported types are excluded from the default because a list of apex
+domains cannot exercise them, not because they are untested (they have unit and
+integration coverage of their own):
+
+``PTR``
+    Needs an IP address or an ``in-addr.arpa``/``ip6.arpa`` name, not a domain.
+``SRV`` and ``NAPTR``
+    Live under ``_service._proto`` labels that do not exist at an apex.
+
+Point ``--types`` at any subset, or supply a purpose-built CSV to cover those.
+"""
 
 from __future__ import annotations
 
@@ -53,7 +74,7 @@ def _normalize_txt(records: set[str]) -> set[str]:
             for q in quoted:
                 out.add(q.lower())
         else:
-            # Bare value (no quotes) — keep as-is
+            # Bare value (no quotes): keep as-is
             out.add(record.lower())
     return out
 
@@ -113,7 +134,10 @@ def test_csv_bulk(csv_path: str | None, request: pytest.FixtureRequest) -> None:
     rdtypes = [t.strip().upper() for t in request.config.getoption("--types").split(",")]
     sample_size = request.config.getoption("--sample")
 
-    resolver = RecursiveResolver(timeout=5.0, ipv4_only=True)
+    # DNSSEC is off for bulk comparison: `dig +short` does not validate
+    # either, so enabling it would compare two different things (and reject
+    # the many real domains with broken DNSSEC).
+    resolver = RecursiveResolver(timeout=3.0, ipv4_only=True, dnssec=False)
 
     with open(csv_path) as f:
         reader = csv.DictReader(f)
@@ -175,7 +199,7 @@ def test_csv_bulk(csv_path: str | None, request: pytest.FixtureRequest) -> None:
                 futures.append(pool.submit(run_one, domain, rdtype))
         concurrent.futures.wait(futures)
 
-    # Classify results — overall and per-type
+    # Classify results: overall and per-type
     counts: dict[str, int] = {}
     per_type: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     failures: list[dict] = []
@@ -201,7 +225,7 @@ def test_csv_bulk(csv_path: str | None, request: pytest.FixtureRequest) -> None:
         type_total = sum(tc.values())
         type_matches = tc.get("exact", 0) + tc.get("overlap", 0) + tc.get("both_empty", 0) + tc.get("dig_empty", 0)
         type_rate = type_matches / type_total if type_total else 0
-        print(f"  {rdtype:6s}: {type_matches}/{type_total} ({type_rate:.1%}) — {dict(tc)}")
+        print(f"  {rdtype:6s}: {type_matches}/{type_total} ({type_rate:.1%}): {dict(tc)}")
 
     if failures:
         print(f"\nTotal failures: {len(failures)}")

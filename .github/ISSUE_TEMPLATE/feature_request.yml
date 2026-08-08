@@ -1,0 +1,20 @@
+name: Feature request
+description: Suggest a capability or a change in behaviour
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: The use case, not the implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behaviour
+  - type: textarea
+    id: rfc
+    attributes:
+      label: Relevant RFCs or prior art
+      description: How do BIND, Unbound, Knot or PowerDNS handle this?
