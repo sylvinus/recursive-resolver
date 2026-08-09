@@ -75,5 +75,6 @@ release-check: check-all ## Everything the release script checks, without publis
 	if [ "$$PY_VER" != "$(VERSION)" ]; then \
 		echo "ERROR: Version mismatch: __init__.py=$$PY_VER vs pyproject.toml=$(VERSION)"; exit 1; \
 	fi
-	@grep -qF "## [$(VERSION)]" CHANGELOG.md || { echo "ERROR: no '## [$(VERSION)]' section in CHANGELOG.md"; exit 1; }
+	@awk -v v="## [$(VERSION)]" 'index($$0, v) == 1 { found = 1; exit } END { exit !found }' CHANGELOG.md \
+		|| { echo "ERROR: no '## [$(VERSION)]' section heading in CHANGELOG.md"; exit 1; }
 	@echo "All checks passed. Version: $(VERSION)"

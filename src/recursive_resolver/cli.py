@@ -129,8 +129,18 @@ def main(argv: list[str] | None = None) -> int:
     except BrokenPipeError:
         # The reader closed the pipe early ("... | head -1"). Point stdout at
         # /dev/null so the interpreter's shutdown flush does not raise again
-        # and print "Exception ignored" over the user's terminal.
-        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        # and print "Exception ignored" over the user's terminal. dup2 makes
+        # the descriptor a duplicate, so the original is closed straight after.
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(devnull, sys.stdout.fileno())
+        finally:
+            # The equality case cannot arise here: os.open only returns a free
+            # descriptor, and had stdout's own descriptor been closed the write
+            # above would have raised EBADF rather than BrokenPipeError. Kept
+            # anyway so the close is unconditionally safe.
+            if devnull != sys.stdout.fileno():  # pragma: no branch
+                os.close(devnull)
         return 0
     except ResolverError as exc:
         if args.json_output:
@@ -190,6 +200,11 @@ def _run_trace(resolver: RecursiveResolver, args: argparse.Namespace) -> int:
         values = _values_for(answer, args)
         if values is None:
             return 2
+    failure = None
+    if answer is None:
+        last = trace[-1].response_type if trace else "no response"
+        failure = f"Resolution failed after {len(trace)} step(s); last response: {last}"
+
     if args.json_output:
         payload = {
             "trace": [
@@ -208,6 +223,12 @@ def _run_trace(resolver: RecursiveResolver, args: argparse.Namespace) -> int:
             "records": values,
             "dnssec": answer.dnssec.value if answer else None,
         }
+        if failure is not None:
+            # Otherwise the payload is success-shaped with two nulls, and the
+            # only statement that anything went wrong is English on stderr.
+            # Same key names as the error object main() emits.
+            payload["error"] = "ResolutionIncomplete"
+            payload["message"] = failure
         print(json.dumps(payload, indent=2))
     else:
         for step in trace:
@@ -216,8 +237,7 @@ def _run_trace(resolver: RecursiveResolver, args: argparse.Namespace) -> int:
             _note_dnssec(answer, args)
             for record in values or []:
                 print(record)
-    if answer is None:
-        last = trace[-1].response_type if trace else "no response"
-        print(f"Resolution failed after {len(trace)} step(s); last response: {last}", file=sys.stderr)
+    if failure is not None:
+        print(failure, file=sys.stderr)
         return 1
     return 0

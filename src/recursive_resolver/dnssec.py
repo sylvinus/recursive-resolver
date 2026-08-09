@@ -197,7 +197,7 @@ class DNSSECValidator:
         max_nsec3_iterations: int = MAX_NSEC3_ITERATIONS,
     ) -> None:
         if not trust_anchors:
-            raise ValueError("trust_anchors must not be empty; pass None to use the IANA root anchors")
+            raise ValueError("trust_anchors must not be empty; omit it to use the IANA root anchors")
         self.max_nsec3_iterations = max_nsec3_iterations
         self._root_ds = dns.rdataset.Rdataset(dns.rdataclass.IN, dns.rdatatype.DS)
         for anchor in trust_anchors:

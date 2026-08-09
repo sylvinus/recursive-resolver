@@ -9,8 +9,8 @@ from unittest.mock import patch
 import pytest
 from conftest import make_response, referral, root_to_com
 
-from recursive_resolver import RecursiveResolver
-from recursive_resolver.singleflight import SingleFlight
+from recursive_resolver import DNSSECValidationError, RecursiveResolver
+from recursive_resolver.singleflight import SingleFlight, _Call
 
 
 class TestSingleFlight:
@@ -70,6 +70,93 @@ class TestSingleFlight:
 
         assert len(errors) == 4
         assert all(isinstance(e, ValueError) for e in errors)
+
+    def test_each_waiter_gets_its_own_exception_instance(self) -> None:
+        """Sharing one object means threads racing on its __traceback__.
+
+        The failure must still arrive with the right type, message and cause;
+        only the identity differs.
+        """
+        cause = ValueError("underlying")
+        original = DNSSECValidationError("a.test.", "A", "bad signature")
+        original.__cause__ = cause
+
+        sf: SingleFlight[int] = SingleFlight()
+        started = threading.Event()
+        seen: list[BaseException] = []
+        lock = threading.Lock()
+
+        def work() -> int:
+            started.set()
+            time.sleep(0.15)
+            raise original
+
+        def run() -> None:
+            try:
+                sf.do("k", work)
+            except BaseException as exc:  # noqa: BLE001 - recorded for inspection
+                with lock:
+                    seen.append(exc)
+
+        # Leader first, then waiters once it is known to be in flight, so the
+        # three really do attach rather than each becoming a leader in turn.
+        leader = threading.Thread(target=run)
+        leader.start()
+        started.wait(timeout=5)
+        others = [threading.Thread(target=run) for _ in range(3)]
+        for t in others:
+            t.start()
+        for t in [leader, *others]:
+            t.join(timeout=5)
+
+        assert len(seen) == 4
+        # The leader re-raises its own object; only the waiters are cloned.
+        clones = [e for e in seen if e is not original]
+        assert clones, "no waiter received a private instance"
+        assert len({id(e) for e in clones}) == len(clones), "two waiters shared one exception object"
+        for exc in clones:
+            assert type(exc) is DNSSECValidationError
+            assert str(exc) == str(original)
+            assert exc.__cause__ is cause
+
+    def test_an_oserror_is_passed_through_rather_than_cloned(self) -> None:
+        """errno lives in C-level state a clone would drop; a lossy copy is worse."""
+        original = OSError(9, "bad file descriptor")
+        sf: SingleFlight[int] = SingleFlight()
+        call = _Call[int]()
+        call.error = original
+        call.event.set()
+        sf._calls["k"] = call
+
+        with pytest.raises(OSError) as exc:
+            sf.do("k", lambda: 0)
+        assert exc.value is original
+        assert exc.value.errno == 9
+
+    def test_an_uncopyable_exception_is_passed_through_rather_than_lost(self) -> None:
+        """The leader catches BaseException, so this is not a closed set.
+
+        A waiter must receive the real failure; an error raised while trying to
+        give it a private instance would be strictly worse than sharing one.
+        """
+
+        class AwkwardError(Exception):
+            def __new__(cls, *args: object) -> AwkwardError:
+                raise TypeError("cannot be reconstructed")
+
+        original = Exception.__new__(AwkwardError)
+        original.args = ("boom",)
+
+        sf: SingleFlight[int] = SingleFlight()
+        call = _Call[int]()
+        call.error = original
+        call.event.set()
+        sf._calls["k"] = call
+
+        with pytest.raises(AwkwardError) as exc:
+            sf.do("k", lambda: 0)
+        assert exc.value is original
+        assert str(exc.value) == "boom"
 
     def test_key_is_released_after_completion(self) -> None:
         sf: SingleFlight[int] = SingleFlight()

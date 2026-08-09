@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from unittest.mock import patch
 
 import pytest
@@ -95,14 +96,18 @@ class TestErrorHandling:
 
     def test_a_closed_pipe_exits_quietly(self) -> None:
         """`recursive-resolver example.com | head -1` must not print a traceback."""
+        # Only dup2 is patched: os.open and os.close stay real, so the handler
+        # leaking the devnull descriptor would show up as a leak here too.
         with (
             patch("recursive_resolver.cli.RecursiveResolver"),
             patch("recursive_resolver.cli._run_query", side_effect=BrokenPipeError),
-            patch("recursive_resolver.cli.os.open", return_value=-1),
             patch("recursive_resolver.cli.os.dup2") as dup2,
         ):
             assert main(["--no-dnssec", "example.com"]) == 0
         assert dup2.called, "stdout was not redirected, so the shutdown flush will raise again"
+        devnull_fd = dup2.call_args.args[0]
+        with pytest.raises(OSError):
+            os.fstat(devnull_fd)  # already closed: the handler did not leak it
 
     def test_contradictory_dnssec_flags_are_a_usage_error(self, capsys: pytest.CaptureFixture) -> None:
         """Rejected at parse time rather than failing every lookup later."""
@@ -162,6 +167,16 @@ class TestTrace:
         with patch("recursive_resolver.cli.RecursiveResolver") as cls:
             cls.return_value.trace_answer.return_value = (None, [])
             assert main(["--trace", "nope.com"]) == 1
+
+    def test_trace_json_failure_says_so_in_the_payload(self, capsys: pytest.CaptureFixture) -> None:
+        """A failed trace must not emit a success-shaped payload full of nulls."""
+        with patch("recursive_resolver.cli.RecursiveResolver") as cls:
+            cls.return_value.trace_answer.return_value = (None, [])
+            assert main(["--trace", "--json", "nope.com"]) == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["error"] == "ResolutionIncomplete"
+        assert "no response" in payload["message"]
+        assert payload["records"] is None and payload["dnssec"] is None
 
     def test_trace_honours_text_mode(self, capsys: pytest.CaptureFixture) -> None:
         """--text must mean the same thing with --trace as without it."""

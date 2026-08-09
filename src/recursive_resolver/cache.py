@@ -135,7 +135,8 @@ class DNSCache:
         max_size: Maximum number of entries. 0 means unlimited.
         min_ttl: Floor applied to record TTLs, in seconds. 0 honours the wire
             TTL exactly, which is what you want when freshness matters:
-            key rotation, GSLB failover.
+            key rotation, GSLB failover. Negative entries are not floored;
+            see :meth:`_clamp`.
         max_ttl: Ceiling applied to record TTLs, in seconds.
         negative_ttl: Fallback TTL for negative entries when the authority
             section carries no usable SOA.
@@ -180,8 +181,18 @@ class DNSCache:
         return int(dns.rdatatype.from_text(rdtype))
 
     def _clamp(self, ttl: int, negative: bool = False) -> int:
-        ceiling = self.max_negative_ttl if negative else self.max_ttl
-        return max(self.min_ttl, min(int(ttl), ceiling))
+        """Clamp a TTL to this cache's bounds.
+
+        ``min_ttl`` is a floor on *record* TTLs only. Negative entries have
+        their own controls (``negative_ttl``, ``max_negative_ttl``) and
+        deliberately no floor: raising ``min_ttl`` to keep a warm answer cache
+        must not also hold an NXDOMAIN past what the zone's SOA asked for, or a
+        name that has just been created stays missing for longer than its
+        operator intended.
+        """
+        if negative:
+            return min(int(ttl), self.max_negative_ttl)
+        return max(self.min_ttl, min(int(ttl), self.max_ttl))
 
     def _get(self, key: CacheKey) -> CacheEntry | None:
         """Fetch and LRU-touch a key. Must be called under the lock."""

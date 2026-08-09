@@ -128,6 +128,22 @@ class TestNegativeCache:
         assert cache.get_nodata(EXAMPLE, dns.rdatatype.MX) is not None
         assert cache.get_nodata(EXAMPLE, A) is None
 
+    def test_min_ttl_does_not_extend_negative_caching(self) -> None:
+        """min_ttl floors record TTLs only, per its documented contract.
+
+        A warm answer cache is no reason to hold an NXDOMAIN past what the
+        zone's SOA asked for: a name created a minute ago would keep resolving
+        as missing.
+        """
+        cache = DNSCache(min_ttl=600)
+        now = time.monotonic()
+        with patch("recursive_resolver.cache.time.monotonic", return_value=now):
+            cache.put_nxdomain(EXAMPLE, ttl=30)
+            cache.put_nodata(EXAMPLE, dns.rdatatype.MX, ttl=30)
+        with patch("recursive_resolver.cache.time.monotonic", return_value=now + 31):
+            assert cache.get_nxdomain(EXAMPLE) is None
+            assert cache.get_nodata(EXAMPLE, dns.rdatatype.MX) is None
+
     def test_negative_ttl_ceiling(self) -> None:
         cache = DNSCache(max_negative_ttl=60)
         now = time.monotonic()
@@ -180,11 +196,13 @@ class TestDelegationCache:
         assert first.addresses == ["1.2.3.4"]
         assert first.ns_names == ["ns1.example.com."]
 
-        # Nor may one reader's mutation be visible to the next.
+        # Nor may one reader's mutation be visible to the next, on either list.
         first.addresses.append("7.7.7.7")
+        first.ns_names.append("ns2.example.com.")
         second = cache.closest_delegation(dns.name.from_text("www.example.com."))
         assert second is not None
         assert second.addresses == ["1.2.3.4"]
+        assert second.ns_names == ["ns1.example.com."]
 
     def test_empty_delegation_is_not_returned(self) -> None:
         cache = DNSCache()

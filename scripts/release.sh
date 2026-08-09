@@ -84,13 +84,15 @@ MODULE_VERSION="$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' "${REPO_DIR}/src/${PK
 [[ "${MODULE_VERSION}" == "${VERSION}" ]] \
     || die "version mismatch: pyproject.toml=${VERSION} but __init__.py=${MODULE_VERSION}"
 
-# -F and the "## [" prefix on purpose: the release notes below are extracted
-# from a "## [VERSION]" *heading*, so a version that only appears in a link
-# definition at the bottom of the file must not pass pre-flight and then yield
-# empty notes after the irreversible PyPI upload. An unescaped pattern would
-# also treat "." as a wildcard.
-grep -qF "## [${VERSION}]" "${REPO_DIR}/CHANGELOG.md" \
-    || die "CHANGELOG.md has no '## [${VERSION}]' section"
+# The release notes below are extracted from a "## [VERSION]" *heading*, so a
+# version that only appears in a link definition at the bottom of the file must
+# not pass pre-flight and then yield empty notes after the irreversible PyPI
+# upload. index()==1 anchors at column 1, and awk's index() is a fixed-string
+# search, so the version's dots are not wildcards. This matches the check the
+# `release-check` target in the Makefile runs.
+awk -v v="## [${VERSION}]" 'index($0, v) == 1 { found = 1; exit } END { exit !found }' \
+    "${REPO_DIR}/CHANGELOG.md" \
+    || die "CHANGELOG.md has no '## [${VERSION}]' section heading"
 
 TAG="v${VERSION}"
 if git -C "${REPO_DIR}" rev-parse "${TAG}" >/dev/null 2>&1; then

@@ -16,6 +16,42 @@ from typing import Any, Generic, TypeVar
 T = TypeVar("T")
 
 
+def _per_waiter(error: BaseException) -> BaseException:
+    """A distinct instance of ``error``, so no two threads share one object.
+
+    ``raise`` writes ``__traceback__`` onto the exception it is handed, so
+    giving every waiter the leader's instance has several threads appending to
+    one traceback at once, and a caller ends up reading frames from threads it
+    never ran.
+
+    ``copy.copy`` cannot do this. These exceptions build their message in
+    ``__init__`` out of several arguments while ``args`` holds only the
+    finished string, so copy re-invokes ``__init__`` with the wrong arity: it
+    raises ``TypeError`` for most of them and silently double-wraps the message
+    for the rest. Bypassing ``__init__`` and carrying ``args``, ``__dict__``
+    and ``__cause__`` across reproduces every :class:`ResolverError` exactly,
+    which is all this class is ever asked to transport.
+
+    ``OSError`` keeps ``errno`` and ``strerror`` in C-level state that is
+    populated at construction and would not survive, so it is passed through
+    untouched: a correct shared object beats a lossy private one. Anything else
+    that cannot be rebuilt is returned as-is for the same reason. The leader
+    catches ``BaseException``, so what arrives here is not a closed set, and
+    the caller must get the real failure rather than an error from this
+    function -- which is exactly what disqualified ``copy.copy``.
+    """
+    if isinstance(error, OSError):
+        return error
+    try:
+        clone = error.__class__.__new__(error.__class__)
+        clone.args = error.args
+        clone.__dict__.update(error.__dict__)
+        clone.__cause__ = error.__cause__
+    except Exception:  # noqa: BLE001 - a messy traceback beats losing the error
+        return error
+    return clone
+
+
 class _Call(Generic[T]):
     __slots__ = ("event", "value", "error")
 
@@ -64,12 +100,7 @@ class SingleFlight(Generic[T]):
             # blocking indefinitely on it.
             return fn()
         if call.error is not None:
-            # Every waiter for this key re-raises the *same* exception object,
-            # and each `raise` writes __traceback__ on it. Without this, several
-            # threads concurrently append to one traceback and a caller ends up
-            # inspecting frames from threads it never ran. Dropping it gives
-            # each waiter a traceback rooted at its own call site.
-            raise call.error.with_traceback(None)
+            raise _per_waiter(call.error)
         return call.value  # type: ignore[return-value]
 
     def in_flight(self) -> int:
