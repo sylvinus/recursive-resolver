@@ -12,7 +12,8 @@
 #
 # Hermetic: building, checking and uploading all happen inside the
 # python:3.13-slim image, so the host never needs pip, build or twine. A clean
-# machine needs only Docker, git and (for the last step) the gh CLI.
+# machine needs only Docker and git; the gh CLI is only needed to run the
+# command the last step prints.
 #
 # Flow:
 #   1. Pre-flight: clean tree, version consistency, changelog entry, no tag yet
@@ -21,7 +22,8 @@
 #   4. Inspect artifact contents and METADATA against what this package promises
 #   5. Upload to TestPyPI, then smoke-install and actually resolve a name
 #   6. Upload to PyPI
-#   7. Tag and create the GitHub release with the artifacts attached
+#   7. Print the git tag / push / gh release commands. The script never runs
+#      them: it does not touch git state or publish a release itself.
 #
 # Every gate is interactive (y/N). Ctrl-C bails out at any point.
 #
@@ -117,7 +119,7 @@ printf '%s═══════════════════════�
 say "Image:    ${PYTHON_IMAGE}"
 say "Repo:     ${REPO_DIR}"
 say "Tag:      ${TAG}"
-say "Flow:     checks → build → inspect → TestPyPI → smoke → PyPI → GitHub release"
+say "Flow:     checks → build → inspect → TestPyPI → smoke → PyPI → print tag/release commands"
 [[ "${SKIP_GATES:-0}" == "1" ]]    && warn "SKIP_GATES=1: checks will be skipped"
 [[ "${SKIP_TESTPYPI:-0}" == "1" ]] && warn "SKIP_TESTPYPI=1: going straight to PyPI"
 echo
@@ -424,29 +426,25 @@ echo
 ok "${PKG_NAME} ${VERSION} released to PyPI"
 echo "  https://pypi.org/project/${PKG_NAME}/${VERSION}/"
 
-# ── 6. GitHub release ─────────────────────────────────────────────────────
+# ── 6. Tag and GitHub release: printed, not executed ──────────────────────
+#
+# The script stops short of touching git. Tagging rewrites local history and
+# pushes to a shared remote, and cutting a release is a public act; neither
+# should happen as a side effect of a script the operator is watching scroll
+# past. Everything needed is prepared here and handed over as commands to run.
 echo
-if ! command -v gh >/dev/null; then
-    warn "gh CLI not found: skipping the GitHub release."
-    echo "Tag it by hand when you're ready:"
-    echo "  git tag -a ${TAG} -m 'Release ${TAG}' && git push origin ${TAG}"
-    exit 0
-fi
+say "→ Preparing the release notes"
 
-confirm "Tag ${TAG} and create the GitHub release?"
-
-say "→ Tagging ${TAG} at the commit the artifacts were built from"
 if [[ "$(git -C "${REPO_DIR}" rev-parse HEAD)" != "${BUILD_SHA}" ]]; then
     warn "HEAD has moved since the build (${BUILD_SHA} -> $(git -C "${REPO_DIR}" rev-parse --short HEAD))"
-    warn "the tag will point at the commit that was actually built and published"
+    warn "the tag command below pins the commit that was actually built and published"
 fi
-git -C "${REPO_DIR}" tag -a "${TAG}" -m "Release ${TAG}" "${BUILD_SHA}"
-git -C "${REPO_DIR}" push origin "${TAG}"
 
-say "→ Creating the GitHub release with the artifacts attached"
-NOTES_FILE="$(mktemp)"
-trap 'rm -f "${NOTES_FILE}"' EXIT
-# Take this version's section out of the changelog as the release notes.
+# Take this version's section out of the changelog as the release notes. This
+# goes to a real file rather than a mktemp: the gh command below is run by hand
+# afterwards, so the notes have to outlive this process. `make clean` and the
+# next run's "Cleaning previous artifacts" step both remove it with dist/.
+NOTES_FILE="${REPO_DIR}/dist/RELEASE_NOTES_${VERSION}.md"
 awk -v ver="${VERSION}" '
     $0 ~ "^## \\[" ver "\\]" { inside = 1; next }
     inside && /^## \[/       { exit }
@@ -454,16 +452,32 @@ awk -v ver="${VERSION}" '
 ' "${REPO_DIR}/CHANGELOG.md" > "${NOTES_FILE}"
 [[ -s "${NOTES_FILE}" ]] || die "extracted release notes for ${VERSION} are empty"
 printf '\n---\n\nInstall: `pip install %s==%s`\n' "${PKG_NAME}" "${VERSION}" >> "${NOTES_FILE}"
+ok "release notes written to ${NOTES_FILE}"
 
 REPO_SLUG="$(git -C "${REPO_DIR}" remote get-url origin \
     | sed -E 's#\.git$##' \
     | sed -E 's#.*[:/]([^/]+/[^/]+)$#\1#')"
 
-gh release create "${TAG}" "${REPO_DIR}"/dist/* \
-    --title "${TAG}" \
-    --notes-file "${NOTES_FILE}" \
-    --repo "${REPO_SLUG}"
+command -v gh >/dev/null \
+    || warn "gh CLI not found: install it, or create the release from the web UI"
+
+printf '\n%s════════════════════════════════════════════════════════════%s\n' "${BLUE}" "${RESET}"
+printf '%s  %s %s is on PyPI.%s\n' "${BLUE}" "${PKG_NAME}" "${VERSION}" "${RESET}"
+printf '%s  Run these to tag it and cut the GitHub release:%s\n' "${BLUE}" "${RESET}"
+printf '%s════════════════════════════════════════════════════════════%s\n\n' "${BLUE}" "${RESET}"
+
+# Only the two artifact globs, never dist/*: the notes file lives there too and
+# must not end up attached to the release.
+cat <<EOF
+git tag -a ${TAG} -m 'Release ${TAG}' ${BUILD_SHA}
+git push origin ${TAG}
+
+gh release create ${TAG} \\
+    ${REPO_DIR}/dist/*.tar.gz ${REPO_DIR}/dist/*.whl \\
+    --title ${TAG} \\
+    --notes-file ${NOTES_FILE} \\
+    --repo ${REPO_SLUG}
+EOF
 
 echo
-ok "GitHub release ${TAG} created"
-echo "  https://github.com/${REPO_SLUG}/releases/tag/${TAG}"
+echo "Once that is done: https://github.com/${REPO_SLUG}/releases/tag/${TAG}"

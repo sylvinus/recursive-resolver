@@ -154,8 +154,10 @@ found before continuing. It:
    **actually resolves a name**, checking that a signed zone validates and that
    a multi-chunk DKIM key joins without a separator;
 6. uploads to PyPI;
-7. tags, pushes, and creates the GitHub release with the artifacts attached and
-   the changelog section as the notes.
+7. prints the `git tag`, `git push` and `gh release create` commands, with the
+   changelog section already extracted to `dist/RELEASE_NOTES_<version>.md`.
+   It does not run them: tagging rewrites history and a release is public, so
+   both stay a deliberate act by whoever is running the release.
 
 `SKIP_GATES=1` skips step 2 on a retry; `SKIP_TESTPYPI=1` goes straight to PyPI.
 
