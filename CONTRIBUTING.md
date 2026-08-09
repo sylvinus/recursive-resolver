@@ -159,6 +159,20 @@ found before continuing. It:
    It does not run them: tagging rewrites history and a release is public, so
    both stay a deliberate act by whoever is running the release.
 
+The GitHub release carries the release notes, the sdist and wheel, and a
+`SHA256SUMS` manifest. Those are the same files twine uploaded moments earlier
+-- nothing rebuilds in between -- so they are byte-identical to PyPI's copy by
+construction. PyPI remains the channel `pip` installs from; the attached copy
+is an archival one, and it is what survives a release being *deleted* on PyPI,
+which unlike yanking stops the files being downloadable at all. `SHA256SUMS`
+makes the two copies comparable: PyPI publishes a sha256 per file at
+`https://pypi.org/pypi/recursive-resolver/<version>/json`, so anyone can check
+that they match without trusting either host.
+
+Run the printed commands promptly. Python builds are not byte-reproducible, so
+rebuilding `dist/` before running them would attach artifacts that differ from
+the ones on PyPI even though the source is identical.
+
 `SKIP_GATES=1` skips step 2 on a retry; `SKIP_TESTPYPI=1` goes straight to PyPI.
 
 ### Prerequisites

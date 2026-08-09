@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
-# Interactive release for recursive-resolver: PyPI, then a GitHub release.
+# Interactive release for recursive-resolver: publishes to PyPI, then prints
+# the commands to tag it and cut the GitHub release.
 #
 # The structure of this script: the interactive gates, the hermetic
 # build-and-upload inside Docker, and the artifact-inspection step: is adapted
@@ -23,7 +24,8 @@
 #   5. Upload to TestPyPI, then smoke-install and actually resolve a name
 #   6. Upload to PyPI
 #   7. Print the git tag / push / gh release commands. The script never runs
-#      them: it does not touch git state or publish a release itself.
+#      them: it does not touch git state or publish a release itself. The
+#      release carries the notes, the artifacts and a SHA256SUMS manifest.
 #
 # Every gate is interactive (y/N). Ctrl-C bails out at any point.
 #
@@ -454,6 +456,23 @@ awk -v ver="${VERSION}" '
 printf '\n---\n\nInstall: `pip install %s==%s`\n' "${PKG_NAME}" "${VERSION}" >> "${NOTES_FILE}"
 ok "release notes written to ${NOTES_FILE}"
 
+# Checksums of the exact files that were just uploaded. Computed in the
+# container rather than on the host: macOS ships `shasum`, not `sha256sum`, and
+# the whole point of this script is that the host needs only Docker and git.
+# Only the two artifacts are hashed, never dist/*, or the notes file and this
+# file itself would end up in the manifest.
+SUMS_FILE="${REPO_DIR}/dist/SHA256SUMS"
+say "→ Checksumming the published artifacts"
+in_container "${PYTHON_IMAGE}" bash -c '
+    set -euo pipefail
+    cd dist
+    sha256sum -- *.tar.gz *.whl > SHA256SUMS
+' >/dev/null
+[[ -s "${SUMS_FILE}" ]] || die "failed to write ${SUMS_FILE}"
+cat "${SUMS_FILE}"
+ok "checksums written to ${SUMS_FILE}"
+echo "  compare against https://pypi.org/pypi/${PKG_NAME}/${VERSION}/json (digests.sha256)"
+
 REPO_SLUG="$(git -C "${REPO_DIR}" remote get-url origin \
     | sed -E 's#\.git$##' \
     | sed -E 's#.*[:/]([^/]+/[^/]+)$#\1#')"
@@ -466,14 +485,23 @@ printf '%s  %s %s is on PyPI.%s\n' "${BLUE}" "${PKG_NAME}" "${VERSION}" "${RESET
 printf '%s  Run these to tag it and cut the GitHub release:%s\n' "${BLUE}" "${RESET}"
 printf '%s════════════════════════════════════════════════════════════%s\n\n' "${BLUE}" "${RESET}"
 
-# Only the two artifact globs, never dist/*: the notes file lives there too and
-# must not end up attached to the release.
+# The artifacts are attached as an archival copy. They are the same files twine
+# just uploaded -- nothing rebuilds between the build step and here -- so they
+# are byte-identical to PyPI's by construction, not by hope. PyPI is still the
+# distribution channel that pip uses; this copy is what survives a release
+# being *deleted* there (deletion, unlike yanking, stops the files being
+# downloadable at all) and lets anyone answer "what was in this version?"
+# against an immutable tag.
+#
+# SHA256SUMS is what makes that claim checkable rather than asserted: PyPI
+# publishes a sha256 per file, so a third party can confirm the two copies
+# match without trusting either host.
 cat <<EOF
 git tag -a ${TAG} -m 'Release ${TAG}' ${BUILD_SHA}
 git push origin ${TAG}
 
 gh release create ${TAG} \\
-    ${REPO_DIR}/dist/*.tar.gz ${REPO_DIR}/dist/*.whl \\
+    ${REPO_DIR}/dist/*.tar.gz ${REPO_DIR}/dist/*.whl ${SUMS_FILE} \\
     --title ${TAG} \\
     --notes-file ${NOTES_FILE} \\
     --repo ${REPO_SLUG}
