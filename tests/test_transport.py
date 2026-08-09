@@ -18,6 +18,7 @@ import pytest
 from conftest import make_response
 
 from recursive_resolver import RecursiveResolver
+from recursive_resolver import resolver as resolver_module
 from recursive_resolver.resolver import _FatalServerError, _MalformedResponseError, _RetryableError
 
 QNAME = dns.name.from_text("example.com.")
@@ -149,7 +150,7 @@ class TestServerRotation:
 
         with (
             patch.object(resolver, "_query_once", side_effect=query_once),
-            patch("recursive_resolver.resolver.random.shuffle", lambda seq: None),
+            patch.object(resolver_module._RANDOM, "shuffle", lambda seq: None),
         ):
             ctx = resolver._new_context()
             response, server = resolver._send_query(QNAME, dns.rdatatype.A, ["1.1.1.1", "9.9.9.9"], ctx)
@@ -221,7 +222,7 @@ class TestBreadthFirstSweep:
 
         with (
             patch.object(resolver, "_query_once", side_effect=query_once),
-            patch("recursive_resolver.resolver.random.shuffle", lambda seq: None),
+            patch.object(resolver_module._RANDOM, "shuffle", lambda seq: None),
         ):
             ctx = resolver._new_context()
             response, server = resolver._send_query(QNAME, dns.rdatatype.A, ["1.1.1.1", "9.9.9.9"], ctx)
@@ -260,7 +261,7 @@ class TestBreadthFirstSweep:
 
         with (
             patch.object(resolver, "_query_once", side_effect=query_once),
-            patch("recursive_resolver.resolver.random.shuffle", lambda seq: None),
+            patch.object(resolver_module._RANDOM, "shuffle", lambda seq: None),
         ):
             ctx = resolver._new_context()
             response, server = resolver._send_query(QNAME, dns.rdatatype.A, ["1.1.1.1", "9.9.9.9"], ctx)
@@ -281,7 +282,7 @@ class TestBreadthFirstSweep:
 
         with (
             patch.object(resolver, "_query_once", side_effect=query_once),
-            patch("recursive_resolver.resolver.random.shuffle", lambda seq: None),
+            patch.object(resolver_module._RANDOM, "shuffle", lambda seq: None),
         ):
             ctx = resolver._new_context()
             response, _ = resolver._send_query(QNAME, dns.rdatatype.A, ["1.1.1.1", "9.9.9.9"], ctx)

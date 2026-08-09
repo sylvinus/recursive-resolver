@@ -17,7 +17,7 @@ import dns.name
 import dns.rcode
 import dns.rdatatype
 import pytest
-from conftest import make_response, referral, root_to_com
+from conftest import make_response, offline_resolver, referral, root_to_com
 
 from recursive_resolver import (
     AddressFilter,
@@ -39,12 +39,6 @@ from recursive_resolver.roots import ROOT_SERVERS, get_root_addresses
 from recursive_resolver.singleflight import SingleFlight
 
 EXAMPLE = dns.name.from_text("example.com.")
-
-
-def _resolver(**kwargs) -> RecursiveResolver:
-    kwargs.setdefault("dnssec", False)
-    kwargs.setdefault("cache_enabled", False)
-    return RecursiveResolver(**kwargs)
 
 
 class TestEntryPoints:
@@ -185,6 +179,14 @@ class TestConstruction:
         with patch("recursive_resolver.resolver.cryptography_available", return_value=False):
             assert RecursiveResolver(dnssec=False) is not None
 
+    def test_an_empty_trust_anchor_tuple_is_not_a_silent_fallback(self) -> None:
+        """() must not quietly mean "use the IANA anchors", which is its opposite."""
+        with pytest.raises(ValueError, match="must not be empty"):
+            RecursiveResolver(dnssec=True, trust_anchors=())
+
+    def test_trust_anchors_none_uses_the_iana_defaults(self) -> None:
+        assert len(RecursiveResolver(dnssec=True, trust_anchors=None)._validator._root_ds) == 2
+
     def test_idna_2008_is_preferred(self) -> None:
         assert RecursiveResolver._default_idna_codec() is dns.name.IDNA_2008_Practical
 
@@ -196,32 +198,32 @@ class TestConstruction:
         assert "IDNA 2008 unavailable" in caplog.text
 
     def test_ipv6_mode_includes_v6_roots(self) -> None:
-        resolver = _resolver(ipv4_only=False)
+        resolver = offline_resolver(ipv4_only=False)
         assert any(":" in a for a in resolver._root_addresses)
 
 
 class TestInputValidationEdges:
     def test_meta_rdtypes_are_refused(self) -> None:
         with pytest.raises(UnsupportedRdtypeError) as exc:
-            _resolver().resolve("example.com", "AXFR")
+            offline_resolver().resolve("example.com", "AXFR")
         assert "meta" in str(exc.value)
 
     def test_any_is_permitted(self) -> None:
-        assert _resolver()._parse_rdtype("ANY") == dns.rdatatype.ANY
+        assert offline_resolver()._parse_rdtype("ANY") == dns.rdatatype.ANY
 
     def test_relative_names_are_made_absolute(self) -> None:
-        assert _resolver()._normalize_qname("example.com", "A").is_absolute()
+        assert offline_resolver()._normalize_qname("example.com", "A").is_absolute()
 
     def test_non_string_input(self) -> None:
         from recursive_resolver import InvalidNameError
 
         with pytest.raises(InvalidNameError):
-            _resolver().resolve(None, "A")  # type: ignore[arg-type]
+            offline_resolver().resolve(None, "A")  # type: ignore[arg-type]
 
     def test_idna_failure_is_reported_as_an_invalid_name(self) -> None:
         from recursive_resolver import InvalidNameError
 
-        resolver = _resolver()
+        resolver = offline_resolver()
         with (
             patch("dns.name.from_text", side_effect=UnicodeError("bad idna")),
             pytest.raises(InvalidNameError) as exc,
@@ -232,7 +234,7 @@ class TestInputValidationEdges:
     def test_other_dns_errors_are_reported_as_invalid_names(self) -> None:
         from recursive_resolver import InvalidNameError
 
-        resolver = _resolver()
+        resolver = offline_resolver()
         with (
             patch("dns.name.from_text", side_effect=dns.exception.SyntaxError("nope")),
             pytest.raises(InvalidNameError),
@@ -242,7 +244,7 @@ class TestInputValidationEdges:
 
 class TestLoopErrorPaths:
     def test_deadline_inside_the_delegation_loop(self) -> None:
-        resolver = _resolver(max_resolution_time=0.05)
+        resolver = offline_resolver(max_resolution_time=0.05)
         calls = 0
 
         def send(qname, rdtype, nameservers, ctx):
@@ -256,7 +258,7 @@ class TestLoopErrorPaths:
 
     def test_stale_glue_falls_back_to_resolving_ns_names(self) -> None:
         """Dead glue must not end the resolution while a live NS name exists."""
-        resolver = _resolver()
+        resolver = offline_resolver()
 
         def send(qname, rdtype, nameservers, ctx):
             if qname == dns.name.from_text("ns2.otherdns.net."):
@@ -283,7 +285,7 @@ class TestLoopErrorPaths:
         """Dead glue plus an unresolvable NS name must fail without spinning."""
         from recursive_resolver import ResolverError
 
-        resolver = _resolver()
+        resolver = offline_resolver()
         calls = 0
 
         def send(qname, rdtype, nameservers, ctx):
@@ -300,7 +302,7 @@ class TestLoopErrorPaths:
         assert calls < 200, f"stale-glue fallback was not bounded: {calls} queries"
 
     def test_cname_chain_limit(self) -> None:
-        resolver = _resolver(max_cname_chain=2)
+        resolver = offline_resolver(max_cname_chain=2)
 
         def send(qname, rdtype, nameservers, ctx):
             if nameservers and nameservers[0] in resolver._root_addresses:
@@ -314,7 +316,7 @@ class TestLoopErrorPaths:
             resolver.resolve("c0.example.com", "A")
 
     def test_nxdomain_without_aa_is_not_trusted(self) -> None:
-        resolver = _resolver()
+        resolver = offline_resolver()
         classification = resolver._classify_response(
             make_response(rcode=dns.rcode.NXDOMAIN, aa=False), EXAMPLE, dns.rdatatype.A, EXAMPLE
         )
@@ -322,7 +324,7 @@ class TestLoopErrorPaths:
         assert "AA" in classification["detail"]
 
     def test_nodata_without_aa_is_not_trusted(self) -> None:
-        resolver = _resolver()
+        resolver = offline_resolver()
         response = make_response(
             authority=[("example.com.", 300, "SOA", ["ns1.example.com. a.example.com. 1 3600 900 604800 86400"])],
             aa=False,
@@ -331,7 +333,7 @@ class TestLoopErrorPaths:
         assert classification["type"] == "error"
 
     def test_require_authoritative_can_be_relaxed(self) -> None:
-        resolver = _resolver(require_authoritative=False)
+        resolver = offline_resolver(require_authoritative=False)
         classification = resolver._classify_response(
             make_response(answer=[("example.com.", 300, "A", ["1.2.3.4"])], aa=False),
             EXAMPLE,
@@ -341,7 +343,7 @@ class TestLoopErrorPaths:
         assert classification["type"] == "answer"
 
     def test_negative_ttl_without_an_soa(self) -> None:
-        assert _resolver()._negative_ttl(make_response(), EXAMPLE) is None
+        assert offline_resolver()._negative_ttl(make_response(), EXAMPLE) is None
 
     def test_delegation_is_not_cached_without_a_ttl(self) -> None:
         resolver = RecursiveResolver(dnssec=False, cache_enabled=True)
@@ -356,13 +358,13 @@ class TestLoopErrorPaths:
         assert resolver.cache.get_delegation(EXAMPLE) is None
 
     def test_ns_resolution_stops_when_the_budget_is_gone(self) -> None:
-        resolver = _resolver(limits=Limits(max_queries=1))
+        resolver = offline_resolver(limits=Limits(max_queries=1))
         ctx = resolver._new_context()
         ctx.budget.spend_query("x.", "A")
         assert resolver._resolve_ns_names([dns.name.from_text("ns.example.com.")], ctx, 1, limit=5) == []
 
     def test_all_servers_erroring_raises_servfail(self) -> None:
-        resolver = _resolver()
+        resolver = offline_resolver()
 
         def send(qname, rdtype, nameservers, ctx):
             return make_response(rcode=dns.rcode.REFUSED, aa=False), nameservers[0]
@@ -428,7 +430,7 @@ class TestFinalBranches:
 
     def test_relative_names_are_absolutised(self) -> None:
         """Defensive guard: dnspython normally returns an absolute name."""
-        resolver = _resolver()
+        resolver = offline_resolver()
         relative = dns.name.from_text("example.com", origin=None)
         assert not relative.is_absolute()
         with patch("dns.name.from_text", return_value=relative):
@@ -436,7 +438,7 @@ class TestFinalBranches:
 
     def test_deadline_expiring_mid_loop(self) -> None:
         """The deadline is re-checked before every query, not just at entry."""
-        resolver = _resolver()
+        resolver = offline_resolver()
         expired = iter([False, False, True])
 
         with (
@@ -451,7 +453,7 @@ class TestFinalBranches:
 
     def test_an_already_expired_budget_short_circuits(self) -> None:
         """A sub-resolution entered after the deadline must not send anything."""
-        resolver = _resolver()
+        resolver = offline_resolver()
         with (
             patch("recursive_resolver.budget.QueryBudget.expired", return_value=True),
             patch.object(resolver, "_send_query") as send,
@@ -462,7 +464,7 @@ class TestFinalBranches:
 
     def test_dead_glue_falls_back_to_a_live_ns_name(self) -> None:
         """Glue that passes the address filter but never answers."""
-        resolver = _resolver()
+        resolver = offline_resolver()
 
         def send(qname, rdtype, nameservers, ctx):
             # The in-zone NS name fails cheaply; the sibling one resolves.
@@ -490,7 +492,7 @@ class TestFinalBranches:
 
     def test_additional_records_for_other_names_are_ignored(self) -> None:
         """Only glue for the referral's own NS names may be used."""
-        resolver = _resolver()
+        resolver = offline_resolver()
         response = make_response(
             authority=[("example.com.", 300, "NS", ["ns1.example.com."])],
             additional=[("unrelated.example.com.", 300, "A", ["9.9.9.9"])],
@@ -502,7 +504,7 @@ class TestFinalBranches:
         assert glue == []
 
     def test_non_address_additional_records_are_ignored(self) -> None:
-        resolver = _resolver()
+        resolver = offline_resolver()
         response = make_response(
             authority=[("example.com.", 300, "NS", ["ns1.example.com."])],
             additional=[("ns1.example.com.", 300, "TXT", ['"not an address"'])],
@@ -514,7 +516,7 @@ class TestFinalBranches:
         assert glue == []
 
     def test_aaaa_glue_is_ignored_in_ipv4_only_mode(self) -> None:
-        resolver = _resolver(ipv4_only=True)
+        resolver = offline_resolver(ipv4_only=True)
         response = make_response(
             authority=[("example.com.", 300, "NS", ["ns1.example.com."])],
             additional=[("ns1.example.com.", 300, "AAAA", ["2001:500:2::c"])],
@@ -526,7 +528,7 @@ class TestFinalBranches:
         assert glue == []
 
     def test_aaaa_glue_is_used_in_dual_stack_mode(self) -> None:
-        resolver = _resolver(ipv4_only=False)
+        resolver = offline_resolver(ipv4_only=False)
         response = make_response(
             authority=[("example.com.", 300, "NS", ["ns1.example.com."])],
             additional=[("ns1.example.com.", 300, "AAAA", ["2001:500:2::c"])],
@@ -560,7 +562,7 @@ class TestBranchCompleteness:
 
     def test_explicit_cname_query_skips_cname_chasing(self) -> None:
         """Asking for a CNAME means the CNAME is the answer, not a redirect."""
-        resolver = _resolver()
+        resolver = offline_resolver()
         classification = resolver._classify_response(
             make_response(rcode=dns.rcode.NXDOMAIN, aa=True), EXAMPLE, dns.rdatatype.CNAME, EXAMPLE
         )
@@ -579,7 +581,7 @@ class TestBranchCompleteness:
         assert resolver.cache.get_delegation(EXAMPLE) is None
 
     def test_negative_ttl_ignores_unrelated_authority_records(self) -> None:
-        resolver = _resolver()
+        resolver = offline_resolver()
         response = make_response(
             authority=[
                 ("example.com.", 300, "NS", ["ns1.example.com."]),
@@ -624,7 +626,7 @@ class TestDSQueries:
 
     def test_ds_in_a_referral_authority_is_the_answer(self) -> None:
         """Parents that reply with a referral still carry the DS in authority."""
-        resolver = _resolver()
+        resolver = offline_resolver()
         response = make_response(
             authority=[
                 ("example.com.", 300, "DS", ["2371 13 2 " + "ab" * 32]),
@@ -638,7 +640,7 @@ class TestDSQueries:
 
     def test_a_ds_query_never_descends_past_the_zone_cut(self) -> None:
         """Without a DS present, the parent has told us there is none."""
-        resolver = _resolver()
+        resolver = offline_resolver()
         response = make_response(
             authority=[("example.com.", 300, "NS", ["ns1.example.com."])],
             additional=[("ns1.example.com.", 300, "A", ["9.9.9.9"])],
@@ -650,7 +652,7 @@ class TestDSQueries:
 
     def test_a_ds_query_below_the_cut_still_follows_referrals(self) -> None:
         """Only a delegation for the qname itself is off limits."""
-        resolver = _resolver()
+        resolver = offline_resolver()
         response = make_response(
             authority=[("example.com.", 300, "NS", ["ns1.example.com."])],
             additional=[("ns1.example.com.", 300, "A", ["9.9.9.9"])],
@@ -663,7 +665,7 @@ class TestDSQueries:
 
     def test_ds_query_with_no_ds_in_the_authority(self) -> None:
         """The parent delegates but publishes no DS: the zone is unsigned."""
-        resolver = _resolver()
+        resolver = offline_resolver()
         response = make_response(
             authority=[
                 ("example.com.", 300, "NS", ["ns1.example.com."]),
@@ -685,7 +687,7 @@ class TestStaleDelegationFallback:
     """
 
     def test_refused_servers_fall_back_to_the_other_ns_names(self) -> None:
-        resolver = _resolver()
+        resolver = offline_resolver()
         stale, live = "5.5.5.5", "9.9.9.9"
 
         def send(qname, rdtype, nameservers, ctx):
@@ -715,13 +717,13 @@ class TestStaleDelegationFallback:
             assert resolver.resolve("example.com", "A") == ["1.2.3.4"]
 
     def test_the_fallback_never_re_tries_addresses_already_used(self) -> None:
-        resolver = _resolver()
+        resolver = offline_resolver()
         ctx = resolver._new_context()
         with patch.object(resolver, "_resolve_ns_names", return_value=["9.9.9.9", "1.1.1.1"]):
             fresh = resolver._fallback_nameservers([dns.name.from_text("ns.example.net.")], {"9.9.9.9"}, ctx, 0)
         assert fresh == ["1.1.1.1"]
 
     def test_no_ns_names_means_no_fallback(self) -> None:
-        resolver = _resolver()
+        resolver = offline_resolver()
         ctx = resolver._new_context()
         assert resolver._fallback_nameservers([], set(), ctx, 0) == []

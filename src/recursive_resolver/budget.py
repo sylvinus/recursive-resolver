@@ -84,7 +84,12 @@ class Limits:
             without usable glue.
         max_nx_targets: NS-hostname resolutions allowed to fail before the
             call is abandoned. The core NXNSAttack control.
-        max_referrals: Referrals allowed to be followed in one call.
+        max_referrals: Referrals allowed to be followed in one call, summed
+            over the whole call tree. Within a single ``_resolve_iterative``
+            frame the binding limit is the resolver's ``max_depth`` (20 by
+            default), which is far below this: ``max_referrals`` bounds the
+            fan-out across NS-hostname sub-resolutions, not the depth of any
+            one delegation walk.
         max_signature_validations: RRSIG verifications allowed in one call
             (KeyTrap).
         max_nsec3_hashes: NSEC3 hash computations allowed in one call
@@ -118,6 +123,8 @@ class QueryBudget:
         max_queries: Total upstream DNS queries allowed for the whole call.
         max_nx_targets: Total NS-hostname resolutions allowed to fail.
         max_referrals: Total referrals allowed to be followed.
+        max_signature_validations: Total RRSIG verifications allowed (KeyTrap).
+        max_nsec3_hashes: Total NSEC3 hash computations allowed (KeyTrap).
         deadline: Absolute ``time.monotonic()`` value after which the
             resolution is abandoned.
     """

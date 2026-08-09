@@ -182,7 +182,13 @@ class DNSSECValidator:
 
     Args:
         trust_anchors: DS records for the root, in presentation format.
+            Must be non-empty: an empty anchor set can never validate anything,
+            so it is rejected rather than silently treated as "use the
+            defaults".
         max_nsec3_iterations: Reject NSEC3 records above this iteration count.
+
+    Raises:
+        ValueError: If ``trust_anchors`` is empty.
     """
 
     def __init__(
@@ -190,6 +196,8 @@ class DNSSECValidator:
         trust_anchors: tuple[str, ...] = ROOT_TRUST_ANCHORS,
         max_nsec3_iterations: int = MAX_NSEC3_ITERATIONS,
     ) -> None:
+        if not trust_anchors:
+            raise ValueError("trust_anchors must not be empty; pass None to use the IANA root anchors")
         self.max_nsec3_iterations = max_nsec3_iterations
         self._root_ds = dns.rdataset.Rdataset(dns.rdataclass.IN, dns.rdatatype.DS)
         for anchor in trust_anchors:
@@ -520,6 +528,8 @@ class DNSSECValidator:
         if next_closer is None:  # pragma: no cover - extra >= 1 guarantees a next closer
             return False
         params = nsec3s[0][0]
+        if params.iterations > self.max_nsec3_iterations:
+            return False
         return any(self._nsec3_covers(next_closer, n, params, budget) for n in nsec3s)
 
     def _wildcard_denied_nsec(self, qname: dns.name.Name, nsecs: list[dns.rrset.RRset]) -> bool:

@@ -12,6 +12,8 @@ import dns.rdatatype
 import dns.rrset
 import pytest
 
+from recursive_resolver import RecursiveResolver
+
 # Every supported type that a plain list of apex domains can exercise. PTR
 # needs an IP, and SRV/NAPTR need _service._proto labels, so they are covered by
 # the unit and integration suites instead.
@@ -113,3 +115,14 @@ def sequence(responses: list[tuple[dns.message.Message, str]]):
         return (None, "")
 
     return side_effect
+
+
+def offline_resolver(**kwargs: object) -> RecursiveResolver:
+    """A resolver wired for unit tests: no DNSSEC, no cache, unless overridden.
+
+    Shared rather than redefined per module so the defaults for offline unit
+    tests are set in one place.
+    """
+    kwargs.setdefault("dnssec", False)
+    kwargs.setdefault("cache_enabled", False)
+    return RecursiveResolver(**kwargs)  # type: ignore[arg-type]

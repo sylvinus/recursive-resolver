@@ -222,6 +222,10 @@ def main() -> int:
     parser.add_argument("--no-tlds", action="store_true", help="Skip the IANA TLD list")
     parser.add_argument("--no-psl", action="store_true", help="Skip the Public Suffix List")
     args = parser.parse_args()
+    if args.limit < 0:
+        # Otherwise a negative limit is truthy below and Python's negative
+        # slicing quietly drops rows from the *end* of the corpus instead.
+        parser.error("--limit must be zero or greater")
 
     rng = random.Random(args.seed)
     collected: list[tuple[str, str]] = list(CURATED)
@@ -253,7 +257,7 @@ def main() -> int:
 
     rows = sorted(seen.items())
     rng.shuffle(rows)
-    if args.limit:
+    if args.limit > 0:
         rows = rows[: args.limit]
 
     with open(args.output, "w", newline="") as handle:

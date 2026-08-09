@@ -61,16 +61,19 @@ clean: ## Remove build artifacts
 # Releases are driven by scripts/release.sh, which is interactive and builds,
 # checks, publishes and tags from inside Docker. See CONTRIBUTING.md.
 
-VERSION := $(shell python3 -c "import re; print(re.search(r'version = \"(.+?)\"', open('pyproject.toml').read()).group(1))")
+# Anchored with re.M, matching the `awk -F'"' '/^version = /'` lookup in
+# scripts/release.sh: unanchored, this returns the first `version = "..."`
+# anywhere in the file, and the two release paths could disagree.
+VERSION := $(shell python3 -c "import re; print(re.search(r'^version = \"(.+?)\"', open('pyproject.toml').read(), re.M).group(1))")
 
 release: ## Interactive release to PyPI and GitHub (see CONTRIBUTING.md)
 	./scripts/release.sh
 
 release-check: check-all ## Everything the release script checks, without publishing
 	@echo "Verifying version consistency..."
-	@PY_VER=$$(python3 -c "import re; print(re.search(r'__version__ = \"(.+?)\"', open('src/recursive_resolver/__init__.py').read()).group(1))"); \
+	@PY_VER=$$(python3 -c "import re; print(re.search(r'^__version__ = \"(.+?)\"', open('src/recursive_resolver/__init__.py').read(), re.M).group(1))"); \
 	if [ "$$PY_VER" != "$(VERSION)" ]; then \
 		echo "ERROR: Version mismatch: __init__.py=$$PY_VER vs pyproject.toml=$(VERSION)"; exit 1; \
 	fi
-	@grep -q "\[$(VERSION)\]" CHANGELOG.md || { echo "ERROR: no CHANGELOG.md entry for $(VERSION)"; exit 1; }
+	@grep -qF "## [$(VERSION)]" CHANGELOG.md || { echo "ERROR: no '## [$(VERSION)]' section in CHANGELOG.md"; exit 1; }
 	@echo "All checks passed. Version: $(VERSION)"

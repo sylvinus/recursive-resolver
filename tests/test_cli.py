@@ -12,8 +12,10 @@ from recursive_resolver.cli import main
 
 
 def _answer(records: str = "1.2.3.4", rdtype: str = "A", dnssec=ValidationState.SECURE) -> Answer:
+    import dns.name
     import dns.rdata
     import dns.rdataclass
+    import dns.rdatatype
     import dns.rrset
 
     rdt = dns.rdatatype.from_text(rdtype)
@@ -79,12 +81,35 @@ class TestErrorHandling:
 
     def test_unknown_rdtype_is_reported_cleanly(self, capsys: pytest.CaptureFixture) -> None:
         """Regression: this used to print a raw dnspython traceback."""
-        assert main(["example.com", "BOGUSTYPE"]) == 1
+        # --no-dnssec: these three tests build a *real* RecursiveResolver, and
+        # with the CLI default of dnssec=True the constructor raises
+        # DNSSECUnavailableError wherever cryptography is missing. main() would
+        # then return 2 from the constructor handler and the assertion would
+        # fail for a reason that has nothing to do with what is under test.
+        assert main(["--no-dnssec", "example.com", "BOGUSTYPE"]) == 1
         assert "UnsupportedRdtypeError" in capsys.readouterr().err
 
     def test_invalid_name_is_reported_cleanly(self, capsys: pytest.CaptureFixture) -> None:
-        assert main(["foo..com"]) == 1
+        assert main(["--no-dnssec", "foo..com"]) == 1
         assert "InvalidNameError" in capsys.readouterr().err
+
+    def test_a_closed_pipe_exits_quietly(self) -> None:
+        """`recursive-resolver example.com | head -1` must not print a traceback."""
+        with (
+            patch("recursive_resolver.cli.RecursiveResolver"),
+            patch("recursive_resolver.cli._run_query", side_effect=BrokenPipeError),
+            patch("recursive_resolver.cli.os.open", return_value=-1),
+            patch("recursive_resolver.cli.os.dup2") as dup2,
+        ):
+            assert main(["--no-dnssec", "example.com"]) == 0
+        assert dup2.called, "stdout was not redirected, so the shutdown flush will raise again"
+
+    def test_contradictory_dnssec_flags_are_a_usage_error(self, capsys: pytest.CaptureFixture) -> None:
+        """Rejected at parse time rather than failing every lookup later."""
+        with pytest.raises(SystemExit) as exc:
+            main(["--no-dnssec", "--require-dnssec", "example.com"])
+        assert exc.value.code == 2
+        assert "not allowed with" in capsys.readouterr().err
 
 
 class TestTextMode:
@@ -138,6 +163,23 @@ class TestTrace:
             cls.return_value.trace_answer.return_value = (None, [])
             assert main(["--trace", "nope.com"]) == 1
 
+    def test_trace_honours_text_mode(self, capsys: pytest.CaptureFixture) -> None:
+        """--text must mean the same thing with --trace as without it."""
+        step = TraceStep(server="1.2.3.4", qname="example.com.", rdtype="A", response_type="answer")
+        with patch("recursive_resolver.cli.RecursiveResolver") as cls:
+            cls.return_value.trace_answer.return_value = (_answer('"chunk1" "chunk2"', "TXT"), [step])
+            assert main(["--trace", "--text", "example.com", "TXT"]) == 0
+        out = capsys.readouterr().out
+        assert "chunk1chunk2" in out
+        assert '" "' not in out
+
+    def test_trace_text_mode_on_a_non_text_type_errors(self, capsys: pytest.CaptureFixture) -> None:
+        step = TraceStep(server="1.2.3.4", qname="example.com.", rdtype="A", response_type="answer")
+        with patch("recursive_resolver.cli.RecursiveResolver") as cls:
+            cls.return_value.trace_answer.return_value = (_answer(), [step])
+            assert main(["--trace", "--text", "example.com"]) == 2
+        assert "character-string" in capsys.readouterr().err
+
 
 class TestOptionPlumbing:
     def test_security_options_reach_the_resolver(self) -> None:
@@ -178,7 +220,10 @@ class TestOptionPlumbing:
         assert cls.call_args.kwargs["max_delegation_cache_depth"] == "2"
 
     def test_an_unknown_cache_depth_is_reported_cleanly(self, capsys: pytest.CaptureFixture) -> None:
-        assert main(["--cache-depth", "sometimes", "example.com"]) == 2
+        # --no-dnssec for the same reason as above: the DNSSEC availability
+        # check runs before cache construction, so without it the message on
+        # stderr would be DNSSECUnavailableError, not the cache-depth one.
+        assert main(["--no-dnssec", "--cache-depth", "sometimes", "example.com"]) == 2
         assert "unknown cache depth" in capsys.readouterr().err
 
 

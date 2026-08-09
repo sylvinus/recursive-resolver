@@ -348,7 +348,14 @@ class TestWildcardExpansion:
 
     @staticmethod
     def _wildcard_chain(*, proof: bool):
-        """A signed zone answering `victim.test.` from its `*.test.` wildcard."""
+        """A signed zone answering `victim.test.` from its `*.test.` wildcard.
+
+        With ``proof=False`` this is the attack: the wildcard's data and
+        signature are presented under a name that really has its own, different
+        record, and no denial proof accompanies them. On the wire the RRSIG
+        owner must match the RRset it covers, so the owner is rewritten too; the
+        rdata (labels=2) is untouched, and that is what still verifies.
+        """
         root = SignedZone.create(".")
         leaf = SignedZone.create("test.")
         wild = rrset_of("*.test.", "A", "192.0.2.99")
@@ -409,53 +416,7 @@ class TestWildcardExpansion:
 
     def test_the_resolver_refuses_an_unproven_wildcard_answer(self) -> None:
         """End to end: a replayed wildcard signature must not validate as SECURE."""
-        root = SignedZone.create(".")
-        leaf = SignedZone.create("test.")
-        wild = rrset_of("*.test.", "A", "192.0.2.99")
-        wild_sig = leaf.sign(wild)
-        # The attacker presents the wildcard's data and signature under a name
-        # that really has its own, different record. On the wire the RRSIG owner
-        # must match the RRset it covers, so the owner is rewritten too; the
-        # rdata (labels=2) is untouched, and that is what still verifies.
-        forged = rrset_of("victim.test.", "A", "192.0.2.99")
-        forged_sig = dns.rrset.RRset(dns.name.from_text("victim.test."), dns.rdataclass.IN, dns.rdatatype.RRSIG)
-        forged_sig.add(wild_sig[0])
-        forged_sig.ttl = wild_sig.ttl
-
-        def dnskey_response(zone: SignedZone):
-            response = make_response()
-            response.answer.append(zone.dnskey_rrset)
-            response.answer.append(zone.signed_dnskey())
-            return response
-
-        ds = root.ds_rrset(leaf)
-        referral_response = make_response(
-            authority=[("test.", 3600, "NS", ["ns.test."])],
-            additional=[("ns.test.", 3600, "A", ["9.9.9.9"])],
-            aa=False,
-        )
-        referral_response.authority.append(ds)
-        referral_response.authority.append(root.sign(ds))
-
-        answer_response = make_response()
-        answer_response.answer.append(forged)
-        answer_response.answer.append(forged_sig)  # no denial proof in authority
-
-        table = {
-            (dns.name.root, dns.rdatatype.DNSKEY): dnskey_response(root),
-            (leaf.name, dns.rdatatype.DNSKEY): dnskey_response(leaf),
-        }
-        state = {"step": 0}
-
-        def send(qname, rdtype, nameservers, ctx):
-            if (qname, rdtype) in table:
-                return table[(qname, rdtype)], "9.9.9.9"
-            state["step"] += 1
-            if state["step"] == 1:
-                return referral_response, "198.41.0.4"
-            return answer_response, "9.9.9.9"
-
-        resolver = RecursiveResolver(max_resolution_time=5, trust_anchors=(root.anchor_text(),))
+        resolver, send = self._wildcard_chain(proof=False)
         with (
             patch.object(resolver, "_send_query", side_effect=send),
             pytest.raises(DNSSECValidationError, match="wildcard"),

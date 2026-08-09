@@ -147,8 +147,9 @@ found before continuing. It:
    `build` or `twine`, and runs `twine check`;
 4. inspects the artifacts against what this package promises: `py.typed`
    present, no tests or scripts in the wheel, LICENSE bundled, and the
-   `dnspython` floor at or above the 2.6.1 security floor with the `dnssec` and
-   `idna` extras;
+   `dnspython` floor at or above the 2.8.0 security floor with the `dnssec` and
+   `idna` extras. It reads these out of the built wheel's `METADATA`, not out
+   of `pyproject.toml`, so a build that lost them is caught;
 5. uploads to TestPyPI, then installs from there in a throwaway container and
    **actually resolves a name**, checking that a signed zone validates and that
    a multi-chunk DKIM key joins without a separator;

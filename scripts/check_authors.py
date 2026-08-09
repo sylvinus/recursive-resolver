@@ -58,7 +58,10 @@ AI_NAME_PATTERNS = (
     r"\bmistral[\s-]*(?:ai|bot)",
     r"\bllama[\s-]*(?:\d|ai|bot)",
     # The GitHub App convention, e.g. "copilot[bot]" or "openai-codex[bot]".
-    r"\[bot\]",
+    # Scoped to the AI apps on purpose: this check runs on every pull request,
+    # and a bare `\[bot\]` would fail dependabot[bot], renovate[bot] and
+    # github-actions[bot], which the policy is not about.
+    r"\b(?:copilot|codex|claude|devin|cursor|gemini|chatgpt|openai|anthropic|aider)[\w.-]*\[bot\]",
 )
 
 MATCHER = re.compile("|".join(AI_EMAIL_DOMAINS + AI_NAME_PATTERNS), re.IGNORECASE)
@@ -117,7 +120,9 @@ def main(argv: list[str]) -> int:
         if len(argv) < 2:
             print("--commit-msg needs a path", file=sys.stderr)
             return 2
-        problems = check_message(Path(argv[1]).read_text(), "commit message")
+        # Git writes commit messages as UTF-8; read_text() would otherwise use
+        # the platform default and blow up on an accented name in a trailer.
+        problems = check_message(Path(argv[1]).read_text(encoding="utf-8"), "commit message")
     else:
         rev_range = argv[0] if argv else "origin/main..HEAD"
         problems = check_range(rev_range)

@@ -28,7 +28,11 @@ body:
     id: expected
     attributes:
       label: Expected versus actual
-      description: What you expected, what happened, and what a reference resolver says (`dig +dnssec <domain> <type>`).
+      description: >-
+        What you expected, what happened, and what a reference resolver says.
+        Please query an explicit resolver rather than the system stub —
+        `dig +dnssec @1.1.1.1 <domain> <type>` — because a stub can synthesise
+        a CNAME of its own and the comparison then is not like for like.
     validations:
       required: true
   - type: input

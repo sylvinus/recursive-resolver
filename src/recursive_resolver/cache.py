@@ -102,7 +102,15 @@ class Delegation:
 
 @dataclass
 class CacheStats:
-    """Cache hit/miss statistics."""
+    """Cache hit/miss statistics for *answer* lookups only.
+
+    ``hits`` and ``misses`` are counted by :meth:`DNSCache.get_answer`. The
+    negative and delegation lookups (``get_nxdomain``, ``get_nodata``,
+    ``get_delegation``, ``closest_delegation``) are deliberately not counted,
+    even though in an iterative resolver they are the majority of lookups: this
+    is the "did the cache answer the user's question outright" rate, not a
+    whole-cache rate. ``evictions`` does cover the shared LRU as a whole.
+    """
 
     hits: int = 0
     misses: int = 0
@@ -110,7 +118,7 @@ class CacheStats:
 
     @property
     def hit_rate(self) -> float:
-        """Return the cache hit rate as a float between 0.0 and 1.0."""
+        """Return the answer-lookup hit rate as a float between 0.0 and 1.0."""
         total = self.hits + self.misses
         if total == 0:
             return 0.0
@@ -205,9 +213,15 @@ class DNSCache:
         assignment anywhere silently rewrites what every later lookup returns,
         across every thread. Copying is cheap because the rdata objects inside
         are immutable and stay shared; only the container is duplicated.
+
+        A :class:`Delegation` needs the same treatment for the same reason: its
+        ``addresses`` and ``ns_names`` are mutable lists, so a caller that
+        appends to one would rewrite the cached zone cut for every thread.
         """
         if isinstance(rrset, dns.rrset.RRset):
             return rrset.copy()
+        if isinstance(rrset, Delegation):
+            return replace(rrset, addresses=list(rrset.addresses), ns_names=list(rrset.ns_names))
         return rrset
 
     def get_answer(
@@ -310,7 +324,7 @@ class DNSCache:
         if self.max_delegation_depth is not None and depth > self.max_delegation_depth:
             return
         key: CacheKey = (_DELEGATION, delegation.zone, 0, 0)
-        entry = CacheEntry(rrset=delegation, expiry=time.monotonic() + self._clamp(ttl))
+        entry = CacheEntry(rrset=self._isolate(delegation), expiry=time.monotonic() + self._clamp(ttl))
         with self._lock:
             self._put(key, entry)
 
@@ -321,7 +335,7 @@ class DNSCache:
             if entry is None:
                 return None
             delegation: Delegation = entry.rrset
-            return delegation
+            return self._isolate(delegation)  # type: ignore[no-any-return]
 
     def closest_delegation(self, qname: dns.name.Name) -> Delegation | None:
         """Return the deepest cached delegation that is an ancestor of ``qname``.
@@ -336,7 +350,7 @@ class DNSCache:
                 if entry is not None:
                     delegation: Delegation = entry.rrset
                     if delegation.addresses:
-                        return delegation
+                        return self._isolate(delegation)  # type: ignore[no-any-return]
                 if current == dns.name.root:
                     return None
                 try:

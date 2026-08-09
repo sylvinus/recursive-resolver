@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 
 from . import Answer, RecursiveResolver, ResolverError, ValidationState, __version__
@@ -77,8 +78,14 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="LEVEL",
         help="How deep to cache zone cuts: tld, all, none, or a label depth",
     )
-    parser.add_argument("--no-dnssec", action="store_true", help="Disable DNSSEC validation")
-    parser.add_argument("--require-dnssec", action="store_true", help="Fail unless the answer is DNSSEC-authenticated")
+    # Mutually exclusive: with both set the resolver would be built with
+    # validation off and validation required, and every lookup would fail with
+    # DNSSECInsecureError instead of a usage message.
+    dnssec_group = parser.add_mutually_exclusive_group()
+    dnssec_group.add_argument("--no-dnssec", action="store_true", help="Disable DNSSEC validation")
+    dnssec_group.add_argument(
+        "--require-dnssec", action="store_true", help="Fail unless the answer is DNSSEC-authenticated"
+    )
     parser.add_argument(
         "--allow-private",
         action="store_true",
@@ -119,6 +126,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.trace:
             return _run_trace(resolver, args)
         return _run_query(resolver, args)
+    except BrokenPipeError:
+        # The reader closed the pipe early ("... | head -1"). Point stdout at
+        # /dev/null so the interpreter's shutdown flush does not raise again
+        # and print "Exception ignored" over the user's terminal.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        return 0
     except ResolverError as exc:
         if args.json_output:
             print(json.dumps({"error": type(exc).__name__, "message": str(exc)}), file=sys.stderr)
@@ -127,16 +140,28 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
 
+def _values_for(answer: Answer, args: argparse.Namespace) -> list[str] | None:
+    """The records to print, honouring ``--text``; None if ``--text`` does not apply.
+
+    Shared by the query and trace paths so that ``--text`` means the same thing
+    in both: printing ``answer.records`` for a TXT lookup reintroduces the `" "`
+    seam between character-strings that ``text_values()`` exists to remove, and
+    that seam is what breaks DKIM and SPF.
+    """
+    if not args.text:
+        return answer.records
+    try:
+        return answer.text_values()
+    except TypeError as exc:
+        print(f"--text: {exc}", file=sys.stderr)
+        return None
+
+
 def _run_query(resolver: RecursiveResolver, args: argparse.Namespace) -> int:
     answer = resolver.resolve_answer(args.domain, args.rdtype)
-    if args.text:
-        try:
-            values = answer.text_values()
-        except TypeError as exc:
-            print(f"--text: {exc}", file=sys.stderr)
-            return 2
-    else:
-        values = answer.records
+    values = _values_for(answer, args)
+    if values is None:
+        return 2
 
     if args.json_output:
         print(
@@ -160,6 +185,11 @@ def _run_query(resolver: RecursiveResolver, args: argparse.Namespace) -> int:
 
 def _run_trace(resolver: RecursiveResolver, args: argparse.Namespace) -> int:
     answer, trace = resolver.trace_answer(args.domain, args.rdtype)
+    values = None
+    if answer is not None:
+        values = _values_for(answer, args)
+        if values is None:
+            return 2
     if args.json_output:
         payload = {
             "trace": [
@@ -175,7 +205,7 @@ def _run_trace(resolver: RecursiveResolver, args: argparse.Namespace) -> int:
                 }
                 for step in trace
             ],
-            "records": answer.records if answer else None,
+            "records": values,
             "dnssec": answer.dnssec.value if answer else None,
         }
         print(json.dumps(payload, indent=2))
@@ -184,7 +214,7 @@ def _run_trace(resolver: RecursiveResolver, args: argparse.Namespace) -> int:
             print(f"{step.server:20s} {step.qname:30s} {step.response_type:10s} {step.dnssec:9s} {step.detail}")
         if answer is not None:
             _note_dnssec(answer, args)
-            for record in answer.records:
+            for record in values or []:
                 print(record)
     if answer is None:
         last = trace[-1].response_type if trace else "no response"

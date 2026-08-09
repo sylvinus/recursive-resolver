@@ -20,7 +20,7 @@ import dns.rdataset
 import dns.rdatatype
 import dns.rrset
 import pytest
-from conftest import make_response, referral, root_to_com
+from conftest import make_response, offline_resolver, referral, root_to_com
 
 from recursive_resolver import (
     AddressFilter,
@@ -34,12 +34,6 @@ from recursive_resolver import (
     ServfailError,
     ValidationState,
 )
-
-
-def _resolver(**kwargs):
-    kwargs.setdefault("dnssec", False)
-    kwargs.setdefault("cache_enabled", False)
-    return RecursiveResolver(**kwargs)
 
 
 class TestSSRFProtection:
@@ -134,7 +128,7 @@ class TestSSRFProtection:
 
     def test_hostile_glue_is_never_queried(self) -> None:
         """A zone pointing its glue at internal IPs must not be followed."""
-        resolver = _resolver()
+        resolver = offline_resolver()
         queried: list[list[str]] = []
 
         def send(qname, rdtype, nameservers, ctx):
@@ -159,7 +153,7 @@ class TestSSRFProtection:
 
     def test_resolved_ns_addresses_are_filtered_too(self) -> None:
         """Glueless NS hostnames resolving to private IPs are also rejected."""
-        resolver = _resolver()
+        resolver = offline_resolver()
 
         def send(qname, rdtype, nameservers, ctx):
             if qname == dns.name.from_text("ns.attacker.test."):
@@ -177,7 +171,7 @@ class TestQueryBudget:
 
     def test_glueless_fanout_is_bounded(self) -> None:
         """A hostile zone answering every query with 50 fresh NS names is capped."""
-        resolver = _resolver(limits=Limits(max_queries=40), max_depth=10)
+        resolver = offline_resolver(limits=Limits(max_queries=40), max_depth=10)
         sent = 0
 
         def send(qname, rdtype, nameservers, ctx):
@@ -195,14 +189,14 @@ class TestQueryBudget:
         assert sent <= 200, f"fan-out was not bounded: {sent} queries"
 
     def test_budget_counts_across_subresolutions(self) -> None:
-        resolver = _resolver(limits=Limits(max_queries=5))
+        resolver = offline_resolver(limits=Limits(max_queries=5))
         with pytest.raises(QueryBudgetExceededError):
             ctx = resolver._new_context()
             for _ in range(10):
                 ctx.budget.spend_query("example.com.", "A")
 
     def test_nx_target_budget(self) -> None:
-        resolver = _resolver(limits=Limits(max_nx_targets=2))
+        resolver = offline_resolver(limits=Limits(max_nx_targets=2))
         ctx = resolver._new_context()
         with pytest.raises(QueryBudgetExceededError):
             for _ in range(5):
@@ -210,7 +204,7 @@ class TestQueryBudget:
 
     def test_ns_names_per_referral_are_capped(self) -> None:
         """Only a bounded, randomly sampled subset of NS names is chased."""
-        resolver = _resolver(limits=Limits(max_ns_per_referral=3))
+        resolver = offline_resolver(limits=Limits(max_ns_per_referral=3))
         response = referral("example.com.", [f"ns{i}.example.com." for i in range(50)])
         classification = resolver._classify_response(
             response, dns.name.from_text("example.com."), dns.rdatatype.A, dns.name.root
@@ -224,7 +218,7 @@ class TestReferralValidation:
 
     def test_sideways_referral_is_rejected(self) -> None:
         """A server must not refer us back to its own zone (com. -> com.)."""
-        resolver = _resolver()
+        resolver = offline_resolver()
         response = referral("com.", ["a.gtld-servers.net."])
         classification = resolver._classify_response(
             response, dns.name.from_text("foo.com."), dns.rdatatype.A, dns.name.from_text("com.")
@@ -233,7 +227,7 @@ class TestReferralValidation:
 
     def test_upward_referral_is_rejected(self) -> None:
         """An ancestor zone in the authority section is not a valid referral."""
-        resolver = _resolver()
+        resolver = offline_resolver()
         response = referral(".", ["a.root-servers.net."])
         classification = resolver._classify_response(
             response, dns.name.from_text("foo.example.com."), dns.rdatatype.A, dns.name.from_text("com.")
@@ -242,7 +236,7 @@ class TestReferralValidation:
 
     def test_upward_referral_does_not_crash(self) -> None:
         """Regression: this used to raise dns.name.NoParent out of resolve()."""
-        resolver = _resolver()
+        resolver = offline_resolver()
 
         def send(qname, rdtype, nameservers, ctx):
             return referral(".", ["a.root-servers.net."], {"a.root-servers.net.": "198.41.0.4"}), "1.2.3.4"
@@ -253,7 +247,7 @@ class TestReferralValidation:
 
     def test_unrelated_referral_is_rejected(self) -> None:
         """evil.com's server must not be able to answer for bank.com."""
-        resolver = _resolver()
+        resolver = offline_resolver()
         response = referral("bank.com.", ["ns1.evil.com."])
         classification = resolver._classify_response(
             response, dns.name.from_text("www.evil.com."), dns.rdatatype.A, dns.name.from_text("com.")
@@ -261,7 +255,7 @@ class TestReferralValidation:
         assert classification["type"] != "referral"
 
     def test_valid_downward_referral_is_accepted(self) -> None:
-        resolver = _resolver()
+        resolver = offline_resolver()
         response = referral("example.com.", ["ns1.example.com."])
         classification = resolver._classify_response(
             response, dns.name.from_text("www.example.com."), dns.rdatatype.A, dns.name.from_text("com.")
@@ -270,7 +264,7 @@ class TestReferralValidation:
         assert classification["zone"] == dns.name.from_text("example.com.")
 
     def test_deepest_referral_wins(self) -> None:
-        resolver = _resolver()
+        resolver = offline_resolver()
         response = make_response(
             authority=[
                 ("com.", 172800, "NS", ["a.gtld-servers.net."]),
@@ -285,7 +279,7 @@ class TestReferralValidation:
         assert classification["zone"] == dns.name.from_text("sub.example.com.")
 
     def test_out_of_bailiwick_glue_is_ignored(self) -> None:
-        resolver = _resolver()
+        resolver = offline_resolver()
         response = referral("target.com.", ["ns1.evil.net."], {"ns1.evil.net.": "6.6.6.6"})
         glue = resolver._select_glue(
             response,
@@ -296,7 +290,7 @@ class TestReferralValidation:
         assert glue == []
 
     def test_in_bailiwick_glue_is_accepted(self) -> None:
-        resolver = _resolver()
+        resolver = offline_resolver()
         response = referral("example.com.", ["ns1.example.com."], {"ns1.example.com.": "9.9.9.9"})
         glue = resolver._select_glue(
             response,
@@ -312,7 +306,7 @@ class TestResponseValidation:
 
     def test_nxdomain_with_answer_records_is_rejected(self) -> None:
         """A protocol-violating NXDOMAIN carrying data must not be trusted."""
-        resolver = _resolver()
+        resolver = offline_resolver()
         response = make_response(
             answer=[("example.com.", 300, "A", ["6.6.6.6"])],
             rcode=dns.rcode.NXDOMAIN,
@@ -323,7 +317,7 @@ class TestResponseValidation:
         assert classification["type"] == "error"
 
     def test_answer_without_aa_bit_is_rejected(self) -> None:
-        resolver = _resolver()
+        resolver = offline_resolver()
         response = make_response(answer=[("example.com.", 300, "A", ["1.2.3.4"])], aa=False)
         classification = resolver._classify_response(
             response, dns.name.from_text("example.com."), dns.rdatatype.A, dns.name.from_text("example.com.")
@@ -331,7 +325,7 @@ class TestResponseValidation:
         assert classification["type"] == "error"
 
     def test_answer_with_aa_bit_is_accepted(self) -> None:
-        resolver = _resolver()
+        resolver = offline_resolver()
         response = make_response(answer=[("example.com.", 300, "A", ["1.2.3.4"])], aa=True)
         classification = resolver._classify_response(
             response, dns.name.from_text("example.com."), dns.rdatatype.A, dns.name.from_text("example.com.")
@@ -340,7 +334,7 @@ class TestResponseValidation:
 
     def test_wrong_rdclass_is_not_an_answer(self) -> None:
         """A CHAOS-class RRset must not satisfy an IN-class query."""
-        resolver = _resolver()
+        resolver = offline_resolver()
         response = make_response(
             answer=[("example.com.", 300, "TXT", ['"injected"'])],
             rdclass=dns.rdataclass.CH,
@@ -388,7 +382,7 @@ class TestTruncation:
 
     def test_plain_udp_path_rejects_truncation(self) -> None:
         """Regression: the no-EDNS fallback silently returned partial answers."""
-        resolver = _resolver(use_tcp_fallback=False)
+        resolver = offline_resolver(use_tcp_fallback=False)
         truncated = make_response(answer=[("example.com.", 300, "A", ["1.1.1.1"])], tc=True)
 
         with patch("dns.query.udp", side_effect=dns.message.Truncated(message=truncated)):
@@ -404,7 +398,7 @@ class TestEDNSDowngrade:
     """The EDNS fallback ladder for broken servers and PMTU blackholes."""
 
     def test_payload_ladder(self) -> None:
-        resolver = _resolver(edns_payload=1232)
+        resolver = offline_resolver(edns_payload=1232)
         assert resolver._payload_for_attempt(0) == 1232
         assert resolver._payload_for_attempt(1) == 512
         assert resolver._payload_for_attempt(2) is None
@@ -415,7 +409,7 @@ class TestEDNSDowngrade:
     )
     def test_edns_unsupported_rcodes_trigger_plain_retry(self, rcode: int) -> None:
         """FORMERR, NOTIMP, SERVFAIL and BADVERS all mean 'try without EDNS'."""
-        resolver = _resolver()
+        resolver = offline_resolver()
         payloads: list[int | None] = []
         good = make_response(answer=[("example.com.", 300, "A", ["1.2.3.4"])])
 
@@ -437,7 +431,7 @@ class TestEDNSDowngrade:
         """A PMTU blackhole must be escaped by shrinking the advertised payload."""
         from recursive_resolver.resolver import _RetryableError
 
-        resolver = _resolver(max_retries=2)
+        resolver = offline_resolver(max_retries=2)
         payloads: list[int | None] = []
 
         def query_once(qname, rdtype, server, payload, timeout, ctx):
@@ -459,7 +453,7 @@ class TestSpoofingResistance:
         """A stray packet must not be an attacker-driven EDNS downgrade primitive."""
         from recursive_resolver.resolver import _RetryableError
 
-        resolver = _resolver(max_retries=1)
+        resolver = offline_resolver(max_retries=1)
         payloads: list[int | None] = []
 
         def query_once(qname, rdtype, server, payload, timeout, ctx):
@@ -474,7 +468,7 @@ class TestSpoofingResistance:
         assert payloads[0] == 1232
 
     def test_all_servers_failing_raises_servfail_not_success(self) -> None:
-        resolver = _resolver()
+        resolver = offline_resolver()
 
         def send(qname, rdtype, nameservers, ctx):
             return make_response(rcode=dns.rcode.REFUSED, aa=False), nameservers[0]
@@ -504,7 +498,11 @@ class TestDNSSECBookkeeping:
         ctx = resolver._new_context()
         # The call may still fail (the stub serves no real signatures); what
         # matters is that it never queries with an empty nameserver list.
-        with patch.object(resolver, "_send_query", side_effect=send), contextlib.suppress(Exception):
+        # ResolverError only, not Exception: a bare suppress would also swallow
+        # an AttributeError or TypeError from a later refactor, and the two
+        # assertions below would still pass because `attempted` is populated by
+        # the first _send_query call.
+        with patch.object(resolver, "_send_query", side_effect=send), contextlib.suppress(ResolverError):
             resolver._verify_denial(
                 make_response(rcode=dns.rcode.NXDOMAIN, aa=True),
                 dns.name.from_text("gone.example.com."),
@@ -634,7 +632,7 @@ class TestLimitsGrouping:
             max_signature_validations=5,
             max_nsec3_hashes=6,
         )
-        budget = _resolver(limits=limits)._new_context().budget
+        budget = offline_resolver(limits=limits)._new_context().budget
         assert budget.max_queries == 1
         assert budget.max_nx_targets == 3
         assert budget.max_referrals == 4
@@ -643,7 +641,7 @@ class TestLimitsGrouping:
 
     def test_each_resolution_gets_a_fresh_budget(self) -> None:
         """Counters must not carry over between calls, or a resolver would decay."""
-        resolver = _resolver(limits=Limits(max_queries=2))
+        resolver = offline_resolver(limits=Limits(max_queries=2))
         first = resolver._new_context().budget
         first.spend_query("example.com.", "A")
         assert resolver._new_context().budget.queries_sent == 0
@@ -810,7 +808,7 @@ class TestReturnedDataIsTheCallersOwn:
     """
 
     @staticmethod
-    def _resolver():
+    def offline_resolver():
         resolver = RecursiveResolver(dnssec=False)
 
         def send(qname, rdtype, nameservers, ctx):
@@ -821,7 +819,7 @@ class TestReturnedDataIsTheCallersOwn:
         return resolver, send
 
     def test_mutating_a_returned_rrset_does_not_poison_the_cache(self) -> None:
-        resolver, send = self._resolver()
+        resolver, send = self.offline_resolver()
         extra = dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.A, "6.6.6.6")
         with patch.object(resolver, "_send_query", side_effect=send):
             first = resolver.resolve_answer("example.com", "A")
@@ -830,7 +828,7 @@ class TestReturnedDataIsTheCallersOwn:
         assert second.records == ["1.2.3.4"]
 
     def test_two_callers_never_share_one_rrset(self) -> None:
-        resolver, send = self._resolver()
+        resolver, send = self.offline_resolver()
         with patch.object(resolver, "_send_query", side_effect=send):
             first = resolver.resolve_answer("example.com", "A")
             second = resolver.resolve_answer("example.com", "A")

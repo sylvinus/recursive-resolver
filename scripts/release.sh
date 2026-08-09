@@ -84,8 +84,13 @@ MODULE_VERSION="$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' "${REPO_DIR}/src/${PK
 [[ "${MODULE_VERSION}" == "${VERSION}" ]] \
     || die "version mismatch: pyproject.toml=${VERSION} but __init__.py=${MODULE_VERSION}"
 
-grep -q "\[${VERSION}\]" "${REPO_DIR}/CHANGELOG.md" \
-    || die "CHANGELOG.md has no entry for ${VERSION}"
+# -F and the "## [" prefix on purpose: the release notes below are extracted
+# from a "## [VERSION]" *heading*, so a version that only appears in a link
+# definition at the bottom of the file must not pass pre-flight and then yield
+# empty notes after the irreversible PyPI upload. An unescaped pattern would
+# also treat "." as a wildcard.
+grep -qF "## [${VERSION}]" "${REPO_DIR}/CHANGELOG.md" \
+    || die "CHANGELOG.md has no '## [${VERSION}]' section"
 
 TAG="v${VERSION}"
 if git -C "${REPO_DIR}" rev-parse "${TAG}" >/dev/null 2>&1; then
@@ -231,8 +236,11 @@ dct = meta("Description-Content-Type")
 if not dct or "markdown" not in dct.lower():
     errors.append(f"METADATA Description-Content-Type isn't markdown: {dct!r}")
 
-# The dependency floor is a security floor: below 2.6.1 dnspython is affected
-# by CVE-2023-29483, and 2.6.0 broke UDP->TCP failover.
+# The dependency floor is a security floor, and there is exactly one canonical
+# value for it: pyproject.toml, SECURITY.md, CONTRIBUTING.md and this check all
+# say 2.8.0. Below 2.6.1 dnspython is affected by CVE-2023-29483, 2.6.0 broke
+# UDP->TCP failover, and 2.7.0 is the first release with the EDNS and DNSSEC
+# behaviour this package relies on.
 deps = re.findall(r"^Requires-Dist: (.+)$", metadata, re.MULTILINE)
 dnspython = [d for d in deps if d.startswith("dnspython")]
 if not dnspython:
@@ -242,8 +250,8 @@ else:
     if "dnssec" not in spec or "idna" not in spec:
         errors.append(f"dnspython requirement is missing the dnssec/idna extras: {spec!r}")
     m = re.search(r">=(\d+)\.(\d+)\.(\d+)", spec)
-    if not m or tuple(int(x) for x in m.groups()) < (2, 6, 1):
-        errors.append(f"dnspython floor is below the 2.6.1 security floor: {spec!r}")
+    if not m or tuple(int(x) for x in m.groups()) < (2, 8, 0):
+        errors.append(f"dnspython floor is below the 2.8.0 security floor: {spec!r}")
 
 if "Typing :: Typed" not in metadata:
     errors.append("METADATA missing the 'Typing :: Typed' classifier")
@@ -404,7 +412,11 @@ in_container \
         set -euo pipefail
         pip install --quiet --no-cache-dir --root-user-action=ignore --target /tmp/pip twine
         export PYTHONPATH=/tmp/pip
-        python -m twine upload --skip-existing dist/*
+        # No --skip-existing here (unlike TestPyPI, where it makes retries
+        # painless): on PyPI it would turn "this version is already published"
+        # into a silent success, and we would go on to tag and cut a GitHub
+        # release for artifacts PyPI never accepted.
+        python -m twine upload dist/*
     '
 echo
 ok "${PKG_NAME} ${VERSION} released to PyPI"
@@ -438,6 +450,7 @@ awk -v ver="${VERSION}" '
     inside && /^## \[/       { exit }
     inside                   { print }
 ' "${REPO_DIR}/CHANGELOG.md" > "${NOTES_FILE}"
+[[ -s "${NOTES_FILE}" ]] || die "extracted release notes for ${VERSION} are empty"
 printf '\n---\n\nInstall: `pip install %s==%s`\n' "${PKG_NAME}" "${VERSION}" >> "${NOTES_FILE}"
 
 REPO_SLUG="$(git -C "${REPO_DIR}" remote get-url origin \
@@ -451,4 +464,4 @@ gh release create "${TAG}" "${REPO_DIR}"/dist/* \
 
 echo
 ok "GitHub release ${TAG} created"
-echo "  https://pypi.org/project/${PKG_NAME}/${VERSION}/"
+echo "  https://github.com/${REPO_SLUG}/releases/tag/${TAG}"

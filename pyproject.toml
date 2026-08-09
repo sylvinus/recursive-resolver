@@ -1,5 +1,9 @@
 [build-system]
-requires = ["hatchling"]
+# >=1.27 is the floor for final PEP 639 support: earlier Hatchling either
+# rejects `license-files` or emits metadata below 2.4, and scripts/release.sh
+# asserts on `License-Expression` and the bundled licence files in the built
+# wheel's METADATA.
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
@@ -85,6 +89,12 @@ include = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# The shared helpers live in tests/conftest.py and tests/signed_zone.py and are
+# imported by name from the test modules. There is deliberately no
+# tests/__init__.py: with one, pytest would import the suite as `tests.test_x`,
+# put only the repo root on sys.path, and load conftest twice under two names.
+# This entry states the requirement rather than relying on rootdir insertion.
+pythonpath = ["tests"]
 addopts = "--strict-markers --strict-config -ra"
 markers = [
     "integration: marks tests that require network access (deselect with '-m \"not integration\"')",

@@ -160,6 +160,32 @@ class TestDelegationCache:
         assert cache.get_delegation(dns.name.from_text("com.")) is not None
         assert cache.get_delegation(EXAMPLE) is None
 
+    def test_a_cached_delegation_is_isolated_from_its_producer_and_its_readers(self) -> None:
+        """Delegation holds mutable lists; sharing them across threads is the hazard.
+
+        Answers already go through _isolate. Without the same treatment here, a
+        caller appending to `delegation.addresses` would silently rewrite the
+        cached zone cut for every other thread.
+        """
+        cache = DNSCache()
+        original = Delegation(zone=EXAMPLE, addresses=["1.2.3.4"], ns_names=["ns1.example.com."])
+        cache.put_delegation(original, ttl=3600)
+
+        # The producer must not be able to reach back into the stored entry.
+        original.addresses.append("6.6.6.6")
+        original.ns_names.append("evil.example.com.")
+
+        first = cache.get_delegation(EXAMPLE)
+        assert first is not None
+        assert first.addresses == ["1.2.3.4"]
+        assert first.ns_names == ["ns1.example.com."]
+
+        # Nor may one reader's mutation be visible to the next.
+        first.addresses.append("7.7.7.7")
+        second = cache.closest_delegation(dns.name.from_text("www.example.com."))
+        assert second is not None
+        assert second.addresses == ["1.2.3.4"]
+
     def test_empty_delegation_is_not_returned(self) -> None:
         cache = DNSCache()
         cache.put_delegation(Delegation(zone=dns.name.from_text("com."), addresses=[]), ttl=3600)

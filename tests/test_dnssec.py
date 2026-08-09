@@ -52,6 +52,11 @@ class TestTrustAnchors:
         validator = DNSSECValidator()
         assert len(validator._root_ds) == 2
 
+    def test_an_empty_anchor_set_is_rejected(self) -> None:
+        """() is a caller error, not a synonym for "use the IANA defaults"."""
+        with pytest.raises(ValueError, match="must not be empty"):
+            DNSSECValidator(trust_anchors=())
+
 
 class TestTypeBitmap:
     def test_decodes_nsec_bitmap(self) -> None:
@@ -901,6 +906,25 @@ class TestNSEC3IterationCapActuallyBites:
             n3 = _nsec3(self.ZONE, digest, _successor(digest), "A RRSIG", iterations=iterations)
             _stub_nsec(v, nsec3s=[n3])
             return v.prove_nodata(qname, dns.rdatatype.MX, [], {})
+
+        assert attempt(10) is True
+        assert attempt(MAX_NSEC3_ITERATIONS + 1) is False
+
+    def test_prove_wildcard_cap(self) -> None:
+        """The wildcard proof hashes too, so it needs the same guard as the others."""
+        qname = dns.name.from_text("anything.example.com.")
+
+        def attempt(iterations: int) -> bool:
+            v = DNSSECValidator()
+            covering = _nsec3(
+                self.ZONE,
+                "00000000000000000000000000000000",
+                "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ",
+                "A RRSIG",
+                iterations=iterations,
+            )
+            _stub_nsec(v, nsec3s=[covering])
+            return v.prove_wildcard(qname, 2, [], {})
 
         assert attempt(10) is True
         assert attempt(MAX_NSEC3_ITERATIONS + 1) is False

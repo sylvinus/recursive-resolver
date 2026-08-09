@@ -41,15 +41,21 @@ answer.dnssec         # <ValidationState.SECURE: 'secure'>
 answer.secure         # True
 ```
 
+The addresses shown here and in the CLI examples below are a snapshot taken in
+August 2026. They are live CDN records and will differ when you run this; only
+the shapes and the DNSSEC verdicts are part of the API.
+
 ### Multi-chunk TXT records
 
 This is the one API detail worth reading. A TXT record is a sequence of
 `<character-string>` chunks of at most 255 octets, so any longer value **arrives
 split**. RFC 6376 (DKIM) and RFC 7208 (SPF) both require the chunks to be joined
 with no separator; DNS presentation format renders them as `"chunk1" "chunk2"`.
-Code that strips the quotes naively corrupts the value. An RSA-2048 DKIM key is
-always split in two, so this is the difference between a key that verifies and
-one that never does.
+Code that strips the quotes naively corrupts the value. An RSA-2048 DKIM key
+does not fit in one chunk, and publishers may split it at any boundary they
+like, into two chunks or more — so the invariant to hold on to is
+concatenation with no separator. This is the difference between a key that
+verifies and one that never does.
 
 ```python
 answer = resolver.resolve_answer("zendesk1._domainkey.zendesk.com", "TXT")
@@ -88,7 +94,11 @@ resolver.resolve("cloudflare.com", "A")  # fine: signed
 
 This matters most when the record itself is a credential. A DKIM key, a CAA
 policy and an SSHFP fingerprint are all trust decisions delegated to DNS, so
-whoever can spoof the response picks the answer. DNSSEC closes that hole.
+whoever can spoof the response picks the answer. DNSSEC closes that hole **for
+signed zones whose answers validate**. It cannot close it for an unsigned zone,
+and the default `RecursiveResolver()` returns those answers as `INSECURE`
+rather than refusing them — so if a credential's zone must be signed for you to
+trust the value, say so with `require_dnssec=True` and handle the error.
 
 DNSSEC needs the `cryptography` package, which ships as part of the default
 install. To go without it: `RecursiveResolver(dnssec=False)`.
@@ -110,8 +120,10 @@ RecursiveResolver(
 
 Zone cuts (root -> `com` -> `example.com`) are cached separately from answers.
 **Do not turn that off in production.** With `max_delegation_cache_depth="none"`
-every single resolution begins with a query to a root server, which at any real
-volume is abusive to the root operators and will get you rate-limited.
+every upstream cache miss begins with a query to a root server, which at any
+real volume is abusive to the root operators and will get you rate-limited.
+(Answer and negative hits still short-circuit, so this is not literally every
+call — but it is every call that has to go out on the wire.)
 
 **When freshness matters**, such as key rotation or GSLB failover, keep
 delegations cached but not answers:

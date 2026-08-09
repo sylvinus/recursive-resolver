@@ -292,6 +292,10 @@ def main() -> int:
         print("dig not found; use --reference stub", file=sys.stderr)
         return 2
 
+    if args.workers < 1:
+        print("--workers must be at least 1", file=sys.stderr)
+        return 2
+
     rdtypes = [t.strip().upper() for t in args.types.split(",") if t.strip()]
     configs = [c.strip() for c in args.configs.split(",") if c.strip()]
     for config in configs:
@@ -300,6 +304,12 @@ def main() -> int:
             return 2
 
     servers = [s.strip() for s in args.reference_servers.split(",") if s.strip()]
+    if not servers:
+        # With no reference there is nothing to compare against, and run_one
+        # trips its own "best is not None" assertion instead of saying so.
+        print("--reference-servers must contain at least one server", file=sys.stderr)
+        return 2
+
     corpus = load_corpus(args.csv, args.sample, args.seed)
     total = len(corpus) * len(rdtypes) * len(configs)
     print(
@@ -335,11 +345,18 @@ def main() -> int:
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
             futures = [pool.submit(task, item, rdtype) for item in corpus for rdtype in rdtypes]
-            concurrent.futures.wait(futures)
+            # result(), not wait(): wait() returns happily when a task died, and
+            # the harness would then report an agreement rate over a silently
+            # incomplete result set.
+            for future in concurrent.futures.as_completed(futures):
+                future.result()
 
     report(results, rdtypes, configs, out_path, time.monotonic() - started)
-    agree = sum(1 for r in results if r.status in AGREEING)
-    return 0 if results and agree / len(results) >= 0.96 else 1
+    # Same exclusion rule as _rate() and report(): a run that meets the
+    # threshold on judged results must not exit 1 because of comparisons both
+    # references disagreed about.
+    _agree, judged, rate = _rate(results)
+    return 0 if judged and rate >= 0.96 else 1
 
 
 def _rate(rows: list[Result]) -> tuple[int, int, float]:

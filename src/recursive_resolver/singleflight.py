@@ -64,7 +64,12 @@ class SingleFlight(Generic[T]):
             # blocking indefinitely on it.
             return fn()
         if call.error is not None:
-            raise call.error
+            # Every waiter for this key re-raises the *same* exception object,
+            # and each `raise` writes __traceback__ on it. Without this, several
+            # threads concurrently append to one traceback and a caller ends up
+            # inspecting frames from threads it never ran. Dropping it gives
+            # each waiter a traceback rooted at its own call site.
+            raise call.error.with_traceback(None)
         return call.value  # type: ignore[return-value]
 
     def in_flight(self) -> int:

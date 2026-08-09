@@ -13,7 +13,7 @@ from __future__ import annotations
 import errno
 import ipaddress
 import logging
-import random
+import secrets
 import threading
 import time
 from collections import OrderedDict
@@ -55,6 +55,13 @@ from .roots import get_root_addresses
 from .singleflight import SingleFlight
 
 logger = logging.getLogger(__name__)
+
+# Server ordering and referral sampling are anti-attacker controls: their whole
+# purpose is to deny a hostile zone any say in which server we talk to. The
+# Mersenne Twister behind `random` is seeded predictably and its state is
+# recoverable from enough observed output, so a CSPRNG is used instead. At this
+# call rate the cost is not measurable.
+_RANDOM = secrets.SystemRandom()
 
 # Errnos meaning "this address family or host is simply not reachable from
 # here": retrying is pointless, so the server is abandoned immediately.
@@ -187,8 +194,9 @@ class RecursiveResolver:
         idna_codec: IDNA codec for unicode names. Defaults to IDNA 2008
             (practical), matching browsers and mail systems.
         trust_anchors: DS records for the root, in presentation format.
-            Defaults to the IANA anchors. Override only to validate against a
-            private root, or in tests.
+            ``None`` uses the IANA anchors. Override only to validate against a
+            private root, or in tests. An empty tuple is rejected rather than
+            treated as ``None``.
 
     Most arguments are readable as an attribute of the same name. The cache and
     address settings are not: they are applied to :attr:`cache` and
@@ -243,7 +251,12 @@ class RecursiveResolver:
         self.dnssec = dnssec
         self._validator: DNSSECValidator | None = None
         if dnssec:
-            self._validator = DNSSECValidator(trust_anchors=trust_anchors) if trust_anchors else DNSSECValidator()
+            # `is not None`, not truthiness: an explicit empty tuple is a
+            # caller error, and DNSSECValidator rejects it. Falling back to the
+            # IANA anchors there would be the opposite of what was asked for.
+            self._validator = (
+                DNSSECValidator(trust_anchors=trust_anchors) if trust_anchors is not None else DNSSECValidator()
+            )
 
         self.address_filter = AddressFilter(extra_blocked_networks, allow_private=allow_private_addresses)
         self.cache = (
@@ -854,7 +867,7 @@ class RecursiveResolver:
         if len(ns_names) > self.limits.max_ns_per_referral:
             # Random sample rather than a prefix: a deterministic slice is
             # attacker-orderable (PowerDNS uses the same approach).
-            ns_names = random.sample(ns_names, self.limits.max_ns_per_referral)
+            ns_names = _RANDOM.sample(ns_names, self.limits.max_ns_per_referral)
         detail = f"NS: {', '.join(str(n) for n in ns_names[:3])}"
         return {
             "type": "referral",
@@ -887,9 +900,7 @@ class RecursiveResolver:
         for rrset in response.additional:
             if rrset.name not in wanted or rrset.rdclass != dns.rdataclass.IN:
                 continue
-            if rrset.rdtype == dns.rdatatype.A or rrset.rdtype == dns.rdatatype.AAAA and not self.ipv4_only:
-                pass
-            else:
+            if rrset.rdtype != dns.rdatatype.A and not (rrset.rdtype == dns.rdatatype.AAAA and not self.ipv4_only):
                 continue
             if not rrset.name.is_subdomain(current_zone) and not rrset.name.is_subdomain(child_zone):
                 logger.debug("Rejecting out-of-bailiwick glue for %s (zone %s)", rrset.name, current_zone)
@@ -1264,7 +1275,7 @@ class RecursiveResolver:
 
     def _order_servers(self, nameservers: list[str]) -> list[str]:
         servers = self.address_filter.filter(nameservers)
-        random.shuffle(servers)
+        _RANDOM.shuffle(servers)
         return servers
 
     def _effective_timeout(self, ctx: _Context) -> float:
