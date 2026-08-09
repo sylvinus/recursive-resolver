@@ -12,6 +12,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import gzip
 import io
@@ -110,11 +111,11 @@ def _enrich_one(domain: str, resolver: object) -> list[str]:
             if "v=spf1" in txt_str:
                 for part in txt_str.split():
                     if part.startswith("include:"):
-                        spf_domain = part[len("include:"):].rstrip(".")
+                        spf_domain = part[len("include:") :].rstrip(".")
                         if "." in spf_domain:
                             found.append(spf_domain)
                     elif part.startswith("redirect="):
-                        spf_domain = part[len("redirect="):].rstrip(".")
+                        spf_domain = part[len("redirect=") :].rstrip(".")
                         if "." in spf_domain:
                             found.append(spf_domain)
     except Exception:
@@ -145,10 +146,8 @@ def enrich_with_mx_spf(domains: set[str], workers: int = 32) -> set[str]:
             done += 1
             if done % 500 == 0:
                 print(f"  Enriching... {done}/{total} domains checked, {len(enriched)} total")
-            try:
+            with contextlib.suppress(Exception):
                 enriched.update(future.result())
-            except Exception:
-                pass
 
     return enriched
 

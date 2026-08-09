@@ -1,272 +1,327 @@
 # recursive-resolver
 
-A pure-Python library that implements **true recursive (iterative) DNS resolution** from root servers. Unlike stub resolvers that forward queries to a local DNS server, this library starts from the DNS root and follows the delegation chain itself. This enables fully cache-less DNS queries, bypassing any intermediate resolver caches.
+[![CI](https://github.com/sylvinus/recursive-resolver/actions/workflows/ci.yml/badge.svg)](https://github.com/sylvinus/recursive-resolver/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/recursive-resolver.svg)](https://pypi.org/project/recursive-resolver/)
+[![Python](https://img.shields.io/pypi/pyversions/recursive-resolver.svg)](https://pypi.org/project/recursive-resolver/)
+[![Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen.svg)](#testing)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/sylvinus/recursive-resolver/blob/main/LICENSE)
 
-Uses [dnspython](https://www.dnspython.org/) only for wire-format parsing and UDP/TCP transport — not its built-in `dns.resolver`.
+A pure-Python library that performs **true iterative DNS resolution** from the root servers, with **DNSSEC validation**. Unlike a stub resolver that forwards queries to whatever is in `/etc/resolv.conf`, this library starts at the DNS root and follows the delegation chain itself, so you see what the authoritative servers actually say, not what an intermediate cache decided to remember.
 
-## Installation
+Built for high-assurance lookups where the answer matters: **DKIM and DMARC key retrieval**, SPF evaluation, certificate validation, and DNS auditing.
+
+Uses [dnspython](https://www.dnspython.org/) for wire-format parsing, transport and DNSSEC primitives; the iteration algorithm, the security policy and the caching are implemented here.
+
+**When not to use it.** A cold walk from the root costs several round trips, so
+this is the wrong tool for ordinary application traffic: for that, keep using
+your system resolver or dnspython's stub, both of which sit behind a warm
+shared cache. Reach for this library when you need to know what the
+authoritative servers actually say and to prove it cryptographically. Note also
+that queries go over IPv4 by default, so set `ipv4_only=False` on an IPv6-only
+host.
 
 ```bash
 pip install recursive-resolver
 ```
 
-Or with [uv](https://docs.astral.sh/uv/):
-
-```bash
-uv add recursive-resolver
-```
-
-## CLI Usage
-
-After installation, the `recursive-resolver` command is available:
-
-```bash
-# Resolve A records
-recursive-resolver example.com
-
-# Resolve a specific record type
-recursive-resolver example.com MX
-
-# Reverse PTR lookup
-recursive-resolver 8.8.8.8 PTR
-
-# Show the full DNS delegation trace from root servers
-recursive-resolver --trace example.com
-
-# JSON output
-recursive-resolver --json example.com MX
-
-# Trace with JSON output
-recursive-resolver --trace --json example.com
-
-# Enable debug logging
-recursive-resolver -v example.com
-
-# Custom timeout and depth
-recursive-resolver --timeout 10 --max-depth 30 example.com
-```
-
-You can also run it as a Python module:
-
-```bash
-python -m recursive_resolver example.com MX
-```
-
-Run `recursive-resolver --help` for all options.
-
-## Quick Start
+## Quick start
 
 ```python
 from recursive_resolver import RecursiveResolver
 
 resolver = RecursiveResolver()
 
-# A records
-ips = resolver.resolve("example.com", "A")
-print(ips)  # ['93.184.216.34']
+resolver.resolve("example.com", "A")
+# ['104.20.23.154', '172.66.147.243']
 
-# MX records
-mx = resolver.resolve("example.com", "MX")
-print(mx)  # ['0 .']
-
-# PTR (auto-converts IP to reverse pointer)
-ptr = resolver.resolve("1.1.1.1", "PTR")
-print(ptr)  # ['one.one.one.one.']
+answer = resolver.resolve_answer("cloudflare.com", "A")
+answer.records        # ['104.16.132.229', '104.16.133.229']
+answer.dnssec         # <ValidationState.SECURE: 'secure'>
+answer.secure         # True
 ```
 
-## Supported DNS Record Types
+The addresses shown here and in the CLI examples below are a snapshot taken in
+August 2026. They are live CDN records and will differ when you run this; only
+the shapes and the DNSSEC verdicts are part of the API.
 
-A, AAAA, CNAME, MX, TXT, SOA, PTR, NS, SRV, CAA, DNSKEY, DS, NAPTR
+### Multi-chunk TXT records
+
+This is the one API detail worth reading. A TXT record is a sequence of
+`<character-string>` chunks of at most 255 octets, so any longer value **arrives
+split**. RFC 6376 (DKIM) and RFC 7208 (SPF) both require the chunks to be joined
+with no separator; DNS presentation format renders them as `"chunk1" "chunk2"`.
+Code that strips the quotes naively corrupts the value. An RSA-2048 DKIM key
+does not fit in one chunk, and publishers may split it at any boundary they
+like, into two chunks or more — so the invariant to hold on to is
+concatenation with no separator. This is the difference between a key that
+verifies and one that never does.
+
+```python
+answer = resolver.resolve_answer("zendesk1._domainkey.zendesk.com", "TXT")
+
+answer.text_values()   # ✅ ['v=DKIM1;t=s;n=core;k=rsa;p=MIIBIjANBgkq…'] : correct
+answer.records         # ⚠️  ['"v=DKIM1;…MII" "BIjANBgkq…"']           : has a seam
+answer.rrset[0].strings  # (b'v=DKIM1;…MII', b'BIjANBgkq…')            : raw chunks
+```
+
+Use `text_values()` for any TXT-like record, or `resolve_rrset()` when you need
+the raw dnspython rdata objects.
+
+## DNSSEC
+
+Validation is **on by default** and chains from the IANA root trust anchors
+(KSK-2017 and KSK-2024). Every answer carries its state:
+
+| State | Meaning | Behaviour |
+|---|---|---|
+| `SECURE` | Signed and validated back to the root | Returned |
+| `INSECURE` | Provably unsigned (an ancestor proved no DS exists), or signed only with an algorithm this build cannot verify | Returned |
+| `BOGUS` | Claims to be signed but does not validate | **`DNSSECValidationError`** |
+
+Only `BOGUS` is an error: most of the internet is legitimately unsigned, so
+rejecting `INSECURE` would reject the majority of domains. A zone signed with
+an algorithm this build cannot verify is `INSECURE` rather than `BOGUS`, per
+RFC 4035 §5.2: not being able to check a zone is not evidence against it, and
+treating it as an attack would take a legitimate domain off the air. If you
+need authenticated data and nothing less:
+
+```python
+resolver = RecursiveResolver(require_dnssec=True)
+resolver.resolve("google.com", "A")      # DNSSECInsecureError: unsigned zone
+resolver.resolve("cloudflare.com", "A")  # fine: signed
+```
+
+This matters most when the record itself is a credential. A DKIM key, a CAA
+policy and an SSHFP fingerprint are all trust decisions delegated to DNS, so
+whoever can spoof the response picks the answer. DNSSEC closes that hole **for
+signed zones whose answers validate**. It cannot close it for an unsigned zone,
+and the default `RecursiveResolver()` returns those answers as `INSECURE`
+rather than refusing them — so if a credential's zone must be signed for you to
+trust the value, say so with `require_dnssec=True` and handle the error.
+
+DNSSEC needs the `cryptography` package, which ships as part of the default
+install. To go without it: `RecursiveResolver(dnssec=False)`.
+
+## Caching
+
+There is a built-in cache, on by default. It holds answers, negatives and
+delegations; answers and delegations are controlled separately. That matters
+because the reasons to cache each are not the same.
+
+```python
+RecursiveResolver(
+    cache_enabled=True,                # master switch
+    cache_answers=True,                # cache final answer RRsets
+    max_delegation_cache_depth="all",  # "tld", "all", "none", or a label depth
+    min_ttl=0,                         # 0 honours the wire TTL exactly
+)
+```
+
+Zone cuts (root -> `com` -> `example.com`) are cached separately from answers.
+**Do not turn that off in production.** With `max_delegation_cache_depth="none"`
+every upstream cache miss begins with a query to a root server, which at any
+real volume is abusive to the root operators and will get you rate-limited.
+(Answer and negative hits still short-circuit, so this is not literally every
+call — but it is every call that has to go out on the wire.)
+
+**When freshness matters**, such as key rotation or GSLB failover, keep
+delegations cached but not answers:
+
+```python
+resolver = RecursiveResolver(cache_answers=False)   # fresh answers, cheap path to them
+```
+
+To cache only the root -> TLD cuts and re-walk everything below on each query:
+
+```python
+resolver = RecursiveResolver(max_delegation_cache_depth=1)
+```
+
+Concurrent lookups of the same name are collapsed into a single walk, so a
+thread pool hammering one domain does not produce N independent query storms.
+
+## Security
+
+This library is designed to be pointed at names an attacker controls, which is
+exactly what happens when you verify DKIM on inbound mail.
+
+- **Nameserver address filtering.** Glue records are attacker-controlled data. An address must be globally routable and none of loopback, link-local, multicast, reserved or private: classification that follows the IANA special-purpose registries rather than a hand-maintained CIDR list. A short explicit list then adds the ranges that classification still calls routable, notably Azure's `168.63.129.16`. So a hostile zone cannot steer the resolver at `127.0.0.1` or at a cloud metadata endpoint. Opt out with `allow_private_addresses=True` only for split-horizon DNS you trust.
+- **Query budget.** A shared per-resolution budget bounds total queries (64), failed NS-hostname lookups (5), referrals followed (130) and NS names chased per referral (13, randomly sampled). This is the NXNSAttack / Non-Responsive-Delegation control (CVE-2020-8616, CVE-2020-12662, CVE-2022-3204); without it a hostile zone can provoke tens of thousands of upstream queries from one call.
+- **Strict downward progress.** A referral must name a zone *strictly* below the one queried, and the qname must lie at or below it. Sideways and upward referrals are rejected rather than followed in circles.
+- **Bailiwick from the query, not the response.** Glue is judged against the zone we asked, never against a zone name the responder supplied.
+- **AA required**, answers matched on class as well as type, `NXDOMAIN`-carrying-answers rejected, truncated responses never treated as complete.
+- **EDNS payload 1232** (DNS Flag Day 2020), with a downgrade ladder to 512 and then to plain DNS, so a broken-PMTU path does not silently blackhole large responses.
+- **KeyTrap hardening** (CVE-2023-50387 / CVE-2023-50868). A zone publishing many DNSKEYs and RRSIGs that collide on key tag can force quadratic signature verification. At most 2 keys and 2 signatures per (tag, algorithm) are tried, at most 8 signatures per RRset, and the whole resolution is bounded to 96 signature verifications and 600 NSEC3 hashes. NSEC3 iteration counts above 100 are refused.
+- **IDNA 2008.** IDNA 2003 maps `ß` to `ss`, which would resolve `straße.de` as the entirely different, separately registrable `strasse.de`.
+
+See [SECURITY.md](https://github.com/sylvinus/recursive-resolver/blob/main/SECURITY.md) for the threat model and reporting process.
+
+## CLI
+
+```bash
+recursive-resolver example.com                    # A records
+recursive-resolver example.com MX                 # a specific type
+recursive-resolver --text s1._domainkey.stripe.com TXT   # joined TXT chunks
+recursive-resolver --trace example.com            # full delegation trace
+recursive-resolver --json example.com MX          # JSON output
+recursive-resolver --require-dnssec example.com   # fail unless authenticated
+recursive-resolver 8.8.8.8 PTR                    # reverse lookup
+python -m recursive_resolver example.com          # as a module
+```
+
+`recursive-resolver --help` lists every option.
+
+The DNSSEC verdict goes to **stderr**, using the same wording as `delv`, so
+that plain output is never silently unvalidated while stdout stays pipeable:
+
+```console
+$ recursive-resolver cloudflare.com A
+; fully validated
+104.16.132.229
+104.16.133.229
+
+$ recursive-resolver google.com A
+; unsigned answer
+142.251.39.174
+
+$ recursive-resolver cloudflare.com A 2>/dev/null   # just the values
+104.16.132.229
+104.16.133.229
+```
+
+## API
+
+```python
+resolver.resolve(name, rdtype)         # -> list[str]      presentation format
+resolver.resolve_rrset(name, rdtype)   # -> dns.rrset.RRset  raw rdata
+resolver.resolve_answer(name, rdtype)  # -> Answer         records + DNSSEC state
+resolver.trace_answer(name, rdtype)    # -> (Answer | None, list[TraceStep])
+```
+
+`RecursiveResolver` is thread-safe; share one instance across a thread pool to
+get the benefit of the shared cache and query deduplication.
+
+### Exceptions
+
+Every failure is a `ResolverError`. Nothing from dnspython escapes.
+
+| Exception | Raised when |
+|---|---|
+| `NXDOMAINError` | The name does not exist |
+| `NoAnswerError` | The name exists but has no records of that type |
+| `CNAMELoopError` | A CNAME loop or over-long chain |
+| `ServfailError` | Every nameserver returned an error |
+| `ResolutionTimeoutError` | Nameservers timed out, or the deadline elapsed |
+| `MaxDepthError` | Delegation depth exceeded |
+| `InvalidNameError` | Malformed name (bad label, too long, IDNA failure) |
+| `UnsupportedRdtypeError` | Unknown or unqueryable record type |
+| `QueryBudgetExceededError` | The work budget was exhausted (likely an attack) |
+| `DNSSECValidationError` | Signed data failed validation: **do not use it** |
+| `DNSSECInsecureError` | `require_dnssec=True` and the zone is unsigned |
 
 ## Configuration
 
 ```python
-resolver = RecursiveResolver(
-    timeout=5.0,              # per-query timeout in seconds
-    max_resolution_time=30.0, # hard cap on total wall-clock time per resolve() call
-    max_depth=20,             # max delegation depth
-    max_cname_chain=10,       # max CNAME follows before error
-    cache_enabled=True,       # enable DNS response caching
-    use_tcp_fallback=True,    # TCP fallback on truncation
-    max_retries=2,            # retries per nameserver
-    ipv4_only=True,           # only use IPv4 for queries
+RecursiveResolver(
+    timeout=2.0,                  # per-query timeout
+    max_resolution_time=15.0,     # hard wall-clock cap per resolve()
+    max_depth=20,                 # delegation depth
+    max_cname_chain=10,           # CNAME follows
+    max_retries=2,                # retries per nameserver (each downgrades EDNS)
+    limits=Limits(),              # hardening limits; see below
+    edns_payload=1232,
+    dnssec=True,
+    require_dnssec=False,
+    require_authoritative=True,   # demand the AA bit
+    ipv4_only=True,
+    use_tcp_fallback=True,
+    allow_private_addresses=False,
+    extra_blocked_networks=None,  # further CIDRs to refuse, added to the built-ins
+    idna_codec=None,              # defaults to IDNA 2008 (practical)
+    trust_anchors=None,           # defaults to the IANA root anchors
 )
 ```
 
-## DNS Resolution Trace
+### Limits
+
+The bounds that stop a hostile zone from making you do unbounded work live in
+one object, because they move as a set: raising `max_queries` without raising
+`max_referrals` only changes which counter fires first.
 
 ```python
-trace = resolver.resolve_with_trace("example.com", "A")
-for step in trace:
-    print(f"{step.server:20s} {step.qname:30s} {step.response_type:10s} {step.detail}")
+from recursive_resolver import Limits, RecursiveResolver
+
+RecursiveResolver(limits=Limits(
+    max_queries=64,                  # total upstream queries per resolve()
+    max_ns_per_referral=13,          # NS hostnames chased per referral
+    max_nx_targets=5,                # NS hostnames allowed to fail (NXNSAttack)
+    max_referrals=130,               # referrals followed per resolve()
+    max_signature_validations=96,    # RRSIG verifications (KeyTrap)
+    max_nsec3_hashes=600,            # NSEC3 hashes (KeyTrap)
+))
 ```
 
-Output:
-```
-198.41.0.4           example.com.                   referral   NS: a.gtld-servers.net., ...
-192.5.6.30           example.com.                   referral   NS: a.iana-servers.net., ...
-199.43.135.53        example.com.                   answer
-```
+The defaults are the values Unbound and PowerDNS ship. Raise them only
+against a measured legitimate name that needs the headroom.
 
-## Exceptions
+## How it works
 
-```python
-from recursive_resolver import (
-    ResolverError,          # Base exception
-    NXDOMAINError,          # Domain does not exist (DNS NXDOMAIN)
-    NoAnswerError,          # No DNS records of requested type
-    MaxDepthError,          # Exceeded max delegation depth
-    ResolutionTimeoutError, # All nameservers timed out
-    CNAMELoopError,         # CNAME loop detected
-    ServfailError,          # All nameservers returned errors
-)
-```
+1. **Start at the root** (or at the deepest cached delegation) using hardcoded root hints.
+2. **Query with RD=0** so servers answer only from their own authority.
+3. **Follow referrals downward**, verifying at each step that the delegation descends and stays in bailiwick.
+4. **Resolve glueless NS hostnames** when a referral carries no usable glue, under the shared budget.
+5. **Validate DNSSEC** at every zone cut: DS against the parent's keys, DNSKEY against the DS, answers against the DNSKEY, and NSEC/NSEC3 proofs for negative answers.
+6. **Chase CNAMEs**, using target records already present in the response when the server supplied them.
+7. **Cache** answers, negatives (NXDOMAIN by name per RFC 2308/8020) and delegations, with TTLs from the wire and negative TTLs from the SOA.
 
-## How It Works
+## Testing
 
-1. **Start at the root**: The resolver begins with hardcoded root DNS server IP addresses (a.root-servers.net through m.root-servers.net).
+The suite is 520 tests at 100% coverage: 483 unit tests with mocked DNS and 37
+integration tests against live DNS, including deliberately-bogus DNSSEC test
+domains (`dnssec-failed.org`, `rhybar.cz`, `bogus.nlnetlabs.nl`) that must be
+rejected, and real DKIM selectors that must round-trip byte-exactly.
 
-2. **Send non-recursive queries**: All queries are sent with `RD=0` (Recursion Desired = off), meaning we're asking the server for what it knows directly, not asking it to recurse on our behalf.
-
-3. **Follow delegations**: When a server doesn't have the final answer, it returns a referral — NS records pointing to DNS nameservers closer to the target. The resolver follows these delegations.
-
-4. **Handle glue records**: Referrals often include "glue" A/AAAA records in the additional section, providing IP addresses for the referred nameservers. When glue is missing, the resolver sub-resolves the NS hostnames.
-
-5. **Chase CNAMEs**: When a CNAME is encountered, DNS resolution restarts from the root for the canonical name (since it may be in a completely different zone).
-
-6. **Cache results**: DNS responses are cached with TTL-based expiry using monotonic time, including negative responses (NXDOMAIN/NODATA).
-
-## Reliability
-
-### Built on dnspython
-
-This library does not implement DNS wire format parsing or UDP/TCP transport from scratch. All low-level DNS operations are handled by [dnspython](https://www.dnspython.org/), one of the most mature and widely-used DNS libraries in the Python ecosystem (first released in 2001). We use it for:
-
-- Building and parsing DNS messages (`dns.message`)
-- UDP and TCP transport with timeout handling (`dns.query`)
-- Record type and rcode constants (`dns.rdatatype`, `dns.rcode`)
-
-What we implement on top of dnspython is the **iterative resolution algorithm** — the logic that starts at root servers, follows delegations, chases CNAMEs, handles glueless referrals, and enforces bailiwick checking. This is the part that `dns.resolver` (dnspython's built-in stub resolver) delegates to your system's recursive resolver.
-
-### Test suite
-
-The test suite has **97% code coverage** across 92 tests at three levels:
-
-- **81 unit tests** (no network) — resolver logic is tested with mocked DNS responses covering: delegation chains, CNAME following, NXDOMAIN/NODATA, glueless referrals, CNAME loops, max depth, timeout/retry behavior, TCP fallback, EDNS0 fallback, PTR auto-reverse, cache hits, negative caching, bailiwick validation, deadline enforcement, and CLI argument handling.
-- **11 integration tests** (real DNS) — live queries against well-known domains verifying A, AAAA, MX, TXT, NS, SOA, PTR, CNAME chains, NXDOMAIN errors, trace output, and cache speedup.
-- **Bulk CSV tests** — automated comparison against `dig` on thousands of real domains (see below).
-
-Run the full suite:
+`tests/test_security.py` is a regression test per defect found in the
+pre-release audit: SSRF via glue, NXNS amplification, referral ping-pong,
+upward-referral crash, truncation acceptance, and the rest.
 
 ```bash
-make test               # Unit tests (fast, no network)
-make test-integration   # Integration tests (requires network)
-make coverage           # Unit tests with coverage report
+make check              # lint, format, types and the offline tests
+make check-all          # everything, including live DNS and the coverage gate
+make test               # offline tests only
+make test-integration   # live-DNS tests only
+make coverage-all       # full coverage report (HTML in htmlcov/)
 ```
 
-### Large-scale validation against dig
+### Differential testing against reference resolvers
 
-We validated the resolver against `dig` (the reference DNS tool) on over **200,000 queries** across **115,000+ real-world domains** and **7 record types** (A, AAAA, MX, TXT, NS, SOA, CAA). The only differences are CDN round-robin (different valid IPs returned to different resolvers) and a handful of domains with dead nameservers.
-
-#### Reproduce the bulk tests
+A separate harness compares this resolver against `dig` (or any reference) over
+a deliberately awkward corpus: Tranco sampled across popularity bands, every
+IANA TLD including the IDN ones, multi-label public suffixes, underscore
+subdomains, and curated pathological cases.
 
 ```bash
-# 1. Generate a domain list from data.gouv.fr public dataset
-python scripts/prepare_test_domains.py -o domains.csv
-
-# 2. Run against dig with default types (A, MX)
-make test-from-csv CSV=domains.csv
-
-# 3. Run with all record types on a sample of 5,000 domains
-uv run pytest tests/test_csv.py --csv=domains.csv \
-    --types=A,AAAA,MX,TXT,NS,SOA,CAA --sample=5000 -s
-
-# 4. Or bring your own domain list — any CSV with a "domain" column works
-echo "domain" > my_domains.csv
-echo "example.com" >> my_domains.csv
-echo "wikipedia.org" >> my_domains.csv
-make test-from-csv CSV=my_domains.csv
+python scripts/collect_domains_diverse.py -o domains.csv
+python scripts/diff_harness.py --csv domains.csv
 ```
 
-Failures are written to a timestamped JSONL file for inspection. The test asserts an overall match rate of at least 96%.
-
-## Development
-
-```bash
-# Install dependencies
-make install
-
-# Run unit tests (no network needed)
-make test
-
-# Run integration tests (requires network)
-make test-integration
-
-# Coverage report
-make coverage
-
-# Lint and format
-make lint
-make format
-
-# Type check
-make typecheck
-
-# Build package
-make build
-
-# Bulk test DNS resolution against dig
-python scripts/prepare_test_domains.py -o domains.csv
-make test-from-csv CSV=domains.csv
-```
-
-Run `make help` to see all available targets.
-
-## Releasing
-
-Releases are published to both [PyPI](https://pypi.org/project/recursive-resolver/) and [GitHub Releases](https://github.com/sylvinus/recursive-resolver/releases).
-
-### 1. Bump the version
-
-Update the version string in **both** files:
-
-- `pyproject.toml` → `version = "X.Y.Z"`
-- `src/recursive_resolver/__init__.py` → `__version__ = "X.Y.Z"`
-
-### 2. Run pre-release checks
-
-```bash
-make release-check
-```
-
-This runs lint, format check, type check, unit tests, and verifies the version is consistent between the two files.
-
-### 3. Publish
-
-```bash
-# Full release: checks + PyPI + GitHub tag & release
-make release
-
-# Or step by step:
-make release-build       # Build sdist + wheel into dist/
-make release-test-pypi   # Upload to Test PyPI first (optional)
-make release-pypi        # Upload to PyPI (production)
-make release-github      # Git tag + GitHub release with dist artifacts
-```
-
-`make release-test-pypi` lets you verify the package on [test.pypi.org](https://test.pypi.org/project/recursive-resolver/) before the real publish:
-
-```bash
-pip install --index-url https://test.pypi.org/simple/ recursive-resolver
-```
-
-### Prerequisites
-
-- **PyPI credentials**: Configure a [PyPI API token](https://pypi.org/manage/account/token/) via `UV_PUBLISH_TOKEN` env var, or `~/.pypirc`, or `uv publish --token <token>`.
-- **GitHub CLI**: `gh` must be installed and authenticated (`gh auth login`).
-
-Run `make help` to see all available targets.
+The most recent run: **99.76% agreement over 39,713 comparisons** (3,983 names across
+10 record types). Of the 95 remaining differences, 37 are CDN answers that vary
+per resolver, 16 are TLD zones publishing a rotating timestamp, 8 are zones
+whose own nameservers disagree with each other, and 34 are authoritative servers
+unreachable from the test host. No non-`ResolverError` exception escaped the
+public API. See [CONTRIBUTING.md](https://github.com/sylvinus/recursive-resolver/blob/main/CONTRIBUTING.md) for how to read the output.
 
 ## License
 
-MIT — Sylvain Zimmer
+MIT, © 2025-2026 Sylvain Zimmer.
+
+Every runtime dependency is permissive (ISC, Apache-2.0/BSD, MIT-0, BSD-3-Clause);
+nothing copyleft is pulled in. [THIRD-PARTY.md](https://github.com/sylvinus/recursive-resolver/blob/main/THIRD-PARTY.md) records the full
+dependency licensing, the two files adapted from another MIT project, and the
+terms of the data the test-corpus scripts download.
+
+See [CHANGELOG.md](https://github.com/sylvinus/recursive-resolver/blob/main/CHANGELOG.md) for release history and
+[CONTRIBUTING.md](https://github.com/sylvinus/recursive-resolver/blob/main/CONTRIBUTING.md) for the development process, the release
+process and the policy on AI-assisted contributions.

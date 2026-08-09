@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, so root-hint / trust-anchor drift and upstream breakage surface
+    # before a release rather than after one.
+    - cron: "17 5 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+      # --python is explicit on purpose: without it uv picks its default
+      # interpreter, and every matrix job could silently test the same one.
+      - name: Install
+        run: uv sync --all-extras --python ${{ matrix.python-version }}
+      - name: Lint
+        run: uv run ruff check src/ tests/ scripts/
+      - name: Format check
+        run: uv run ruff format --check src/ tests/ scripts/
+      - name: Type check
+        run: uv run mypy src/
+      - name: Unit tests
+        run: uv run pytest -m "not integration" -q --no-cov
+
+  authors:
+    name: No AI co-authors
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The whole history, so the base commit of the PR is present.
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Check commit authorship
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python scripts/check_authors.py "$BASE_SHA..$HEAD_SHA"
+
+  integration:
+    runs-on: ubuntu-latest
+    # Live DNS: without a bound, a hang runs to the 6-hour default.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v5
+      - run: uv python install 3.13
+      - run: uv sync --all-extras --python 3.13
+      - name: Full suite (live DNS + DNSSEC), 100% statement and branch coverage enforced
+        run: uv run pytest -q --cov
+
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v5
+      - run: uv python install 3.13
+      - name: Build sdist and wheel
+        run: uv build
+      - name: Check metadata
+        run: uvx twine check dist/*
+      - name: Verify the wheel ships py.typed
+        # `uv run --no-project python` rather than a bare `python`: this job
+        # never runs setup-python, and `uv python install` does not promise a
+        # `python` on PATH. zipfile also takes a single archive, so assert
+        # that dist/ holds exactly one wheel before looking inside it.
+        run: |
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          if [ ${#wheels[@]} -ne 1 ]; then
+            echo "expected exactly one wheel in dist/, found ${#wheels[@]}"; exit 1
+          fi
+          uv run --no-project python -m zipfile -l "${wheels[0]}" \
+            | grep -q 'recursive_resolver/py.typed' \
+            || { echo "py.typed missing from the wheel"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/

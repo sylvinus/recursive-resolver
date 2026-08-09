@@ -2,7 +2,7 @@
 """Strategy 2: Certificate Transparency logs via crt.sh.
 
 Queries crt.sh for recently issued certificates across diverse TLDs.
-This produces domains that actually exist and have active HTTPS — good for
+This produces domains that actually exist and have active HTTPS: good for
 testing CNAME chains, CDN delegations, and unusual DNS configurations.
 """
 
@@ -12,23 +12,48 @@ import csv
 import json
 import random
 import time
-from urllib.request import urlopen, Request
 from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 OUTPUT = "domains_extra2.csv"
 
 # Search terms that produce diverse results across TLDs and configurations
 SEARCH_TERMS = [
     # Country TLDs
-    "%.de", "%.jp", "%.br", "%.in", "%.au", "%.kr", "%.ru",
-    "%.nl", "%.se", "%.ch", "%.za", "%.mx", "%.ar", "%.pl",
+    "%.de",
+    "%.jp",
+    "%.br",
+    "%.in",
+    "%.au",
+    "%.kr",
+    "%.ru",
+    "%.nl",
+    "%.se",
+    "%.ch",
+    "%.za",
+    "%.mx",
+    "%.ar",
+    "%.pl",
     # New gTLDs
-    "%.io", "%.dev", "%.app", "%.cloud", "%.xyz", "%.online",
-    "%.tech", "%.store", "%.site", "%.blog",
+    "%.io",
+    "%.dev",
+    "%.app",
+    "%.cloud",
+    "%.xyz",
+    "%.online",
+    "%.tech",
+    "%.store",
+    "%.site",
+    "%.blog",
     # Infrastructure / interesting DNS
-    "%.gov", "%.edu", "%.mil",
+    "%.gov",
+    "%.edu",
+    "%.mil",
     # CDN / cloud hosted (complex DNS chains)
-    "%cdn%", "%api%", "%mail%", "%static%",
+    "%cdn%",
+    "%api%",
+    "%mail%",
+    "%static%",
 ]
 
 

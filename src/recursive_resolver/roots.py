@@ -1,11 +1,12 @@
-"""Hardcoded root server hints (13 servers, IPv4 + IPv6).
+"""Root server hints and the DNSSEC root trust anchors.
 
-Source: https://www.internic.net/domain/named.root
+Root hints source: https://www.internic.net/domain/named.root
+Trust anchor source: https://data.iana.org/root-anchors/root-anchors.xml
 """
 
 from __future__ import annotations
 
-# Root server name -> (IPv4, IPv6)
+# Root server name -> (IPv4, IPv6). Verified against named.root.
 ROOT_SERVERS: dict[str, tuple[str, str]] = {
     "a.root-servers.net": ("198.41.0.4", "2001:503:ba3e::2:30"),
     "b.root-servers.net": ("170.247.170.2", "2801:1b8:10::b"),
@@ -21,6 +22,17 @@ ROOT_SERVERS: dict[str, tuple[str, str]] = {
     "l.root-servers.net": ("199.7.83.42", "2001:500:9f::42"),
     "m.root-servers.net": ("202.12.27.33", "2001:dc3::35"),
 }
+
+# DS records for the root zone, in presentation format.
+#
+# Only currently-valid anchors are listed: KSK-2017 (tag 20326, valid from
+# 2017-02-02) and KSK-2024 (tag 38696, valid from 2024-07-18).
+#
+# Format: keytag algorithm digest_type digest
+ROOT_TRUST_ANCHORS: tuple[str, ...] = (
+    "20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D",
+    "38696 8 2 683D2D0ACB8C9B712A1948B27F741219298D0A450D612C483AF444A4C0FB2B16",
+)
 
 
 def get_root_addresses(ipv4_only: bool = True) -> list[str]:
