@@ -110,6 +110,26 @@ class QueryBudgetExceededError(ResolverError):
         )
 
 
+class DNSSECMaterialUnavailableError(ResolverError):
+    """A DNSKEY or DS could not be retrieved, so no verdict can be reached.
+
+    Deliberately **not** a :class:`DNSSECError`: nothing was validated and
+    nothing failed to validate. One lame nameserver in a zone's NS set, or a
+    SERVFAIL from every one of them, means the validation material never
+    arrived; reporting that as bogus turns a transient server fault into an
+    apparent attack. Consumers that treat :class:`DNSSECError` as "refuse to
+    use this data" should let this one fall through to ordinary retry handling.
+    """
+
+    def __init__(self, qname: str, rdtype: str, reason: str = "no usable response from any nameserver") -> None:
+        self.reason = reason
+        super().__init__(
+            f"Could not retrieve DNSSEC material {qname}/{rdtype}: {reason}",
+            qname=qname,
+            rdtype=rdtype,
+        )
+
+
 class DNSSECError(ResolverError):
     """Base class for DNSSEC validation problems."""
 

@@ -26,6 +26,7 @@ from typing import Any
 
 import dns.name
 import dns.rdataclass
+import dns.rdataset
 import dns.rdatatype
 import dns.rrset
 
@@ -135,8 +136,9 @@ class DNSCache:
         max_size: Maximum number of entries. 0 means unlimited.
         min_ttl: Floor applied to record TTLs, in seconds. 0 honours the wire
             TTL exactly, which is what you want when freshness matters:
-            key rotation, GSLB failover. Negative entries are not floored;
-            see :meth:`_clamp`.
+            key rotation, GSLB failover. Negative entries and authenticated
+            data are never floored; see :meth:`_clamp`. Must not exceed
+            ``max_ttl``.
         max_ttl: Ceiling applied to record TTLs, in seconds.
         negative_ttl: Fallback TTL for negative entries when the authority
             section carries no usable SOA.
@@ -156,6 +158,13 @@ class DNSCache:
         max_negative_ttl: int = 3600,
         max_delegation_depth: int | str | None = None,
     ) -> None:
+        # `_clamp` applies the floor last, so min_ttl > max_ttl silently wins
+        # and every unauthenticated record is cached for min_ttl seconds -
+        # a max_ttl set for freshness, quietly inverted.
+        if min_ttl > max_ttl:
+            raise ValueError(f"min_ttl ({min_ttl}) must not exceed max_ttl ({max_ttl})")
+        if min_ttl < 0 or negative_ttl < 0 or max_negative_ttl < 0:
+            raise ValueError("TTL bounds must not be negative")
         self.max_size = max_size
         self.min_ttl = min_ttl
         self.max_ttl = max_ttl
@@ -180,7 +189,7 @@ class DNSCache:
             return rdtype
         return int(dns.rdatatype.from_text(rdtype))
 
-    def _clamp(self, ttl: int, negative: bool = False) -> int:
+    def _clamp(self, ttl: int, negative: bool = False, secure: bool = False) -> int:
         """Clamp a TTL to this cache's bounds.
 
         ``min_ttl`` is a floor on *record* TTLs only. Negative entries have
@@ -189,9 +198,17 @@ class DNSCache:
         must not also hold an NXDOMAIN past what the zone's SOA asked for, or a
         name that has just been created stays missing for longer than its
         operator intended.
+
+        Authenticated answers and delegations have no floor either. The TTL
+        handed in for one has already been capped to what its signature allows
+        (RFC 4035 §5.3.3, which includes the time left before that signature
+        expires), and lifting it back up would serve the data as authenticated
+        past the point where anything vouches for it.
         """
         if negative:
             return min(int(ttl), self.max_negative_ttl)
+        if secure:
+            return min(int(ttl), self.max_ttl)
         return max(self.min_ttl, min(int(ttl), self.max_ttl))
 
     def _get(self, key: CacheKey) -> CacheEntry | None:
@@ -232,7 +249,12 @@ class DNSCache:
         if isinstance(rrset, dns.rrset.RRset):
             return rrset.copy()
         if isinstance(rrset, Delegation):
-            return replace(rrset, addresses=list(rrset.addresses), ns_names=list(rrset.ns_names))
+            # `ds` too: it is a mutable rdataset, and it is the trust material a
+            # resumed resolution rebuilds its chain from.
+            ds = rrset.ds
+            if isinstance(ds, dns.rdataset.Rdataset):
+                ds = dns.rdataset.from_rdata_list(ds.ttl, list(ds))
+            return replace(rrset, addresses=list(rrset.addresses), ns_names=list(rrset.ns_names), ds=ds)
         return rrset
 
     def get_answer(
@@ -263,7 +285,9 @@ class DNSCache:
     ) -> None:
         """Store a positive answer, taking a private copy of the RRset."""
         key: CacheKey = (_ANSWER, self._name(qname), self._rdtype(rdtype), rdclass)
-        entry = CacheEntry(rrset=self._isolate(rrset), expiry=time.monotonic() + self._clamp(ttl), secure=secure)
+        entry = CacheEntry(
+            rrset=self._isolate(rrset), expiry=time.monotonic() + self._clamp(ttl, secure=secure), secure=secure
+        )
         with self._lock:
             self._put(key, entry)
 
@@ -273,21 +297,27 @@ class DNSCache:
         """Look up a cached NXDOMAIN for this exact name."""
         key: CacheKey = (_NXDOMAIN, self._name(qname), 0, 0)
         with self._lock:
-            return self._get(key)
+            entry = self._get(key)
+            return None if entry is None else replace(entry)
 
-    def get_nxdomain_ancestor(self, qname: dns.name.Name | str) -> dns.name.Name | None:
-        """Return a cached NXDOMAIN ancestor of ``qname``, if any.
+    def get_nxdomain_ancestor(self, qname: dns.name.Name | str) -> CacheEntry | None:
+        """Return the cached NXDOMAIN entry for an ancestor of ``qname``, if any.
 
         Implements RFC 8020 / ``harden-below-nxdomain``: if ``foo.example.com``
         does not exist, nothing below it can exist either. This is the primary
         defence against random-subdomain (water torture) floods.
+
+        The entry rather than the name, so the caller can see whether that
+        denial was proven: a name below an authenticated "does not exist" is
+        itself authenticated as absent, and one below an unproven denial is not.
         """
         name = self._name(qname)
         with self._lock:
             current = name
             while True:
-                if self._get((_NXDOMAIN, current, 0, 0)) is not None:
-                    return current
+                entry = self._get((_NXDOMAIN, current, 0, 0))
+                if entry is not None:
+                    return replace(entry)
                 if current == dns.name.root:
                     return None
                 try:
@@ -295,12 +325,18 @@ class DNSCache:
                 except dns.name.NoParent:  # pragma: no cover - guarded by the root check
                     return None
 
-    def put_nxdomain(self, qname: dns.name.Name | str, ttl: int | None = None) -> None:
-        """Store an NXDOMAIN, keyed by name only (RFC 2308 §5)."""
+    def put_nxdomain(self, qname: dns.name.Name | str, ttl: int | None = None, secure: bool = False) -> None:
+        """Store an NXDOMAIN, keyed by name only (RFC 2308 §5).
+
+        ``secure`` records whether the denial was proven, so a caller reading
+        it back can hold it to the same standard as the answer that produced
+        it. Without that, a strict-mode resolver refuses an unproven denial
+        once and then serves it from cache ever after.
+        """
         key: CacheKey = (_NXDOMAIN, self._name(qname), 0, 0)
         effective = self.negative_ttl if ttl is None else ttl
         expiry = time.monotonic() + self._clamp(effective, negative=True)
-        entry = CacheEntry(rrset=None, expiry=expiry, is_negative=True)
+        entry = CacheEntry(rrset=None, expiry=expiry, is_negative=True, secure=secure)
         with self._lock:
             self._put(key, entry)
 
@@ -310,7 +346,8 @@ class DNSCache:
         """Look up a cached NODATA for this name and type."""
         key: CacheKey = (_NODATA, self._name(qname), self._rdtype(rdtype), rdclass)
         with self._lock:
-            return self._get(key)
+            entry = self._get(key)
+            return None if entry is None else replace(entry)
 
     def put_nodata(
         self,
@@ -318,12 +355,13 @@ class DNSCache:
         rdtype: int | str,
         ttl: int | None = None,
         rdclass: int = dns.rdataclass.IN,
+        secure: bool = False,
     ) -> None:
-        """Store a NODATA for this name and type."""
+        """Store a NODATA for this name and type. ``secure``: see put_nxdomain."""
         key: CacheKey = (_NODATA, self._name(qname), self._rdtype(rdtype), rdclass)
         effective = self.negative_ttl if ttl is None else ttl
         expiry = time.monotonic() + self._clamp(effective, negative=True)
-        entry = CacheEntry(rrset=None, expiry=expiry, is_negative=True)
+        entry = CacheEntry(rrset=None, expiry=expiry, is_negative=True, secure=secure)
         with self._lock:
             self._put(key, entry)
 
@@ -335,7 +373,13 @@ class DNSCache:
         if self.max_delegation_depth is not None and depth > self.max_delegation_depth:
             return
         key: CacheKey = (_DELEGATION, delegation.zone, 0, 0)
-        entry = CacheEntry(rrset=self._isolate(delegation), expiry=time.monotonic() + self._clamp(ttl))
+        # A validated delegation carries the DS that was signed, so it is held
+        # to the same rule as an authenticated answer: no floor (see _clamp).
+        entry = CacheEntry(
+            rrset=self._isolate(delegation),
+            expiry=time.monotonic() + self._clamp(ttl, secure=delegation.secure),
+            secure=delegation.secure,
+        )
         with self._lock:
             self._put(key, entry)
 

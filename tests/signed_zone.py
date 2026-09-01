@@ -12,6 +12,7 @@ enough to run inside a unit test.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 import dns.dnssec
@@ -24,11 +25,17 @@ import dns.rrset
 from cryptography.hazmat.primitives.asymmetric import ec
 
 ALGORITHM = dns.dnssec.Algorithm.ECDSAP256SHA256
+REVOKE = 0x0080  # RFC 5011 §7
 DIGEST = dns.dnssec.DSDigest.SHA256
 
-# A wide signature validity window keeps the fixture stable over time.
-INCEPTION = 1_600_000_000
-EXPIRATION = 4_000_000_000
+# A realistic signature validity window, computed at import so the fixture
+# stays valid as time passes. It must be realistic rather than merely wide:
+# RFC 4034 §3.1.5 compares inception and expiration as serial numbers per RFC
+# 1982, so a window spanning more than 2^31 seconds - about 68 years - reads as
+# wrapped and is refused, here and by Unbound alike. Real zones sign for days.
+_NOW = int(time.time())
+INCEPTION = _NOW - 3600
+EXPIRATION = _NOW + 30 * 86400
 
 
 def rrset_of(name: str, rdtype: str, *rdatas: str, ttl: int = 300) -> dns.rrset.RRset:
@@ -61,7 +68,7 @@ class SignedZone:
         dnskey_rrset.ttl = 3600
         return cls(name=name, private_key=private_key, dnskey=dnskey, dnskey_rrset=dnskey_rrset)
 
-    def sign(self, rrset: dns.rrset.RRset) -> dns.rrset.RRset:
+    def sign(self, rrset: dns.rrset.RRset, expiration: int = EXPIRATION) -> dns.rrset.RRset:
         """Return the RRSIG RRset covering ``rrset``, signed by this zone."""
         rrsig = dns.dnssec.sign(
             rrset,
@@ -69,7 +76,7 @@ class SignedZone:
             self.name,
             self.dnskey,
             inception=INCEPTION,
-            expiration=EXPIRATION,
+            expiration=expiration,
         )
         out = dns.rrset.RRset(rrset.name, dns.rdataclass.IN, dns.rdatatype.RRSIG)
         out.add(rrsig)
@@ -95,6 +102,25 @@ class SignedZone:
 
     def keyring(self) -> dict[dns.name.Name, dns.rrset.RRset]:
         return {self.name: self.dnskey_rrset}
+
+    def revoked(self) -> SignedZone:
+        """The same zone after revoking its key (RFC 5011 §2.1).
+
+        Revocation is the REVOKE bit set on the *same* key material, so the
+        holder of the private key can still produce signatures that verify
+        against it. That is the point: a validator that ignores the bit keeps
+        trusting a key its owner has publicly withdrawn.
+        """
+        revoked_key = dns.rdata.from_text(
+            dns.rdataclass.IN,
+            dns.rdatatype.DNSKEY,
+            f"{self.dnskey.flags | REVOKE} {self.dnskey.protocol} {self.dnskey.algorithm} "
+            f"{dns.rdata._base64ify(self.dnskey.key, chunksize=0)}",
+        )
+        rrset = dns.rrset.RRset(self.name, dns.rdataclass.IN, dns.rdatatype.DNSKEY)
+        rrset.add(revoked_key)
+        rrset.ttl = self.dnskey_rrset.ttl
+        return SignedZone(name=self.name, private_key=self.private_key, dnskey=revoked_key, dnskey_rrset=rrset)
 
     def anchor_text(self) -> str:
         """This zone's DS in presentation format, for use as a trust anchor."""

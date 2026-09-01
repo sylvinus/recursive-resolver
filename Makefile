@@ -4,7 +4,8 @@ CSV ?= domains.csv
 SOURCES := src/ tests/ scripts/
 
 .PHONY: help install test test-integration test-from-csv coverage coverage-all lint format typecheck \
-       check check-all build clean docker-shell release release-check
+       check check-all build clean docker-shell release release-check \
+       test-corpus test-verdicts test-record test-offline test-protocol
 
 help: ## Show this help message
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -46,6 +47,29 @@ check-all: lint typecheck ## Everything, including live DNS and the coverage gat
 
 build: ## Build sdist and wheel
 	uv build
+
+# ── Real-world testing protocol (TESTING.md) ──────────────────────────
+
+CORPUS ?= corpus.csv
+ADVERSARIAL ?= adversarial.csv
+CASSETTES ?= cassettes.jsonl
+
+test-corpus: ## Build the adversarial corpus (network, ~10 min)
+	uv run python scripts/collect_domains_diverse.py -o $(CORPUS) --limit 30000
+	uv run python scripts/collect_domains_adversarial.py --csv $(CORPUS) -o $(ADVERSARIAL)
+
+test-verdicts: ## Verdict differential and flap detection (network, ~1h)
+	uv run python scripts/verdict_harness.py --csv $(ADVERSARIAL) -o verdicts.csv --escalate 8
+
+test-record: ## Record cassettes for offline replay (network)
+	uv run python scripts/cassette.py record --csv $(ADVERSARIAL) -o $(CASSETTES) --types A,MX
+
+test-offline: ## Replay cassettes under every order and fault, then mutate (no network)
+	uv run python scripts/cassette.py replay --cassettes $(CASSETTES)
+	uv run python scripts/cassette.py perturb --cassettes $(CASSETTES)
+	uv run python scripts/mutation_check.py --cassettes $(CASSETTES)
+
+test-protocol: test-corpus test-verdicts test-record test-offline ## The whole protocol, before a release
 
 docker-shell: ## Drop into a Docker shell with uv, make, dig and deps installed
 	docker build -t recursive-resolver .

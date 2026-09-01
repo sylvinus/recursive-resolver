@@ -284,6 +284,11 @@ class TestDNSSECVerdictOnStderr:
         assert err == ""
         assert json.loads(out)["dnssec"] == "secure"
 
+    def test_json_says_disabled_rather_than_insecure(self, capsys: pytest.CaptureFixture) -> None:
+        """The stderr note gets this right; the JSON payload used to claim "insecure"."""
+        out, _ = self._run(["--json", "--no-dnssec", "example.com"], _answer(dnssec=ValidationState.INSECURE), capsys)
+        assert json.loads(out)["dnssec"] == "disabled"
+
     def test_text_mode_still_reports(self, capsys: pytest.CaptureFixture) -> None:
         out, err = self._run(["--text", "example.com", "TXT"], _answer('"v=spf1 -all"', "TXT"), capsys)
         assert err.strip() == "; fully validated"

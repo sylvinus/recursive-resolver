@@ -22,6 +22,18 @@ _DNSSEC_NOTES = {
 }
 
 
+def _json_dnssec(answer: Answer | None, args: argparse.Namespace) -> str | None:
+    """The DNSSEC state for a JSON payload.
+
+    ``--no-dnssec`` leaves the default INSECURE on the Answer, which in JSON
+    reads as "we looked and the zone is unsigned". Nothing was looked at, so
+    say so.
+    """
+    if args.no_dnssec:
+        return "disabled"
+    return answer.dnssec.value if answer is not None else None
+
+
 def _note_dnssec(answer: Answer, args: argparse.Namespace) -> None:
     """Report the DNSSEC verdict on stderr, so plain output is not silently unvalidated.
 
@@ -181,7 +193,7 @@ def _run_query(resolver: RecursiveResolver, args: argparse.Namespace) -> int:
                     "canonical_name": str(answer.canonical_name),
                     "records": values,
                     "ttl": answer.ttl,
-                    "dnssec": answer.dnssec.value,
+                    "dnssec": _json_dnssec(answer, args),
                 },
                 indent=2,
             )
@@ -221,7 +233,7 @@ def _run_trace(resolver: RecursiveResolver, args: argparse.Namespace) -> int:
                 for step in trace
             ],
             "records": values,
-            "dnssec": answer.dnssec.value if answer else None,
+            "dnssec": _json_dnssec(answer, args),
         }
         if failure is not None:
             # Otherwise the payload is success-shaped with two nulls, and the

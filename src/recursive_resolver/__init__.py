@@ -8,6 +8,7 @@ from .exceptions import (
     CNAMELoopError,
     DNSSECError,
     DNSSECInsecureError,
+    DNSSECMaterialUnavailableError,
     DNSSECUnavailableError,
     DNSSECValidationError,
     InvalidNameError,
@@ -22,7 +23,7 @@ from .exceptions import (
 )
 from .resolver import Answer, RecursiveResolver, TraceStep
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "RecursiveResolver",
@@ -46,6 +47,7 @@ __all__ = [
     "DNSSECError",
     "DNSSECValidationError",
     "DNSSECInsecureError",
+    "DNSSECMaterialUnavailableError",
     "DNSSECUnavailableError",
     "__version__",
 ]

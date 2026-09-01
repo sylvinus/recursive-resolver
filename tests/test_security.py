@@ -11,7 +11,9 @@ import dataclasses
 from unittest.mock import patch
 
 import dns.dnssec
+import dns.exception
 import dns.flags
+import dns.message
 import dns.name
 import dns.rcode
 import dns.rdata
@@ -131,7 +133,7 @@ class TestSSRFProtection:
         resolver = offline_resolver()
         queried: list[list[str]] = []
 
-        def send(qname, rdtype, nameservers, ctx):
+        def send(qname, rdtype, nameservers, ctx, usable=None):
             queried.append(list(nameservers))
             if len(queried) == 1:
                 return root_to_com(), "198.41.0.4"
@@ -155,7 +157,7 @@ class TestSSRFProtection:
         """Glueless NS hostnames resolving to private IPs are also rejected."""
         resolver = offline_resolver()
 
-        def send(qname, rdtype, nameservers, ctx):
+        def send(qname, rdtype, nameservers, ctx, usable=None):
             if qname == dns.name.from_text("ns.attacker.test."):
                 return make_response(answer=[("ns.attacker.test.", 300, "A", ["192.168.1.1"])]), "1.2.3.4"
             if nameservers and nameservers[0] == "198.41.0.4":
@@ -174,7 +176,7 @@ class TestQueryBudget:
         resolver = offline_resolver(limits=Limits(max_queries=40), max_depth=10)
         sent = 0
 
-        def send(qname, rdtype, nameservers, ctx):
+        def send(qname, rdtype, nameservers, ctx, usable=None):
             nonlocal sent
             sent += 1
             assert sent < 5000, "runaway fan-out"
@@ -238,7 +240,7 @@ class TestReferralValidation:
         """Regression: this used to raise dns.name.NoParent out of resolve()."""
         resolver = offline_resolver()
 
-        def send(qname, rdtype, nameservers, ctx):
+        def send(qname, rdtype, nameservers, ctx, usable=None):
             return referral(".", ["a.root-servers.net."], {"a.root-servers.net.": "198.41.0.4"}), "1.2.3.4"
 
         # Must surface as a ResolverError, never dns.name.NoParent.
@@ -349,7 +351,7 @@ class TestResponseValidation:
         resolver = RecursiveResolver(dnssec=False, cache_enabled=True)
         sent = 0
 
-        def send(qname, rdtype, nameservers, ctx):
+        def send(qname, rdtype, nameservers, ctx, usable=None):
             nonlocal sent
             sent += 1
             if sent == 1:
@@ -402,6 +404,76 @@ class TestEDNSDowngrade:
         assert resolver._payload_for_attempt(0) == 1232
         assert resolver._payload_for_attempt(1) == 512
         assert resolver._payload_for_attempt(2) is None
+
+    def test_the_ladder_never_drops_edns_while_validating(self) -> None:
+        """DNSSEC needs EDNS0 to carry DO (RFC 4035 §3.2.1).
+
+        Without the OPT record the answer comes back with no RRSIGs, which the
+        validator can only read as BOGUS: a validation failure of our own making
+        against a perfectly good zone.
+        """
+        resolver = offline_resolver(edns_payload=1232)
+        assert resolver._payload_for_attempt(2, True) == 512
+
+    def test_every_sweep_carries_the_do_bit_for_a_validating_query(self) -> None:
+        resolver = RecursiveResolver(timeout=0.5, cache_enabled=False)
+        sent: list[dns.message.Message] = []
+
+        def capture(query, server, timeout=None, **kwargs):
+            sent.append(query)
+            raise dns.exception.Timeout("forced")
+
+        with (
+            patch("dns.query.udp", side_effect=capture),
+            patch("dns.query.udp_with_fallback", side_effect=lambda q, s, timeout=None, **kw: (capture(q, s), False)),
+        ):
+            ctx = resolver._new_context()
+            resolver._send_query(dns.name.from_text("example.com."), dns.rdatatype.DNSKEY, ["9.9.9.9"], ctx)
+
+        assert len(sent) == resolver.max_retries + 1
+        assert not [i + 1 for i, query in enumerate(sent) if not query.ednsflags & dns.flags.DO]
+
+    def test_an_edns_incapable_server_is_abandoned_while_validating(self) -> None:
+        """Its answers can never be validated, so a DO-less retry is pointless.
+
+        Querying it without DO and then judging the unsigned result BOGUS is the
+        worst of both: no signatures, and a DNSSEC verdict pinned on the zone.
+        """
+        resolver = RecursiveResolver(cache_enabled=False)
+        payloads: list[int | None] = []
+
+        def query_once(qname, rdtype, server, payload, timeout, ctx):
+            payloads.append(payload)
+            return make_response(rcode=dns.rcode.FORMERR, aa=False)
+
+        zone = dns.name.from_text("example.com.")
+        with patch.object(resolver, "_query_once", side_effect=query_once):
+            ctx = resolver._new_context()
+            response, _ = resolver._send_query(
+                zone, dns.rdatatype.DNSKEY, ["9.9.9.9"], ctx, usable=resolver._usable_dnskey(zone)
+            )
+
+        assert response is None
+        assert payloads == [1232], "the server must be abandoned, not retried without DO"
+
+    def test_a_servfail_still_reaches_the_caller_while_validating(self) -> None:
+        """Abandoning the server must not hide the failure it reported.
+
+        SERVFAIL shares a branch with the EDNS-incapable rcodes. Without DO
+        there is nothing to gain from re-asking, but the response still has to
+        come back, or a broken zone would surface as a timeout.
+        """
+        resolver = RecursiveResolver(cache_enabled=False)
+
+        def query_once(qname, rdtype, server, payload, timeout, ctx):
+            return make_response(rcode=dns.rcode.SERVFAIL, aa=False)
+
+        with patch.object(resolver, "_query_once", side_effect=query_once):
+            ctx = resolver._new_context()
+            response, _ = resolver._send_query(dns.name.from_text("example.com."), dns.rdatatype.A, ["9.9.9.9"], ctx)
+
+        assert response is not None
+        assert response.rcode() == dns.rcode.SERVFAIL
 
     @pytest.mark.parametrize(
         "rcode",
@@ -470,7 +542,7 @@ class TestSpoofingResistance:
     def test_all_servers_failing_raises_servfail_not_success(self) -> None:
         resolver = offline_resolver()
 
-        def send(qname, rdtype, nameservers, ctx):
+        def send(qname, rdtype, nameservers, ctx, usable=None):
             return make_response(rcode=dns.rcode.REFUSED, aa=False), nameservers[0]
 
         with patch.object(resolver, "_send_query", side_effect=send), pytest.raises(ServfailError):
@@ -491,7 +563,7 @@ class TestDNSSECBookkeeping:
         resolver = RecursiveResolver(dnssec=True, cache_enabled=False)
         attempted: list[list[str]] = []
 
-        def send(qname, rdtype, nameservers, ctx):
+        def send(qname, rdtype, nameservers, ctx, usable=None):
             attempted.append(list(nameservers))
             return (None, "") if not nameservers else (make_response(aa=True), nameservers[0])
 
@@ -523,7 +595,7 @@ class TestDNSSECBookkeeping:
         resolver = RecursiveResolver(dnssec=False, cache_enabled=False)
         calls = 0
 
-        def send(qname, rdtype, nameservers, ctx):
+        def send(qname, rdtype, nameservers, ctx, usable=None):
             nonlocal calls
             calls += 1
             assert nameservers, "queried with an empty nameserver list"
@@ -551,7 +623,7 @@ class TestDNSSECBookkeeping:
             ),
             ttl=3600,
         )
-        zone, servers, state, ds = resolver._starting_point(dns.name.from_text("example.com."), dns.rdatatype.A)
+        zone, servers, state, ds, _names = resolver._starting_point(dns.name.from_text("example.com."), dns.rdatatype.A)
         assert zone == dns.name.from_text("com.")
         assert servers == ["192.5.6.30"]
         assert ds is sentinel
@@ -565,7 +637,9 @@ class TestDNSSECBookkeeping:
             Delegation(zone=dns.name.from_text("com."), addresses=["192.5.6.30"], secure=True, ds=None),
             ttl=3600,
         )
-        zone, servers, _state, _ds = resolver._starting_point(dns.name.from_text("example.com."), dns.rdatatype.A)
+        zone, servers, _state, _ds, _names = resolver._starting_point(
+            dns.name.from_text("example.com."), dns.rdatatype.A
+        )
         assert zone == dns.name.root
         assert servers == resolver._root_addresses
 
@@ -661,7 +735,7 @@ class TestCrossZoneCNAMEPoisoning:
     FORGED = '"v=DKIM1; k=rsa; p=ATTACKERKEY"'
 
     def _send(self, resolver):
-        def send(qname, rdtype, nameservers, ctx):
+        def send(qname, rdtype, nameservers, ctx, usable=None):
             if nameservers == resolver._root_addresses:
                 if str(qname).endswith("attacker.test."):
                     return referral("attacker.test.", ["ns.attacker.test."], {"ns.attacker.test.": self.ATTACKER_IP}), (
@@ -700,7 +774,7 @@ class TestCrossZoneCNAMEPoisoning:
         resolver = RecursiveResolver(dnssec=False, cache_enabled=False)
         calls = []
 
-        def send(qname, rdtype, nameservers, ctx):
+        def send(qname, rdtype, nameservers, ctx, usable=None):
             calls.append(str(qname))
             if nameservers == resolver._root_addresses:
                 return referral("example.com.", ["ns.example.com."], {"ns.example.com.": "192.5.6.30"}), "198.41.0.4"
@@ -748,7 +822,7 @@ class TestNegativeCacheScoping:
     def test_a_sibling_of_a_missing_name_is_not_denied(self) -> None:
         resolver = RecursiveResolver(dnssec=False)
 
-        def send(qname, rdtype, nameservers, ctx):
+        def send(qname, rdtype, nameservers, ctx, usable=None):
             if nameservers == resolver._root_addresses:
                 return referral("example.com.", ["ns.example.com."], {"ns.example.com.": "192.5.6.30"}), "198.41.0.4"
             if str(qname) == "missing.example.com.":
@@ -811,7 +885,7 @@ class TestReturnedDataIsTheCallersOwn:
     def offline_resolver():
         resolver = RecursiveResolver(dnssec=False)
 
-        def send(qname, rdtype, nameservers, ctx):
+        def send(qname, rdtype, nameservers, ctx, usable=None):
             if nameservers == resolver._root_addresses:
                 return referral("example.com.", ["ns.example.com."], {"ns.example.com.": "192.5.6.30"}), "198.41.0.4"
             return make_response(answer=[("example.com.", 300, "A", ["1.2.3.4"])]), "192.5.6.30"
@@ -883,3 +957,93 @@ class TestUnverifiableAlgorithmsAreInsecureNotBogus:
         ds = dns.rdataset.Rdataset(dns.rdataclass.IN, dns.rdatatype.DS)
         ds.add(dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.DS, "12345 8 2 " + "AB" * 32), ttl=300)
         assert validator.validate_dnskey(dns.name.from_text("z.test."), keys, None, ds) is ValidationState.BOGUS
+
+
+class TestSpoofedPacketsDoNotRetireANameserver:
+    """RFC 5452 §9: a wrong-ID datagram is junk, not an answer, and not a fault.
+
+    The randomised query ID and source port exist so an off-path attacker's
+    guesses are discarded. Treating the first wrong guess as a protocol error
+    hands that attacker the outcome anyway: the server gets abandoned, or its
+    EDNS support written off, on the strength of a packet nobody authenticated.
+
+    These run against a real UDP socket, so what is exercised is the flag this
+    resolver passes rather than a stubbed-out reimplementation of it.
+    """
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _server(spoofs: int):
+        """A nameserver that emits ``spoofs`` junk packets before answering."""
+        import socket
+        import threading
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        finished = threading.Event()
+
+        def serve() -> None:
+            try:
+                data, addr = sock.recvfrom(4096)
+                query = dns.message.from_wire(data)
+                for _ in range(spoofs):
+                    # A well-formed response to a *different* query: exactly
+                    # what a blind spoofer's guess looks like on the wire.
+                    junk = dns.message.make_query("guessed.example.", "A")
+                    junk.flags |= dns.flags.QR
+                    sock.sendto(junk.to_wire(), addr)
+                reply = dns.message.make_response(query)
+                reply.flags |= dns.flags.AA
+                reply.answer.append(dns.rrset.from_text("a.test.", 300, "IN", "A", "1.2.3.4"))
+                sock.sendto(reply.to_wire(), addr)
+            except Exception:  # pragma: no cover - the test asserts on the client side
+                pass
+            finally:
+                finished.set()
+
+        threading.Thread(target=serve, daemon=True).start()
+        try:
+            yield port
+        finally:
+            finished.wait(timeout=5)
+            sock.close()
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _on_port(port: int, tcp_fallback: bool):
+        """Send to the ephemeral test port while leaving the resolver's code intact.
+
+        Only the entry point the resolver actually calls is redirected, so
+        ``udp_with_fallback`` still reaches the real ``udp`` underneath.
+        """
+        name = "dns.query.udp_with_fallback" if tcp_fallback else "dns.query.udp"
+        real = dns.query.udp_with_fallback if tcp_fallback else dns.query.udp
+
+        def send(query, where, *args, **kwargs):
+            kwargs["port"] = port
+            return real(query, where, *args, **kwargs)
+
+        with patch(name, side_effect=send):
+            yield
+
+    def _ask(self, port: int, **kwargs):
+        resolver = offline_resolver(dnssec=False, **kwargs)
+        ctx = resolver._new_context()
+        with self._on_port(port, resolver.use_tcp_fallback):
+            return resolver._query_once(dns.name.from_text("a.test."), dns.rdatatype.A, "127.0.0.1", 1232, 4.0, ctx)
+
+    def test_a_spoofed_reply_before_the_real_one_is_discarded(self) -> None:
+        with self._server(spoofs=1) as port:
+            response = self._ask(port)
+        assert [str(rr) for rrset in response.answer for rr in rrset] == ["1.2.3.4"]
+
+    def test_a_burst_of_spoofed_replies_is_discarded(self) -> None:
+        with self._server(spoofs=5) as port:
+            response = self._ask(port)
+        assert response.answer, "a flood of wrong-ID packets denied a real answer"
+
+    def test_the_same_holds_without_tcp_fallback(self) -> None:
+        with self._server(spoofs=1) as port:
+            response = self._ask(port, use_tcp_fallback=False)
+        assert response.answer

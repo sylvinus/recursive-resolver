@@ -46,9 +46,9 @@ author, the committer and any `Co-authored-by:` trailer.
 
 This package is MIT and every runtime dependency is permissive. Before copying
 anything in, check [THIRD-PARTY.md](THIRD-PARTY.md) and note that several
-reference resolvers are **copyleft**: PowerDNS Recursor and Knot Resolver are
-GPL, BIND 9 is MPL-2.0. Their *behaviour* is fair to cite: parameter names and
-default values are facts, and recording them lets a reader check our choices
+widely-used resolver implementations are **copyleft** (GPL or MPL). Their
+*behaviour* is fair to cite: parameter names and default values are facts, and
+recording them lets a reader check our choices
 against the state of the art. Their code, documentation text and curated data
 (prefix lists, tables) are not, and must not be pasted in.
 
@@ -68,7 +68,12 @@ the file header and add a row to `THIRD-PARTY.md`.
   acceptable in the query path: it is what previously turned malformed input
   into phantom network timeouts.
 - Unit tests must not touch the network. Use the builders in `tests/conftest.py`
-  and patch `_send_query`.
+  and patch `_send_query`, or `_query_once` when the sweep across a zone's
+  nameservers is itself what is being tested.
+- **A DNSSEC verdict needs retrieved material.** `DNSSECValidationError` means
+  signed data was obtained and failed to verify. Anything that could not be
+  fetched, whether a lame server, a SERVFAIL or no answer at all, is a
+  `DNSSECMaterialUnavailableError`, which is deliberately not a `DNSSECError`.
 - Integration tests go behind the `integration` marker.
 
 ## Differential testing
@@ -76,6 +81,10 @@ the file header and add a row to `THIRD-PARTY.md`.
 Beyond the unit and integration suites, `scripts/diff_harness.py` compares this
 resolver against reference resolvers across a large corpus, broken down by
 record type, corpus category and resolver configuration.
+
+It compares record values, not DNSSEC verdicts, and runs each name once. The
+layers that cover those, driven by `make test-protocol`, are described in
+[TESTING.md](TESTING.md).
 
 ```bash
 # Build a deliberately awkward corpus (~4k names).

@@ -7,6 +7,9 @@ import time
 from unittest.mock import patch
 
 import dns.name
+import dns.rdata
+import dns.rdataclass
+import dns.rdataset
 import dns.rdatatype
 import pytest
 from conftest import make_response, referral, root_to_com
@@ -108,19 +111,35 @@ class TestNegativeCache:
         cache = DNSCache()
         cache.put_nxdomain(EXAMPLE, ttl=300)
         assert cache.get_nxdomain(EXAMPLE) is not None
-        assert cache.get_nxdomain_ancestor(EXAMPLE) == EXAMPLE
+        assert cache.get_nxdomain_ancestor(EXAMPLE) is not None
 
     def test_harden_below_nxdomain(self) -> None:
         """RFC 8020: nothing can exist below a non-existent name."""
         cache = DNSCache()
         cache.put_nxdomain(dns.name.from_text("gone.example.com."), ttl=300)
         found = cache.get_nxdomain_ancestor(dns.name.from_text("deep.under.gone.example.com."))
-        assert found == dns.name.from_text("gone.example.com.")
+        assert found is not None and found.is_negative
 
     def test_unrelated_names_are_not_covered(self) -> None:
         cache = DNSCache()
         cache.put_nxdomain(dns.name.from_text("gone.example.com."), ttl=300)
         assert cache.get_nxdomain_ancestor(dns.name.from_text("live.example.com.")) is None
+
+    def test_the_denial_state_is_recorded_and_returned(self) -> None:
+        """A cached denial must remember whether it was ever proven."""
+        cache = DNSCache()
+        cache.put_nxdomain(dns.name.from_text("proven.example.com."), ttl=300, secure=True)
+        cache.put_nxdomain(dns.name.from_text("unproven.example.com."), ttl=300)
+        proven = cache.get_nxdomain_ancestor(dns.name.from_text("a.proven.example.com."))
+        unproven = cache.get_nxdomain_ancestor(dns.name.from_text("a.unproven.example.com."))
+        assert proven is not None and proven.secure is True
+        assert unproven is not None and unproven.secure is False
+
+    def test_nodata_records_the_denial_state_too(self) -> None:
+        cache = DNSCache()
+        cache.put_nodata(EXAMPLE, "MX", ttl=300, secure=True)
+        entry = cache.get_nodata(EXAMPLE, "MX")
+        assert entry is not None and entry.secure is True
 
     def test_nodata_is_keyed_by_name_and_type(self) -> None:
         cache = DNSCache()
@@ -153,7 +172,30 @@ class TestNegativeCache:
             assert cache.get_nxdomain(EXAMPLE) is None
 
 
+class TestTTLBounds:
+    def test_a_floor_above_the_ceiling_is_refused(self) -> None:
+        """_clamp applies the floor last, so this would silently invert max_ttl."""
+        with pytest.raises(ValueError, match="min_ttl"):
+            DNSCache(min_ttl=600, max_ttl=300)
+
+    def test_negative_bounds_are_refused(self) -> None:
+        with pytest.raises(ValueError, match="negative"):
+            DNSCache(min_ttl=-1)
+
+
 class TestDelegationCache:
+    def test_a_validated_delegation_is_not_floored(self) -> None:
+        """It carries a signed DS, so min_ttl must not hold it past the signature."""
+        cache = DNSCache(min_ttl=600)
+        now = time.monotonic()
+        zone = dns.name.from_text("example.com.")
+        with patch("recursive_resolver.cache.time.monotonic", return_value=now):
+            cache.put_delegation(Delegation(zone=zone, addresses=["1.2.3.4"], secure=True), ttl=30)
+            cache.put_delegation(Delegation(zone=dns.name.from_text("unsigned.test."), addresses=["1.2.3.4"]), ttl=30)
+        with patch("recursive_resolver.cache.time.monotonic", return_value=now + 31):
+            assert cache.get_delegation(zone) is None
+            assert cache.get_delegation(dns.name.from_text("unsigned.test.")) is not None
+
     def test_put_and_closest(self) -> None:
         cache = DNSCache()
         cache.put_delegation(Delegation(zone=dns.name.from_text("com."), addresses=["1.2.3.4"]), ttl=3600)
@@ -291,7 +333,7 @@ class TestResolverCacheIntegration:
             authority=[("example.com.", 900, "SOA", ["ns1.example.com. a.example.com. 1 3600 900 604800 120"])],
             aa=True,
         )
-        assert resolver._negative_ttl(response, EXAMPLE) == 120
+        assert resolver._negative_ttl(response, EXAMPLE, EXAMPLE) == 120
 
     def test_nodata_is_cached(self) -> None:
         resolver = RecursiveResolver(dnssec=False, cache_enabled=True)
@@ -373,3 +415,52 @@ class TestNamedCacheDepths:
         resolver = RecursiveResolver(dnssec=False, max_delegation_cache_depth="tld")
         assert resolver.cache is not None
         assert resolver.cache.max_delegation_depth == 1
+
+
+class TestEntriesHandedOutAreCopies:
+    """A caller must not be able to rewrite the cache by touching what it got.
+
+    `secure` on a negative entry is what `require_dnssec` gates on, so an
+    aliased entry is a way to downgrade a cached denial for every thread.
+    """
+
+    def test_a_negative_entry_is_a_copy(self) -> None:
+        cache = DNSCache()
+        cache.put_nxdomain("gone.example.", ttl=300, secure=True)
+        cache.get_nxdomain(dns.name.from_text("gone.example."))
+        entry = cache.get_nxdomain(dns.name.from_text("gone.example."))
+        assert entry is not None
+        entry.secure = False
+        again = cache.get_nxdomain(dns.name.from_text("gone.example."))
+        assert again is not None and again.secure is True
+
+    def test_the_rfc8020_ancestor_lookup_is_a_copy_too(self) -> None:
+        cache = DNSCache()
+        cache.put_nxdomain("gone.example.", ttl=300, secure=True)
+        entry = cache.get_nxdomain_ancestor(dns.name.from_text("a.b.gone.example."))
+        assert entry is not None
+        entry.secure = False
+        again = cache.get_nxdomain_ancestor(dns.name.from_text("a.b.gone.example."))
+        assert again is not None and again.secure is True
+
+    def test_a_nodata_entry_is_a_copy(self) -> None:
+        cache = DNSCache()
+        cache.put_nodata("x.example.", "MX", ttl=300, secure=True)
+        entry = cache.get_nodata(dns.name.from_text("x.example."), dns.rdatatype.MX)
+        assert entry is not None
+        entry.secure = False
+        again = cache.get_nodata(dns.name.from_text("x.example."), dns.rdatatype.MX)
+        assert again is not None and again.secure is True
+
+    def test_a_delegations_ds_is_a_copy(self) -> None:
+        """It is the trust material a resumed resolution rebuilds its chain from."""
+        cache = DNSCache()
+        ds = dns.rdataset.Rdataset(dns.rdataclass.IN, dns.rdatatype.DS)
+        ds.add(dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.DS, "12345 8 2 " + "ab" * 32), ttl=300)
+        cache.put_delegation(Delegation(zone=EXAMPLE, addresses=["1.2.3.4"], ds=ds), ttl=300)
+        handed_out = cache.get_delegation(EXAMPLE)
+        assert handed_out is not None and handed_out.ds is not None
+        handed_out.ds.add(dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.DS, "999 8 2 " + "cd" * 32), ttl=300)
+        again = cache.get_delegation(EXAMPLE)
+        assert again is not None and again.ds is not None
+        assert len(again.ds) == 1, "a caller's edit reached the cached trust material"

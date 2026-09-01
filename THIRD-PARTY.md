@@ -35,8 +35,8 @@ Français, **MIT licensed**. Both carry the notice in their header:
 
 ## Reference values, not copied code
 
-`budget.py`, `dnssec.py` and `resolver.py` cite the defaults that BIND 9,
-Unbound, PowerDNS Recursor and Knot Resolver use for the same protections
+`budget.py` and `resolver.py` cite the defaults that other widely-used resolver
+implementations use for the same protections
 (`max-recursion-queries`, `MAX_TARGET_COUNT`, `max-ns-per-resolve`, and so on).
 These are parameter names and numeric values: facts about how those resolvers
 behave, recorded so a reader can check our choices against the state of the art.

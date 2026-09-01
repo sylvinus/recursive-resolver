@@ -6,6 +6,7 @@ are exercised explicitly rather than left to chance.
 
 from __future__ import annotations
 
+import ipaddress
 import subprocess
 import sys
 import threading
@@ -28,6 +29,7 @@ from recursive_resolver import (
     QueryBudgetExceededError,
     RecursiveResolver,
     ResolutionTimeoutError,
+    ResolverError,
     ServfailError,
     UnsupportedRdtypeError,
     ValidationState,
@@ -97,6 +99,31 @@ class TestAddressFilterEdges:
         f = AddressFilter()
         assert f.is_allowed("224.0.0.1") is False
         assert f.is_allowed("::") is False
+
+    def test_ipv6_transition_prefixes_are_rejected_by_our_own_list(self) -> None:
+        """Each wraps an IPv4 address, here 169.254.169.254 or 127.0.0.1.
+
+        Stdlib classification catches these on a current interpreter, but did
+        not before CVE-2024-4032, so the built-in list must catch them on its
+        own. Checked with classification switched off.
+        """
+        f = AddressFilter()
+        f._networks = tuple(n for n in f._networks if n.version == 6)
+        for address in (
+            "2002:a9fe:a9fe::1",  # 6to4
+            "2001:0:53aa:64c:0:5faa:a9fe:a9fe",  # Teredo
+            "64:ff9b::a9fe:a9fe",  # NAT64 well-known
+            "64:ff9b:1::a9fe:a9fe",  # NAT64 local-use
+            "::0.0.0.1",  # IPv4-compatible
+        ):
+            assert any(ipaddress.ip_address(address) in network for network in f._networks), (
+                f"{address} is not in any built-in blocked network"
+            )
+
+    def test_real_public_ipv6_nameservers_are_still_allowed(self) -> None:
+        f = AddressFilter()
+        assert f.is_allowed("2001:4860:4860::8888") is True
+        assert f.is_allowed("2620:fe::fe") is True
 
 
 class TestBudgetEdges:
@@ -208,8 +235,19 @@ class TestInputValidationEdges:
             offline_resolver().resolve("example.com", "AXFR")
         assert "meta" in str(exc.value)
 
-    def test_any_is_permitted(self) -> None:
-        assert offline_resolver()._parse_rdtype("ANY") == dns.rdatatype.ANY
+    def test_any_is_refused(self) -> None:
+        """An `Answer` holds one RRset, so there is nothing ANY could return.
+
+        Letting it through was worse than refusing: no RRset ever matched the
+        query type, so a fully populated answer read as NODATA and was cached
+        as one, denying the name for every later query of any type.
+        """
+        with pytest.raises(UnsupportedRdtypeError, match="ANY cannot be queried"):
+            offline_resolver()._parse_rdtype("ANY")
+
+    def test_a_resolve_call_for_any_is_refused_too(self) -> None:
+        with pytest.raises(UnsupportedRdtypeError):
+            offline_resolver().resolve("example.com", "ANY")
 
     def test_relative_names_are_made_absolute(self) -> None:
         assert offline_resolver()._normalize_qname("example.com", "A").is_absolute()
@@ -343,7 +381,7 @@ class TestLoopErrorPaths:
         assert classification["type"] == "answer"
 
     def test_negative_ttl_without_an_soa(self) -> None:
-        assert offline_resolver()._negative_ttl(make_response(), EXAMPLE) is None
+        assert offline_resolver()._negative_ttl(make_response(), EXAMPLE, EXAMPLE) is None
 
     def test_delegation_is_not_cached_without_a_ttl(self) -> None:
         resolver = RecursiveResolver(dnssec=False, cache_enabled=True)
@@ -362,6 +400,21 @@ class TestLoopErrorPaths:
         ctx = resolver._new_context()
         ctx.budget.spend_query("x.", "A")
         assert resolver._resolve_ns_names([dns.name.from_text("ns.example.com.")], ctx, 1, limit=5) == []
+
+    def test_the_aaaa_lookup_is_skipped_once_the_budget_is_gone(self) -> None:
+        """The A lookup can spend the last query; asking for AAAA anyway overruns."""
+        resolver = offline_resolver(limits=Limits(max_queries=1), ipv4_only=False)
+        ctx = resolver._new_context()
+        asked = []
+
+        def resolve(ns_name, rdtype, ctx_, depth, path):
+            asked.append(rdtype)
+            ctx_.budget.spend_query(str(ns_name), dns.rdatatype.to_text(rdtype))
+            raise ServfailError(str(ns_name), dns.rdatatype.to_text(rdtype))
+
+        with patch.object(resolver, "_resolve_iterative", side_effect=resolve):
+            assert resolver._resolve_ns_names([dns.name.from_text("ns.example.com.")], ctx, 1, limit=5) == []
+        assert asked == [dns.rdatatype.A], "AAAA was queried with no budget left"
 
     def test_all_servers_erroring_raises_servfail(self) -> None:
         resolver = offline_resolver()
@@ -556,7 +609,7 @@ class TestBranchCompleteness:
         resolver.cache.put_delegation(
             Delegation(zone=dns.name.from_text("com."), addresses=["127.0.0.1", "10.0.0.1"]), ttl=3600
         )
-        zone, servers, _state, _ds = resolver._starting_point(EXAMPLE, dns.rdatatype.A)
+        zone, servers, _state, _ds, _names = resolver._starting_point(EXAMPLE, dns.rdatatype.A)
         assert zone == dns.name.root
         assert servers == resolver._root_addresses
 
@@ -589,7 +642,7 @@ class TestBranchCompleteness:
             ],
             aa=False,
         )
-        assert resolver._negative_ttl(response, EXAMPLE) is None
+        assert resolver._negative_ttl(response, EXAMPLE, EXAMPLE) is None
 
 
 class TestDSQueries:
@@ -600,14 +653,14 @@ class TestDSQueries:
         DS query was then sent to the child, which correctly answers NODATA."""
         resolver = RecursiveResolver(dnssec=False, cache_enabled=True)
         resolver.cache.put_delegation(Delegation(zone=EXAMPLE, addresses=["5.5.5.5"]), ttl=3600)
-        zone, servers, _state, _ds = resolver._starting_point(EXAMPLE, dns.rdatatype.DS)
+        zone, servers, _state, _ds, _names = resolver._starting_point(EXAMPLE, dns.rdatatype.DS)
         assert zone != EXAMPLE, "a DS query must not start at the child zone"
         assert servers != ["5.5.5.5"]
 
     def test_a_query_still_uses_the_child_delegation(self) -> None:
         resolver = RecursiveResolver(dnssec=False, cache_enabled=True)
         resolver.cache.put_delegation(Delegation(zone=EXAMPLE, addresses=["5.5.5.5"]), ttl=3600)
-        zone, servers, _state, _ds = resolver._starting_point(EXAMPLE, dns.rdatatype.A)
+        zone, servers, _state, _ds, _names = resolver._starting_point(EXAMPLE, dns.rdatatype.A)
         assert zone == EXAMPLE
         assert servers == ["5.5.5.5"]
 
@@ -615,13 +668,13 @@ class TestDSQueries:
         resolver = RecursiveResolver(dnssec=False, cache_enabled=True)
         resolver.cache.put_delegation(Delegation(zone=dns.name.from_text("com."), addresses=["192.5.6.30"]), ttl=3600)
         resolver.cache.put_delegation(Delegation(zone=EXAMPLE, addresses=["5.5.5.5"]), ttl=3600)
-        zone, servers, _state, _ds = resolver._starting_point(EXAMPLE, dns.rdatatype.DS)
+        zone, servers, _state, _ds, _names = resolver._starting_point(EXAMPLE, dns.rdatatype.DS)
         assert zone == dns.name.from_text("com.")
         assert servers == ["192.5.6.30"]
 
     def test_ds_at_the_root_has_no_parent_to_climb_to(self) -> None:
         resolver = RecursiveResolver(dnssec=False, cache_enabled=True)
-        zone, _servers, _state, _ds = resolver._starting_point(dns.name.root, dns.rdatatype.DS)
+        zone, _servers, _state, _ds, _names = resolver._starting_point(dns.name.root, dns.rdatatype.DS)
         assert zone == dns.name.root
 
     def test_ds_in_a_referral_authority_is_the_answer(self) -> None:
@@ -727,3 +780,28 @@ class TestStaleDelegationFallback:
         resolver = offline_resolver()
         ctx = resolver._new_context()
         assert resolver._fallback_nameservers([], set(), ctx, 0) == []
+
+
+class TestConstructorRejectsOutOfRangeEDNS:
+    """Everything leaving this package is a `ResolverError`.
+
+    An OPT record carries the payload size in the class field, so a value
+    outside 16 bits reached dnspython as a bad rdclass and came back as a bare
+    `ValueError` from inside the query path, long after the caller could tell
+    what they had done wrong.
+    """
+
+    @pytest.mark.parametrize("payload", [70000, -3, 65536])
+    def test_an_out_of_range_payload_is_refused_at_construction(self, payload: int) -> None:
+        with pytest.raises(ValueError, match="edns_payload"):
+            RecursiveResolver(edns_payload=payload)
+
+    @pytest.mark.parametrize("payload", [0, 512, 1232, 65535])
+    def test_the_usable_range_is_accepted(self, payload: int) -> None:
+        assert RecursiveResolver(edns_payload=payload, dnssec=False).edns_payload == payload
+
+    def test_nothing_but_a_resolver_error_escapes_resolve(self) -> None:
+        """The contract the guard exists to keep."""
+        resolver = offline_resolver(edns_payload=1232)
+        with patch.object(resolver, "_send_query", return_value=(None, "")), pytest.raises(ResolverError):
+            resolver.resolve("example.com", "A")
