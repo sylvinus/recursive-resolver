@@ -111,11 +111,8 @@ class SignedZone:
         against it. That is the point: a validator that ignores the bit keeps
         trusting a key its owner has publicly withdrawn.
         """
-        revoked_key = dns.rdata.from_text(
-            dns.rdataclass.IN,
-            dns.rdatatype.DNSKEY,
-            f"{self.dnskey.flags | REVOKE} {self.dnskey.protocol} {self.dnskey.algorithm} "
-            f"{dns.rdata._base64ify(self.dnskey.key, chunksize=0)}",
+        revoked_key = dns.dnssec.make_dnskey(
+            self.private_key.public_key(), self.dnskey.algorithm, flags=self.dnskey.flags | REVOKE
         )
         rrset = dns.rrset.RRset(self.name, dns.rdataclass.IN, dns.rdatatype.DNSKEY)
         rrset.add(revoked_key)

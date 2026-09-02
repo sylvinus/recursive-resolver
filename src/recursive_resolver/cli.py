@@ -28,10 +28,16 @@ def _json_dnssec(answer: Answer | None, args: argparse.Namespace) -> str | None:
     ``--no-dnssec`` leaves the default INSECURE on the Answer, which in JSON
     reads as "we looked and the zone is unsigned". Nothing was looked at, so
     say so.
+
+    No answer still means no verdict. A trace that failed has nothing to report
+    a state for, and "disabled" there would describe the configuration where
+    the caller is reading a result.
     """
+    if answer is None:
+        return None
     if args.no_dnssec:
         return "disabled"
-    return answer.dnssec.value if answer is not None else None
+    return answer.dnssec.value
 
 
 def _note_dnssec(answer: Answer, args: argparse.Namespace) -> None:

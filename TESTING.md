@@ -6,8 +6,8 @@ validator that could be made to accept forged data by anyone who owned a signed
 domain, and that returned a false `DNSSECValidationError` on ordinary names.
 
 This document is the protocol built in response: what to run, against what
-corpus, and what has to hold. Some of it exists and has been run; some of it is
-built but unexercised; some is a proposal. Each section says which.
+corpus, and what has to hold. Layers 0 to 4 and 6 exist and were run for this
+release; layers 5 and 7 are proposals and say so in their headings.
 
 ## Why none of the existing testing found it
 
@@ -63,7 +63,7 @@ per-resolution ledger. Production code carries no test hooks.
 | I1 | A DNSSEC verdict requires retrieved material: if any fetch of validation material came back empty-handed, the resolution must end in `DNSSECMaterialUnavailableError`, never a `DNSSECError`. |
 | I2 | Every query sent while validating carries EDNS0, so it can carry DO (RFC 4035 §3.2.1). |
 | I3 | No zone is judged on one server's word: a failed material fetch must have asked every usable address in the NS set. |
-| I4 | Nothing is accepted from a response the resolver itself classified as unusable (no AA, wrong class, out of bailiwick). |
+| I4 | Nothing is accepted from a response the resolver itself classified as unusable (no AA, wrong class, out of bailiwick), judged against the resolver's own `require_authoritative` setting. |
 | I5 | `DNSSECMaterialUnavailableError` is only raised when a fetch really did return nothing, so it cannot become a way to hide a validation failure. |
 
 I1 alone catches this release's first bug the moment it fires, on any corpus,
@@ -114,12 +114,19 @@ is reached. The references do not expose a verdict, so each is asked twice:
 `SERVFAIL` that becomes an answer under CD=1 is bogus, `NOERROR` with AD is
 secure, `NOERROR` without AD is insecure.
 
+The panel is first reduced to a verdict of its own. Each reference falls into
+one of secure, bogus or insecure, and a group counts only with a two-thirds
+majority behind it: with five validators, the odd one running a stale cache, a
+negative trust anchor or an algorithm it will not verify cannot decide
+anything on its own. A panel with no two-thirds group is `references-disagree`,
+reported as a disagreement rather than quietly resolved in our favour.
+
 Rules, each a failure rather than a report line:
 
 | Ours | Required of the references |
 |---|---|
-| `SECURE` | at least one says secure |
-| `INSECURE` | none says secure. The dangerous direction is a signature we failed to notice |
+| `SECURE` | secure holds the majority. A lone secure among four insecure is a disagreement, not agreement |
+| `INSECURE` | secure does not hold the majority, or insecure also does. The dangerous direction is a signature we failed to notice |
 | `BOGUS` | all but at most one refuse (SERVFAIL without CD, data with CD) |
 | unavailable / failed | flagged when the references all resolved it |
 
@@ -135,9 +142,11 @@ off rather than DNSSEC off in every config but one.
 
 ## Layer 4: cassette replay with systematic perturbation
 
-Built and unit-tested, but not exercised against a recorded corpus for this
-release: every mutation run below reports `cassettes skipped`. What follows is
-what it does, not a result it has produced.
+Run for this release: 397 cassettes over 23,320 recorded responses, 19,453
+perturbed replays, no failures. Five of the mutations below are caught here
+independently of the unit suite - the retrieval-failure family, which is the
+class this layer exists for. The other forty-five survive it, and are meant to:
+they need input the honest internet does not send.
 
 ```bash
 python scripts/cassette.py record --csv adversarial.csv -o cassettes.jsonl --types A,MX
@@ -162,7 +171,17 @@ What must hold, checked on every replay along with the Layer 0 invariants:
   unavailable;
 - a **signature-removing** fault may additionally produce BOGUS, because data
   that should be signed and is not is what tampering looks like; it must never
-  produce a weaker verdict than the baseline.
+  produce a weaker verdict than the baseline;
+- an exception that is not a `ResolverError` fails outright, whatever the
+  fault and whether or not it reproduces. The README promises none escapes,
+  and this is where that promise meets 19,000 adversarial replays.
+
+`record` drops any name whose cassette does not reproduce its own baseline
+offline, and says which. Three of 400 did not: zones whose nameservers disagree
+with each other, so replaying with a different one first walks into a branch
+the recording never entered. Keeping them would mean `replay` failing forever
+and `perturb` measuring every scenario against an outcome that was never
+recorded.
 
 The retrieval bugs 0.2.0 fixes are the shape this enumerates: each depends on
 which server answered first, which is exactly what forcing every order removes.
@@ -461,8 +480,13 @@ audit wants repeating whenever this code changes.
 
 The mutation catalogue in `scripts/mutation_check.py` now holds 50 entries, one
 per defect found across all three methods. Each reintroduces the original bug
-into a copy of the package and confirms the suite still fails. Every one is
-currently caught. That is the only evidence that the tests written alongside a
-fix actually test it - and it caught one case where a mutation preserved the
-file's byte length, landed in the same mtime second, and let Python reuse stale
-bytecode so the mutant never ran at all.
+into a copy of the package and confirms the suite still fails. That is the only
+evidence that the tests written alongside a fix actually test it.
+
+Getting there needed a fix to the harness itself. One mutation preserved the
+file's byte length and landed in the same mtime second as the `.pyc` copied
+alongside it, so Python reused the stale bytecode: the mutant never executed,
+and the report called it caught. The copy now excludes `__pycache__` and
+`*.pyc`, so every mutant is compiled from the mutated source. Re-run after the
+fix: that mutant executes, and the suite fails on it like the rest. All 50 are
+caught, and all 50 now demonstrably ran.

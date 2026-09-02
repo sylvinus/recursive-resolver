@@ -57,6 +57,7 @@ from audit import resolve_audited  # noqa: E402
 from recursive_resolver import (  # noqa: E402
     DNSSECError,
     DNSSECInsecureError,
+    InvalidNameError,
     NoAnswerError,
     NXDOMAINError,
     RecursiveResolver,
@@ -185,10 +186,20 @@ def ascii_name(domain: str, rdtype: str) -> str:
     dnspython's default IDNA codec is IDNA 2003, ours is IDNA 2008, and for
     some internationalised names the two encode to *different domains*.
     Comparing verdicts means comparing them for the same name.
+
+    There is no public entry point for this: the resolver normalises on its way
+    into `resolve`, and the whole point here is the name it would actually put
+    on the wire. Only the failure it defines is caught, so a name this build
+    refuses is compared as written and said so, rather than every error being
+    swallowed into a silently different query.
     """
     try:
         return str(_NORMALISER._normalize_qname(domain, rdtype))
-    except Exception:  # noqa: BLE001 - an unencodable name is compared as given
+    except InvalidNameError as exc:
+        print(
+            f"  note {domain}/{rdtype}: not a name we can encode ({exc}); asking the references as written",
+            file=sys.stderr,
+        )
         return domain
 
 
@@ -265,19 +276,39 @@ def compare(ours: Outcome, references: dict[str, str]) -> str:
     return ""
 
 
+def positive_int(text: str) -> int:
+    """`--runs 0` leaves `outcomes` empty, and `outcomes[0]` then raises."""
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be 1 or more, got {value}")
+    return value
+
+
+def server_list(text: str) -> list[str]:
+    """An empty list means a ThreadPoolExecutor with no workers, which raises.
+
+    Use ``--no-references`` to skip the reference resolvers; an empty
+    ``--references`` is a typo, not a way to ask for that.
+    """
+    servers = [s.strip() for s in text.split(",") if s.strip()]
+    if not servers:
+        raise argparse.ArgumentTypeError("needs at least one server; use --no-references to skip them")
+    return servers
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--csv", required=True, help="Corpus CSV (domain,category[,tags])")
     parser.add_argument("-o", "--output", default="verdicts.csv", help="Output CSV path")
     parser.add_argument("--types", default=DEFAULT_TYPES, help=f"Record types (default {DEFAULT_TYPES})")
-    parser.add_argument("--runs", type=int, default=1, help="Resolutions per name before escalation")
+    parser.add_argument("--runs", type=positive_int, default=1, help="Resolutions per name before escalation")
     parser.add_argument("--escalate", type=int, default=8, help="Resolutions for anomalous names")
     parser.add_argument("--sample", type=int, default=0, help="Random sample of N names (0 = all)")
     parser.add_argument("--seed", type=int, default=20260830, help="Sampling seed")
     parser.add_argument("--workers", type=int, default=16, help="Concurrent names")
     parser.add_argument("--timeout", type=float, default=3.0, help="Per-query timeout")
     parser.add_argument("--no-references", action="store_true", help="Skip the reference resolvers")
-    parser.add_argument("--references", default=",".join(REFERENCES), help="Reference resolver IPs")
+    parser.add_argument("--references", type=server_list, default=",".join(REFERENCES), help="Reference resolver IPs")
     parser.add_argument("--config", default="default", help=f"Resolver options from: {','.join(CONFIGS)}")
     parser.add_argument("--append", action="store_true", help="Append to the output file instead of replacing it")
     args = parser.parse_args()
@@ -285,7 +316,7 @@ def main() -> int:
     if args.config not in CONFIGS:
         raise SystemExit(f"unknown config {args.config!r}; choose from {', '.join(CONFIGS)}")
     options = CONFIGS[args.config]
-    reference_servers = [s.strip() for s in args.references.split(",") if s.strip()]
+    reference_servers = args.references
 
     types = [t.strip().upper() for t in args.types.split(",") if t.strip()]
     with open(args.csv, newline="", encoding="utf-8") as handle:

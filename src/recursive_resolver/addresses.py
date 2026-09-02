@@ -13,15 +13,16 @@ is deliberately not a hand-maintained CIDR list: it stays correct as IANA
 allocates, and it covers CGNAT, the documentation prefixes, ``0.0.0.0/8``,
 ``240.0.0.0/4`` and benchmarking space.
 
-A short built-in list then adds the ranges that classification does not refuse,
-or did not always refuse. Two kinds: addresses that look public but serve
-instance metadata (Azure's ``168.63.129.16``), and the IPv6 transition prefixes
-that carry an IPv4 address inside them. Those last matter because a resolver
-running on a patched interpreter and one running on 3.10.14 do not agree about
-them: CVE-2024-4032 corrected ``is_private``/``is_global`` for exactly this
-family, so ``2002:a9fe:a9fe::1`` - link-local metadata wrapped in 6to4 - was
-globally routable to an older stdlib. Listing them makes the control the same
-on every supported version.
+A short built-in list then adds the ranges classification does not refuse, or
+did not always refuse. Two kinds: addresses that look public but serve instance
+metadata (Azure's ``168.63.129.16``), and the IPv6 transition prefixes that
+carry an IPv4 address inside them. CVE-2024-4032 corrected
+``is_private``/``is_global`` for several of those prefixes, so an interpreter
+older than 3.10.14 does not agree with a current one about, say,
+``2002:a9fe:a9fe::1`` - link-local metadata wrapped in 6to4. The rest of the
+family a current stdlib does refuse; they are listed anyway, as policy, because
+none of them is a nameserver location and the control should not read
+differently on different supported versions.
 
 The order of the checks below (specific categories before ``is_private``, since
 loopback and link-local are subsets of it in Python's model), the ``is_global``
@@ -53,8 +54,9 @@ _BUILTIN_BLOCKED_NETWORKS: tuple[str, ...] = (
     # Deprecated IPv6 site-local (RFC 3879); some networks still route it.
     "fec0::/10",
     # IPv6 transition prefixes: each embeds an IPv4 address, so reaching one
-    # reaches whatever that address is. Not a nameserver location either way,
-    # and stdlib classification of them varies by patch level.
+    # reaches whatever that address is. Not a nameserver location either way.
+    # Classification refuses these on a current stdlib; some of them only since
+    # CVE-2024-4032, so they are stated here rather than assumed.
     "2002::/16",  # 6to4 (RFC 3056)
     "2001::/32",  # Teredo (RFC 4380)
     "64:ff9b::/96",  # NAT64 well-known prefix (RFC 6052)

@@ -21,10 +21,14 @@ from conftest import make_response
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 from audit import Fetch, Ledger, audited  # noqa: E402
-from cassette import apply_fault, transition_allowed  # noqa: E402
+from cassette import apply_fault, outcome_of, transition_allowed  # noqa: E402
+from verdict_harness import SECURE, Outcome, compare  # noqa: E402
 
 from recursive_resolver import DNSSECValidationError, RecursiveResolver  # noqa: E402
-from recursive_resolver.exceptions import DNSSECMaterialUnavailableError  # noqa: E402
+from recursive_resolver.exceptions import (  # noqa: E402
+    DNSSECMaterialUnavailableError,
+    MaxDepthError,
+)
 
 
 def _fetch(*, material=True, got=True, offered=("9.9.9.9", "1.1.1.1"), asked=("9.9.9.9", "1.1.1.1")) -> Fetch:
@@ -60,6 +64,24 @@ class TestInvariants:
     def test_i4_an_answer_accepted_without_the_aa_bit(self) -> None:
         ledger = Ledger(classifications=[("example.test.", False, "answer")])
         assert any(v.startswith("I4") for v in ledger.violations(None))
+
+    def test_i4_is_silent_when_the_resolver_does_not_require_authority(self) -> None:
+        """`lax-aa` is one of the configurations the verdict harness sweeps.
+
+        Reporting a violation there flags the resolver for doing exactly what
+        it was told, and a gating harness that cries wolf gets ignored.
+        """
+        ledger = Ledger(classifications=[("example.test.", False, "answer")], require_authoritative=False)
+        assert ledger.violations(None) == []
+
+    def test_the_ledger_takes_the_policy_from_the_resolver(self) -> None:
+        lax = RecursiveResolver(dnssec=False, cache_enabled=False, require_authoritative=False)
+        with audited(lax) as ledger:
+            pass
+        assert ledger.require_authoritative is False
+        with audited(RecursiveResolver(dnssec=False, cache_enabled=False)) as ledger:
+            pass
+        assert ledger.require_authoritative is True
 
     def test_i5_material_reported_unavailable_when_every_fetch_answered(self) -> None:
         ledger = Ledger(fetches=[_fetch()])
@@ -104,6 +126,20 @@ class TestPerturbationRules:
         assert transition_allowed("ok/secure", "ok/secure", "")
         assert not transition_allowed("ok/insecure", "ok/secure", "")
 
+    def test_a_leaked_exception_is_never_an_allowed_outcome(self) -> None:
+        """README: every failure is a ResolverError, nothing from dnspython escapes.
+
+        `error/` is the escape hatch for resolver errors this harness has no
+        bucket for, and a fault may legitimately turn one into another. A
+        non-ResolverError is not in that category, and reproducing it under
+        every server order does not make it legitimate.
+        """
+        assert outcome_of(None, MaxDepthError("a.test.", "A", 30)) == "error/MaxDepthError"
+        assert outcome_of(None, TypeError("boom")) == "leaked/TypeError"
+        assert transition_allowed("error/MaxDepthError", "nodata", "timeout")
+        assert not transition_allowed("nodata", "leaked/TypeError", "timeout")
+        assert not transition_allowed("leaked/TypeError", "leaked/TypeError", "")
+
 
 class TestFaults:
     def test_each_fault_does_what_it_says(self) -> None:
@@ -121,3 +157,37 @@ class TestFaults:
         # FORMERR emulates a server that dislikes the OPT record, so a query
         # sent without EDNS must come back untouched.
         assert apply_fault(make_response(), "formerr", None).rcode() == dns.rcode.NOERROR
+
+
+class TestReferencePanel:
+    """A verdict needs a two-thirds majority of the panel, not one supporter.
+
+    Five public validators do not always agree, and the odd one running a stale
+    cache or a negative trust anchor must not be able to ratify our answer on
+    its own. These pin the quorum, because the rule is the whole reason the
+    differential can fail a release.
+    """
+
+    @staticmethod
+    def _panel(*verdicts: str) -> dict[str, str]:
+        return {f"ref{i}": v for i, v in enumerate(verdicts)}
+
+    def test_a_lone_secure_does_not_ratify_our_secure(self) -> None:
+        panel = self._panel(SECURE, "insecure", "insecure", "insecure", "insecure")
+        assert compare(Outcome(SECURE, ""), panel) == "we-say-secure-they-do-not"
+
+    def test_a_two_thirds_secure_majority_does(self) -> None:
+        panel = self._panel(SECURE, SECURE, SECURE, SECURE, "insecure")
+        assert compare(Outcome(SECURE, ""), panel) == ""
+
+    def test_an_evenly_split_panel_decides_nothing(self) -> None:
+        panel = self._panel(SECURE, SECURE, "insecure", "insecure")
+        assert compare(Outcome(SECURE, ""), panel) == "references-disagree"
+
+    def test_a_secure_majority_against_our_insecure_is_the_dangerous_direction(self) -> None:
+        panel = self._panel(SECURE, SECURE, SECURE, SECURE, "bogus")
+        assert compare(Outcome("insecure", ""), panel) == "we-say-insecure-they-say-secure"
+
+    def test_a_lone_secure_against_our_insecure_is_not(self) -> None:
+        panel = self._panel(SECURE, "insecure", "insecure", "insecure", "insecure")
+        assert compare(Outcome("insecure", ""), panel) == ""

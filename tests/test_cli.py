@@ -294,6 +294,23 @@ class TestDNSSECVerdictOnStderr:
         assert err.strip() == "; fully validated"
         assert out.strip() == "v=spf1 -all"
 
+    def test_a_failed_trace_reports_no_verdict_even_with_no_dnssec(self, capsys: pytest.CaptureFixture) -> None:
+        """No answer, no verdict. "disabled" would describe the wrong thing."""
+        step = TraceStep(server="1.2.3.4", qname="example.com.", rdtype="A", response_type="timeout")
+        with patch("recursive_resolver.cli.RecursiveResolver") as cls:
+            cls.return_value.trace_answer.return_value = (None, [step])
+            main(["--trace", "--json", "--no-dnssec", "example.com"])
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["dnssec"] is None
+        assert payload["error"] == "ResolutionIncomplete"
+
+    def test_a_completed_trace_still_says_disabled(self, capsys: pytest.CaptureFixture) -> None:
+        step = TraceStep(server="1.2.3.4", qname="example.com.", rdtype="A", response_type="answer")
+        with patch("recursive_resolver.cli.RecursiveResolver") as cls:
+            cls.return_value.trace_answer.return_value = (_answer(dnssec=ValidationState.INSECURE), [step])
+            main(["--trace", "--json", "--no-dnssec", "example.com"])
+        assert json.loads(capsys.readouterr().out)["dnssec"] == "disabled"
+
     def test_trace_mode_reports_before_the_records(self, capsys: pytest.CaptureFixture) -> None:
         answer = _answer()
         step = TraceStep(server="1.2.3.4", qname="example.com.", rdtype="A", response_type="answer")

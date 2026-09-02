@@ -54,17 +54,36 @@ CORPUS ?= corpus.csv
 ADVERSARIAL ?= adversarial.csv
 CASSETTES ?= cassettes.jsonl
 
-test-corpus: ## Build the adversarial corpus (network, ~10 min)
-	uv run python scripts/collect_domains_diverse.py -o $(CORPUS) --limit 30000
-	uv run python scripts/collect_domains_adversarial.py --csv $(CORPUS) -o $(ADVERSARIAL)
+# The later stages read the files the earlier ones write, so those files are the
+# dependencies - not the phony targets. A phony prerequisite would rebuild the
+# 30,000-name corpus on every verdict run; a file one reuses what is there and
+# collects only when it is missing. Delete the file to force a fresh collection.
+#
+# A collector killed halfway leaves a partial file, which Make would otherwise
+# treat as a finished one and every later stage would read as the corpus.
+.DELETE_ON_ERROR:
 
-test-verdicts: ## Verdict differential and flap detection (network, ~1h)
+$(CORPUS):
+	uv run python scripts/collect_domains_diverse.py -o $@ --limit 30000
+
+$(ADVERSARIAL): $(CORPUS)
+	uv run python scripts/collect_domains_adversarial.py --csv $< -o $@
+
+$(CASSETTES): $(ADVERSARIAL)
+	uv run python scripts/cassette.py record --csv $< -o $@ --types A,MX
+
+test-corpus: $(ADVERSARIAL) ## Build the adversarial corpus (network, ~10 min)
+
+test-verdicts: $(ADVERSARIAL) ## Verdict differential and flap detection (network, ~1h)
 	uv run python scripts/verdict_harness.py --csv $(ADVERSARIAL) -o verdicts.csv --escalate 8
 
-test-record: ## Record cassettes for offline replay (network)
-	uv run python scripts/cassette.py record --csv $(ADVERSARIAL) -o $(CASSETTES) --types A,MX
+test-record: $(CASSETTES) ## Record cassettes for offline replay (network)
 
+# The only target here that must never reach the network, so it asks for the
+# cassettes rather than depending on them: a missing file is an instruction to
+# the operator, not a licence to spend ten minutes recording one.
 test-offline: ## Replay cassettes under every order and fault, then mutate (no network)
+	@test -f $(CASSETTES) || { echo "$(CASSETTES) not found; run 'make test-record' first (needs network)" >&2; exit 1; }
 	uv run python scripts/cassette.py replay --cassettes $(CASSETTES)
 	uv run python scripts/cassette.py perturb --cassettes $(CASSETTES)
 	uv run python scripts/mutation_check.py --cassettes $(CASSETTES)

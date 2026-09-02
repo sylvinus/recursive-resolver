@@ -86,7 +86,10 @@ from recursive_resolver.resolver import _RetryableError  # noqa: E402
 
 TIMEOUT = "timeout"
 MESH_LIMIT = 6  # addresses probed per (qname, type); keeps root fan-out bounded
-CLOSURE_ROUNDS = 3  # passes of "replay, then record what the replay could not answer"
+CLOSURE_ROUNDS = 6  # passes of "replay, then record what the replay could not answer"
+# Each pass reaches one level further, so a CNAME redirected into a zone the
+# original resolution never entered needs several: root, TLD, that zone's
+# nameservers, then the name itself.
 
 AVAILABILITY_FAULTS = ("timeout", "servfail", "formerr", "empty-answer", "no-aa")
 SIGNATURE_FAULTS = ("strip-rrsig", "strip-dnssec")
@@ -114,7 +117,15 @@ def outcome_of(answer, exc) -> str:
         return "nodata"
     if isinstance(exc, DNSSECError):
         return "bogus"
-    return f"error/{type(exc).__name__}"
+    if isinstance(exc, ResolverError):
+        # A real resolver error this function has no separate bucket for -
+        # MaxDepthError, CNAMELoopError and the like. Legitimate, and a fault
+        # can legitimately turn one into another.
+        return f"error/{type(exc).__name__}"
+    # Not a ResolverError at all. README: "Every failure is a `ResolverError`.
+    # Nothing from dnspython escapes." This is the layer with 19,000 adversarial
+    # replays in it, so it is the place that promise gets tested.
+    return f"leaked/{type(exc).__name__}"
 
 
 def key_of(qname, rdtype, server: str) -> str:
@@ -183,6 +194,14 @@ def record_case(domain: str, rdtype: str, timeout: float) -> dict | None:
             break
         for key in gaps:
             fetch_into(entries, key, timeout)
+
+    # A cassette that cannot reproduce its own baseline tests nothing: `replay`
+    # fails on it forever, and `perturb` would measure every scenario against
+    # an outcome the recording never had. Drop it here rather than write a
+    # cassette every later layer has to special-case.
+    replayed, _violations = replay(case)
+    if replayed != baseline:
+        return None
     return case
 
 
@@ -291,6 +310,10 @@ def apply_fault(response: dns.message.Message, kind: str, payload: int | None) -
 
 def transition_allowed(baseline: str, observed: str, fault_kind: str) -> bool:
     """Is this a legitimate consequence of the injected fault?"""
+    # Never, whatever else is true. An exception that is not a ResolverError is
+    # a broken promise, not an outcome, and reproducing it does not make it one.
+    if baseline.startswith("leaked/") or observed.startswith("leaked/"):
+        return False
     if observed == baseline:
         return True
     if observed == "unavailable":
@@ -348,15 +371,21 @@ def main() -> int:
                 done += 1
                 if done % 50 == 0:
                     print(f"  recorded {done}/{len(items)} in {time.time() - started:.0f}s", file=sys.stderr)
-            return case
+            return item, case
 
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            cases = [c for c in pool.map(work, items) if c]
+            attempted = list(pool.map(work, items))
+        cases = [case for _item, case in attempted if case]
+        dropped = [item for item, case in attempted if not case]
         with open(args.output, "w", encoding="utf-8") as handle:
             for case in cases:
                 handle.write(json.dumps(case) + "\n")
         sizes = sum(len(c["entries"]) for c in cases)
         print(f"\n{len(cases)} cassettes, {sizes} recorded responses, {time.time() - started:.0f}s", file=sys.stderr)
+        if dropped:
+            print(f"  {len(dropped)} not recorded (no stable offline reproduction):", file=sys.stderr)
+            for domain, rdtype in dropped[:20]:
+                print(f"    {domain}/{rdtype}", file=sys.stderr)
         return 0
 
     cases = [json.loads(line) for line in Path(args.cassettes).read_text(encoding="utf-8").splitlines() if line]
@@ -392,13 +421,19 @@ def main() -> int:
             for fault in FAULTS:
                 yield ("fault", server, fault)
 
-    def run_case(case: dict) -> tuple[int, list[str]]:
+    def run_case(case: dict) -> tuple[int, list[str], str]:
         local: list[str] = []
         ran = 0
-        # A cassette that does not reproduce cannot judge a perturbation.
+        # A cassette that does not reproduce cannot judge a perturbation: every
+        # scenario would be measured against an outcome the recording never
+        # had. Set the whole cassette aside rather than compare to the wrong
+        # baseline. `replay` is the layer that gates reproduction, and reports
+        # these by name; here they are counted so the coverage is visible.
         base, base_violations = replay(case)
         if base_violations:
             local.append(f"{case['domain']}/{case['rdtype']} baseline: {base_violations}")
+        if base != case["baseline"]:
+            return ran, local, f"{case['domain']}/{case['rdtype']}: recorded {case['baseline']}, replayed {base}"
         for kind, server, fault in scenarios(case):
             ran += 1
             if kind == "order":
@@ -415,17 +450,21 @@ def main() -> int:
                 local.append(f"{case['domain']}/{case['rdtype']} [{label}] {base} -> {observed}")
             for violation in violations:
                 local.append(f"{case['domain']}/{case['rdtype']} [{label}] {violation}")
-        return ran, local
+        return ran, local, ""
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         results = list(pool.map(run_case, cases))
     total = sum(r[0] for r in results)
-    for _ran, local in results:
+    skipped = [r[2] for r in results if r[2]]
+    for _ran, local, _skip in results:
         failures.extend(local)
 
     print(f"\n{len(cases)} cassettes, {total} perturbed replays in {time.time() - started:.0f}s", file=sys.stderr)
     for outcome, count in counts.most_common():
         print(f"  {outcome:22s} {count:7d}", file=sys.stderr)
+    print(f"  not reproduced, so not perturbed: {len(skipped)}", file=sys.stderr)
+    for skip in skipped[:20]:
+        print(f"    {skip}", file=sys.stderr)
     print(f"  failures: {len(failures)}", file=sys.stderr)
     for failure in failures[:60]:
         print(f"    {failure}", file=sys.stderr)

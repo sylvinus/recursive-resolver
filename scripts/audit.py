@@ -21,7 +21,9 @@ I2  Every query sent while validating carries EDNS0, so it can carry the DO
 I3  No zone is judged on one server's word. A fetch of validation material
     that failed must have asked every usable address in the NS set.
 I4  Nothing is accepted from a response the resolver itself classified as
-    unusable (non-authoritative answer, wrong class, out of bailiwick).
+    unusable (non-authoritative answer, wrong class, out of bailiwick). Held
+    to the resolver's own policy: with ``require_authoritative=False`` a
+    non-authoritative answer is a configured choice, not a violation.
 I5  ``DNSSECMaterialUnavailableError`` is only raised when a fetch really did
     return nothing: it must not become a way to hide a validation failure.
 """
@@ -66,6 +68,10 @@ class Ledger:
     fetches: list[Fetch] = field(default_factory=list)
     queries: list[tuple[str, str, str, int | None, bool]] = field(default_factory=list)
     classifications: list[tuple[str, bool, str]] = field(default_factory=list)
+    # I4 measures the resolver against its own rule, so it has to know what
+    # that rule is. `require_authoritative=False` is one of the configurations
+    # the verdict harness sweeps, and there every non-AA answer is deliberate.
+    require_authoritative: bool = True
 
     def failed_material_fetches(self) -> list[Fetch]:
         return [f for f in self.fetches if f.material and not f.got_response]
@@ -95,9 +101,10 @@ class Ledger:
                 )
 
         # I4
-        for qname, authoritative, kind in self.classifications:
-            if kind in ("answer", "nxdomain", "nodata") and not authoritative:
-                out.append(f"I4: accepted a {kind} for {qname} without the AA bit")
+        if self.require_authoritative:
+            for qname, authoritative, kind in self.classifications:
+                if kind in ("answer", "nxdomain", "nodata") and not authoritative:
+                    out.append(f"I4: accepted a {kind} for {qname} without the AA bit")
 
         # I5
         if isinstance(outcome, DNSSECMaterialUnavailableError) and not failed:
@@ -109,7 +116,7 @@ class Ledger:
 @contextmanager
 def audited(resolver: RecursiveResolver):
     """Record one resolver's activity. Yields the :class:`Ledger`."""
-    ledger = Ledger()
+    ledger = Ledger(require_authoritative=resolver.require_authoritative)
     real_send = resolver._send_query
     real_query = resolver._query_once
     real_classify = resolver._classify_response

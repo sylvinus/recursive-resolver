@@ -688,31 +688,54 @@ MUTATIONS: list[tuple[str, str, list[tuple[str, str]]]] = [
 
 
 def apply_mutation(target: Path, edits: list[tuple[str, str]]) -> None:
+    """Apply every edit exactly once, across both files.
+
+    Every edit has to land. Applying some and reporting success would run the
+    suites against a half-mutated build, which proves nothing about the defect
+    the entry names: an edit that no longer matches is a stale catalogue entry
+    and has to be said out loud.
+    """
+    for old, _new in edits:
+        # An empty search string matches anything, so the rewrite would land at
+        # offset 0 and break the file: caught by every layer, and a test of
+        # nothing.
+        if not old:
+            raise SystemExit("mutation has an empty search string")
+
+    pending = list(edits)
     for name in ("resolver.py", "dnssec.py"):
         path = target / "recursive_resolver" / name
         text = path.read_text(encoding="utf-8")
-        changed = False
-        for old, new in edits:
-            # An empty search string matches anything, so the rewrite would
-            # land at offset 0 and break the file: caught by every layer, and
-            # a test of nothing.
-            if not old:
-                raise SystemExit("mutation has an empty search string")
+        applied = []
+        for old, new in pending:
             if old in text:
                 text = text.replace(old, new, 1)
-                changed = True
-        if changed:
+                applied.append((old, new))
+        if applied:
             path.write_text(text, encoding="utf-8")
-            return
-    raise SystemExit(f"mutation no longer applies: {edits[0][0][:60]!r}")
+            pending = [edit for edit in pending if edit not in applied]
+
+    if pending:
+        raise SystemExit(f"mutation no longer applies: {pending[0][0][:60]!r}")
 
 
-def run(cmd: list[str], env_src: Path, cwd: Path) -> bool:
+# pytest exits 0 when everything passed and 1 when a test failed. Anything else
+# is the harness itself going wrong - a collection error, a usage mistake, an
+# interpreter that will not start - and reading it as "the mutant was caught"
+# turns a broken run into a clean report.
+PYTEST_EXIT_CODES = frozenset({0, 1})
+
+
+def run(cmd: list[str], env_src: Path, cwd: Path, expected: frozenset[int] | None = None) -> bool:
     """True when the command passes (i.e. the mutant survived this layer)."""
     import os
 
     env = dict(os.environ, RR_SRC=str(env_src), PYTHONPATH=str(env_src))
     result = subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=str(cwd))
+    if expected is not None and result.returncode not in expected:
+        raise SystemExit(
+            f"{cmd[0]} exited {result.returncode}, which is neither pass nor fail:\n{result.stdout[-2000:]}"
+        )
     return result.returncode == 0
 
 
@@ -726,6 +749,18 @@ def main() -> int:
     mutations = [m for m in MUTATIONS if not args.only or m[0] == args.only]
     if not mutations:
         raise SystemExit(f"no mutation named {args.only!r}")
+
+    # An unreadable cassette file makes every perturb run fail, which reads as
+    # "every mutant caught by the cassettes" - the most flattering possible
+    # result, produced by the harness being broken.
+    if args.cassettes:
+        cassettes = Path(args.cassettes)
+        if not cassettes.is_file():
+            raise SystemExit(f"cassette file not found: {args.cassettes}")
+        try:
+            cassettes.open("rb").close()
+        except OSError as exc:
+            raise SystemExit(f"cannot read {args.cassettes}: {exc}") from None
 
     survivors: list[str] = []
     print(f"{'mutation':<44}{'unit suite':<14}{'cassettes':<14}caught by")
@@ -758,6 +793,7 @@ def main() -> int:
                 ],
                 target,
                 target,
+                expected=PYTEST_EXIT_CODES,
             )
             cassette_ok = True
             if args.cassettes:

@@ -216,6 +216,10 @@ class DNSSECValidator:
             so it is rejected rather than silently treated as "use the
             defaults".
         max_nsec3_iterations: Reject NSEC3 records above this iteration count.
+        clock_skew: Seconds of slack allowed on an RRSIG's inception, for
+            signers whose clock runs ahead of ours (60 by default). Applies to
+            inception only: expiration is checked against the real time, so
+            slack can never keep an expired signature alive.
 
     Raises:
         ValueError: If ``trust_anchors`` is empty.
@@ -706,10 +710,10 @@ class DNSSECValidator:
         Returns:
             SECURE when the name error is proven, BOGUS when nothing proves it,
             and INSECURE when either cover an RFC 5155 §8.4 proof needs - the
-            next closer name's or the wildcard's - is **opt-out** only. Opt-out asserts that a range contains no signed
-            delegations, not that it contains no names (RFC 5155 §6), so a name
-            inside it may exist as an unsigned delegation and the name error is
-            not proven. This is not a hypothetical: in an opt-out TLD every
+            next closer name's or the wildcard's - is **opt-out** only. Opt-out
+            asserts that a range contains no signed delegations, not that it
+            contains no names (RFC 5155 §6), so a name inside it may exist as an
+            unsigned delegation and the name error is not proven. This is not a hypothetical: in an opt-out TLD every
             unsigned domain sits in such a range, and the records needed are
             public and correctly signed, so treating the result as authenticated
             would let anyone forge an authenticated "does not exist" for them.

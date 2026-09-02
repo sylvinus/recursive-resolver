@@ -1559,18 +1559,6 @@ class TestWildcardProofNSEC3:
         assert v.prove_wildcard(self.QNAME, 3, [], {}) is ValidationState.BOGUS
 
 
-def _predecessor(digest: str) -> str:
-    """The immediately preceding base32hex hash of the same length."""
-    chars = list(digest)
-    for i in range(len(chars) - 1, -1, -1):
-        idx = B32HEX.index(chars[i])
-        if idx > 0:
-            chars[i] = B32HEX[idx - 1]
-            return "".join(chars)
-        chars[i] = B32HEX[-1]
-    return "".join(chars)
-
-
 class TestNSEC3NXDOMAINProof:
     """RFC 5155 §8.4 needs three things, and dropping any one must fail.
 
