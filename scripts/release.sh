@@ -11,10 +11,11 @@
 #   Gouvernement Français
 #   Licensed under the MIT License.
 #
-# Hermetic: building, checking and uploading all happen inside the
-# python:3.13-slim image, so the host never needs pip, build or twine. A clean
-# machine needs only Docker and git; the gh CLI is only needed to run the
-# command the last step prints.
+# Hermetic: building and uploading happen inside the python:3.13-slim image,
+# so the host never needs pip, build or twine. A clean machine needs only
+# Docker and git; the gh CLI is only needed to run the command the last step
+# prints. Step 2 is the exception - the Makefile runs the checks through uv on
+# the host - so the script installs uv if it is missing, after asking.
 #
 # Flow:
 #   1. Pre-flight: clean tree, version consistency, changelog entry, no tag yet
@@ -31,6 +32,8 @@
 #
 #   SKIP_GATES=1   skip step 2 on a retry
 #   SKIP_TESTPYPI=1 go straight to PyPI (not recommended for a first release)
+#   UV_VERSION=x.y.z pin the uv the bootstrap installs, instead of latest
+#   UV_INSTALL_DIR=… where to put it (default ~/.local/bin)
 
 set -euo pipefail
 
@@ -64,6 +67,37 @@ read_token() {
     [[ -n "${token}" ]] || die "empty token"
     [[ "${token}" == pypi-* ]] || warn "token does not start with 'pypi-': continuing anyway"
     printf -v "${varname}" '%s' "${token}"
+}
+
+ensure_uv() {
+    # Every check in the Makefile runs through `uv run`, so step 2 needs uv on
+    # the host even though the build does not. A release VM is rebuilt from
+    # scratch each time and has none, and the failure is a bare
+    # "make: uv: No such file or directory" five lines into the run. Install it
+    # instead, and only here: with SKIP_GATES=1 this is never reached and the
+    # script still needs nothing but Docker and git.
+    command -v uv >/dev/null && return
+
+    local url="https://astral.sh/uv/install.sh"
+    [[ -n "${UV_VERSION:-}" ]] && url="https://astral.sh/uv/${UV_VERSION}/install.sh"
+    warn "uv not found in PATH; installing from ${url}"
+    confirm "Download and run that installer?"
+
+    # The installer writes to UV_INSTALL_DIR, else XDG_BIN_HOME, else
+    # ~/.local/bin, and tells the user to restart their shell - which does
+    # nothing for a script, so put it on PATH here.
+    export UV_INSTALL_DIR="${UV_INSTALL_DIR:-${HOME}/.local/bin}"
+    if command -v curl >/dev/null; then
+        curl -LsSf "${url}" | sh
+    elif command -v wget >/dev/null; then
+        wget -qO- "${url}" | sh
+    else
+        die "neither curl nor wget available to install uv"
+    fi
+    export PATH="${UV_INSTALL_DIR}:${PATH}"
+
+    command -v uv >/dev/null || die "uv installed to ${UV_INSTALL_DIR} but still not on PATH"
+    ok "uv $(uv --version 2>/dev/null | awk '{print $2}') ready"
 }
 
 in_container() {
@@ -131,6 +165,7 @@ confirm "Proceed?"
 if [[ "${SKIP_GATES:-0}" == "1" ]]; then
     warn "skipping lint/typecheck/tests (SKIP_GATES=1)"
 else
+    ensure_uv
     say "→ make check-all (lint, format, types, full suite, 100% coverage gate)"
     make -C "${REPO_DIR}" check-all
     ok "Checks passed"
