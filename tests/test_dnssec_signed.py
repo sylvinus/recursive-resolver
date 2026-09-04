@@ -1290,6 +1290,127 @@ class TestParentServedInsecureChild:
             resolver.resolve("example.sub.test.", "A")
 
 
+class TestAStaleUnsignedServerDoesNotCondemnTheZone:
+    """RFC 4035 §5.5: try another server before concluding an answer is Bogus.
+
+    The same rule `_verify_denial` applies to a proof that does not validate,
+    one level up. Found on `nic.bj`, whose four nameservers include one
+    serving a stale *unsigned* copy of the zone: it answers authoritatively
+    with no RRSIG for any type, and NODATA for DNSKEY. Landing on it made
+    every type in the zone read as forged and the DNSKEY NODATA unprovable,
+    while every other validating resolver simply asked a sibling.
+
+    Driven at `_query_once` so the real sweep across the NS set runs, and the
+    stale server is the one the sweep has to get past rather than one the test
+    arranged to be skipped.
+    """
+
+    STALE = "9.9.9.10"
+    GOOD = "9.9.9.11"
+
+    def _world(self, stale_response, good_response):
+        root = SignedZone.create(".")
+        child = SignedZone.create("test.")
+        ds = root.ds_rrset(child)
+
+        referral = make_response(
+            authority=[("test.", 3600, "NS", ["ns1.test.", "ns2.test."])],
+            additional=[("ns1.test.", 3600, "A", [self.STALE]), ("ns2.test.", 3600, "A", [self.GOOD])],
+            aa=False,
+        )
+        referral.authority.append(ds)
+        referral.authority.append(root.sign(ds))
+
+        def dnskey_response(zone: SignedZone):
+            response = make_response()
+            response.answer.append(zone.dnskey_rrset)
+            response.answer.append(zone.signed_dnskey())
+            return response
+
+        def query_once(qname, rdtype, server, payload, timeout, ctx):
+            if server not in (self.STALE, self.GOOD):
+                if rdtype == dns.rdatatype.DNSKEY and qname == dns.name.root:
+                    return dnskey_response(root)
+                return referral
+            if server == self.STALE:
+                return stale_response
+            if rdtype == dns.rdatatype.DNSKEY and qname == child.name:
+                return dnskey_response(child)
+            return good_response(child)
+
+        resolver = RecursiveResolver(max_resolution_time=5, trust_anchors=(root.anchor_text(),), cache_enabled=False)
+        return resolver, query_once
+
+    @staticmethod
+    def _unsigned_answer() -> dns.message.Message:
+        response = make_response()
+        response.answer.append(rrset_of("test.", "A", "198.51.100.9"))
+        return response
+
+    @staticmethod
+    def _signed_answer(child: SignedZone) -> dns.message.Message:
+        answer = rrset_of("test.", "A", "192.0.2.10")
+        response = make_response()
+        response.answer.append(answer)
+        response.answer.append(child.sign(answer))
+        return response
+
+    def test_an_unsigned_answer_from_one_server_is_retried_elsewhere(self) -> None:
+        # The sweep shuffles the NS set, so this runs both orders.
+        for _ in range(8):
+            resolver, query_once = self._world(self._unsigned_answer(), self._signed_answer)
+            with patch.object(resolver, "_query_once", side_effect=query_once):
+                result = resolver.resolve_answer("test.", "A")
+            assert result.records == ["192.0.2.10"], "took the stale server's unsigned answer"
+            assert result.dnssec is ValidationState.SECURE
+
+    def test_an_unsigned_nodata_from_one_server_is_retried_elsewhere(self) -> None:
+        """The `nic.bj/DNSKEY` case: a NODATA the stale copy cannot prove.
+
+        Sweeping only on a failed *proof* does not reach this: the sibling
+        holds real DNSKEY records, so it never sends a denial for the
+        denial-sweep predicate to accept, and the zone came out "unproven
+        nodata in a signed zone" with the records sitting on the next server.
+        """
+        stale = make_response(authority=[("test.", 300, "SOA", ["ns1.test. hm.test. 1 3600 900 604800 300"])])
+        for _ in range(8):
+            resolver, query_once = self._world(stale, self._signed_answer)
+            with patch.object(resolver, "_query_once", side_effect=query_once):
+                result = resolver.resolve_answer("test.", "DNSKEY")
+            assert result.dnssec is ValidationState.SECURE
+            assert result.records, "no DNSKEY came back"
+
+    def test_a_zone_every_server_serves_unsigned_is_still_bogus(self) -> None:
+        """Sweeping must not turn a zone with no signatures anywhere into a pass."""
+        resolver, query_once = self._world(self._unsigned_answer(), lambda _child: self._unsigned_answer())
+        with (
+            patch.object(resolver, "_query_once", side_effect=query_once),
+            pytest.raises(DNSSECValidationError, match="no RRSIG"),
+        ):
+            resolver.resolve("test.", "A")
+
+    def test_a_referral_is_not_swept_past_for_want_of_a_signature(self) -> None:
+        """The delegation NS RRset is unsigned by design (RFC 4035 §2.2).
+
+        Treating an unsigned referral as a stale copy would sweep the whole
+        parent NS set on every delegation in a signed zone and then fail.
+        """
+        resolver, _ = self._world(self._unsigned_answer(), self._signed_answer)
+        ctx = resolver._new_context()
+        bare = make_response(authority=[("sub.test.", 3600, "NS", ["ns1.sub.test."])], aa=False)
+        assert resolver._serves_an_unsigned_copy(bare, "referral", ValidationState.SECURE, ctx) is False, (
+            "a referral was mistaken for a stale unsigned copy"
+        )
+
+    def test_an_insecure_chain_is_left_alone(self) -> None:
+        """Nothing to sweep for when the chain never claimed the zone was signed."""
+        resolver, _ = self._world(self._unsigned_answer(), self._signed_answer)
+        ctx = resolver._new_context()
+        assert (
+            resolver._serves_an_unsigned_copy(self._unsigned_answer(), "answer", ValidationState.INSECURE, ctx) is False
+        )
+
+
 class TestClockSkewOnInception:
     """A signer whose clock runs ahead of ours must not produce BOGUS.
 

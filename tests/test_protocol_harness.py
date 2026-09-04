@@ -9,8 +9,12 @@ cause - and keep the modules importable.
 
 from __future__ import annotations
 
+import ast
+import inspect
 import sys
+import textwrap
 from pathlib import Path
+from unittest.mock import patch
 
 import dns.flags
 import dns.name
@@ -22,9 +26,28 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 from audit import Fetch, Ledger, audited  # noqa: E402
 from cassette import apply_fault, outcome_of, transition_allowed  # noqa: E402
-from verdict_harness import SECURE, Outcome, compare  # noqa: E402
+from verdict_harness import (  # noqa: E402
+    BOGUS,
+    FAILED,
+    INFORMATIONAL_DISAGREEMENTS,
+    INSECURE,
+    LEAKED,
+    NODATA,
+    NXDOMAIN,
+    SECURE,
+    Outcome,
+    compare,
+    data_is_unstable,
+    gates_release,
+    leaked,
+    our_outcome,
+)
 
-from recursive_resolver import DNSSECValidationError, RecursiveResolver  # noqa: E402
+from recursive_resolver import (  # noqa: E402
+    DNSSECValidationError,
+    RecursiveResolver,
+    ServfailError,
+)
 from recursive_resolver.exceptions import (  # noqa: E402
     DNSSECMaterialUnavailableError,
     MaxDepthError,
@@ -191,3 +214,138 @@ class TestReferencePanel:
     def test_a_lone_secure_against_our_insecure_is_not(self) -> None:
         panel = self._panel(SECURE, "insecure", "insecure", "insecure", "insecure")
         assert compare(Outcome("insecure", ""), panel) == ""
+
+    def test_a_bogus_majority_against_our_insecure_is_a_disagreement(self) -> None:
+        """We return the data; four of five refuse it. Whatever they caught, we did not."""
+        panel = self._panel("bogus", "bogus", "bogus", "servfail", "insecure")
+        assert compare(Outcome("insecure", ""), panel) == "we-say-insecure-they-say-bogus"
+
+    def test_a_lone_bogus_against_our_insecure_is_not(self) -> None:
+        """One operator's SERVFAIL is an operator, not a finding."""
+        panel = self._panel("bogus", "insecure", "insecure", "insecure", "insecure")
+        assert compare(Outcome("insecure", ""), panel) == ""
+
+
+class TestEveryDisagreementIsClassified:
+    """A label `compare` can return must be a deliberate gate-or-not decision.
+
+    The labels used to be enumerated in the *gating* set, so one added to
+    `compare` and forgotten there was filed under "the internet, not us" and
+    let a release through. This reads the labels out of the source, so adding
+    one without deciding what it means fails here rather than in six months.
+    """
+
+    @staticmethod
+    def _labels() -> set[str]:
+        source = inspect.getsource(compare)
+        tree = ast.parse(textwrap.dedent(source))
+        return {
+            node.value.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Return)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+            and node.value.value
+        } | {
+            branch.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Return) and isinstance(node.value, ast.IfExp)
+            for branch in (node.value.body, node.value.orelse)
+            if isinstance(branch, ast.Constant) and isinstance(branch.value, str) and branch.value
+        }
+
+    def test_the_labels_are_the_ones_we_think(self) -> None:
+        assert self._labels() == {
+            "references-disagree",
+            "we-say-secure-they-do-not",
+            "we-say-insecure-they-say-secure",
+            "we-say-insecure-they-say-bogus",
+            "false-bogus",
+            "we-answered-they-refused",
+            "material-unavailable-but-they-resolved",
+            "we-failed-they-resolved",
+        }
+
+    def test_the_leak_label_is_classified_too(self) -> None:
+        """It never comes out of `compare`, so the source scan cannot see it."""
+        assert gates_release("we-leaked-a-non-resolver-error")
+        assert "we-leaked-a-non-resolver-error" not in INFORMATIONAL_DISAGREEMENTS
+
+    def test_the_ones_that_are_about_us_gate_the_release(self) -> None:
+        about_us = self._labels() - INFORMATIONAL_DISAGREEMENTS
+        assert about_us, "compare returns nothing that would fail a release"
+        for label in about_us:
+            assert gates_release(label), f"{label} is reported but does not gate"
+
+    def test_no_disagreement_is_not_a_gate(self) -> None:
+        assert not gates_release("")
+
+
+class TestOnlyRealDataExcusesAFlap:
+    """A flap is excused when the zone handed back two different datasets.
+
+    An outcome that leaves as an exception carries no records, and that is the
+    absence of evidence about the zone's contents, not evidence that they
+    changed. Treating it as a second dataset excused the one flap that matters
+    most: `nic.bj` alternating between SECURE and BOGUS on four record types
+    was reported across 120,000 lookups as zero verdict flaps.
+    """
+
+    def test_secure_alternating_with_bogus_is_a_flap(self) -> None:
+        outcomes = [
+            Outcome(SECURE, "", ("81.91.239.11",), ()),
+            Outcome(BOGUS, "zone is signed but the answer carries no RRSIG"),
+            Outcome(SECURE, "", ("81.91.239.11",), ()),
+        ]
+        assert data_is_unstable(outcomes) is False
+
+    def test_two_different_answers_are_the_zone_being_unstable(self) -> None:
+        outcomes = [
+            Outcome(SECURE, "", ("192.0.2.1",), ()),
+            Outcome(INSECURE, "", ("198.51.100.1",), ()),
+        ]
+        assert data_is_unstable(outcomes) is True
+
+    def test_the_same_records_down_two_different_cname_chains_are_unstable(self) -> None:
+        """The case the rule was written for: a traffic manager landing either side."""
+        outcomes = [
+            Outcome(SECURE, "", ("192.0.2.1",), ("a.example.test.",)),
+            Outcome(INSECURE, "", ("192.0.2.1",), ("b.example.test.",)),
+        ]
+        assert data_is_unstable(outcomes) is True
+
+    def test_a_retrieval_failure_alongside_one_answer_excuses_nothing(self) -> None:
+        outcomes = [Outcome(SECURE, "", ("192.0.2.1",), ()), Outcome(FAILED, "timeout")]
+        assert data_is_unstable(outcomes) is False
+
+    def test_two_denials_are_not_two_datasets(self) -> None:
+        assert data_is_unstable([Outcome(NXDOMAIN, "gone"), Outcome(NODATA, "none")]) is False
+
+
+class TestALeakedExceptionFailsTheRun:
+    """README: every failure is a ResolverError, nothing from dnspython escapes.
+
+    The cassette layer refuses to call one an outcome. This layer sees far more
+    of the real internet, and used to file a leak under `failed` - which reads
+    as one more unreachable zone and never gates.
+    """
+
+    def test_a_resolver_error_is_a_failure_not_a_leak(self) -> None:
+        resolver = RecursiveResolver(dnssec=False, cache_enabled=False)
+        with patch.object(resolver, "resolve_answer", side_effect=ServfailError("a.test.", "A")):
+            outcome, _violations = our_outcome(resolver, "a.test.", "A")
+        assert outcome.kind == "failed"
+        assert not leaked([outcome])
+
+    def test_anything_else_is_a_leak(self) -> None:
+        resolver = RecursiveResolver(dnssec=False, cache_enabled=False)
+        with patch.object(resolver, "resolve_answer", side_effect=TypeError("boom")):
+            outcome, _violations = our_outcome(resolver, "a.test.", "A")
+        assert outcome.kind == LEAKED
+        assert leaked([outcome])
+
+    def test_a_leak_gates_even_when_the_panel_agrees_with_it(self) -> None:
+        """No reference verdict excuses it, so it does not go through `compare`."""
+        panel = {"ref0": "servfail", "ref1": "servfail", "ref2": "servfail"}
+        assert compare(Outcome(LEAKED, ""), panel) == ""
+        assert gates_release("we-leaked-a-non-resolver-error")

@@ -61,6 +61,7 @@ from recursive_resolver import (  # noqa: E402
     NoAnswerError,
     NXDOMAINError,
     RecursiveResolver,
+    ResolverError,
     ValidationState,
 )
 from recursive_resolver.exceptions import DNSSECMaterialUnavailableError  # noqa: E402
@@ -97,6 +98,10 @@ NXDOMAIN = "nxdomain"
 NODATA = "nodata"
 UNAVAILABLE = "unavailable"
 FAILED = "failed"
+# Not an outcome. README: "Every failure is a `ResolverError`. Nothing from
+# dnspython escapes." Anything else that reaches the caller is a broken promise,
+# and filing it under FAILED would let it pass as one more unreachable zone.
+LEAKED = "leaked"
 
 # Outcomes that say "we could not get there", not "here is what the data means".
 # A name that alternates between a verdict and one of these is reporting the
@@ -104,16 +109,25 @@ FAILED = "failed"
 # is reporting a defect in here.
 RETRIEVAL_KINDS = frozenset({UNAVAILABLE, FAILED})
 
-# Disagreements that mean we read the same data differently, as opposed to not
-# having got the data at all. Only these gate a release.
-VERDICT_DISAGREEMENTS = frozenset(
+# Disagreements that mean we could not get the data, or that the panel could
+# not agree with itself. Everything else `compare` can return is a statement
+# about how *we* read data we did have, and gates the release.
+#
+# Listed this way round on purpose. The set used to name the gating labels, so
+# a label added to `compare` and not added here was silently filed under "the
+# internet, not us" and let a release through. Defaulting to gating means the
+# mistake is a spurious failure rather than a missed one.
+INFORMATIONAL_DISAGREEMENTS = frozenset(
     {
-        "we-say-secure-they-do-not",
-        "we-say-insecure-they-say-secure",
-        "false-bogus",
-        "we-answered-they-refused",
+        "references-disagree",
+        "material-unavailable-but-they-resolved",
+        "we-failed-they-resolved",
     }
 )
+
+
+def gates_release(disagreement: str) -> bool:
+    return bool(disagreement) and disagreement not in INFORMATIONAL_DISAGREEMENTS
 
 
 @dataclass
@@ -135,6 +149,31 @@ class Outcome:
         verdict that follows the data is not a flap.
         """
         return (self.kind, self.records, self.chain)
+
+    def carried_data(self) -> bool:
+        """Did this outcome actually come with data to compare?
+
+        Everything that leaves as an exception - BOGUS, NODATA, NXDOMAIN, a
+        retrieval failure - has an empty record set, which is the absence of
+        evidence about the zone's contents and not evidence that they changed.
+        """
+        return bool(self.records or self.chain)
+
+
+def data_is_unstable(outcomes: list[Outcome]) -> bool:
+    """Did the zone hand back two different datasets across these runs?
+
+    Different answers between runs mean the zone itself is unstable, so a
+    verdict that changes with them is following the data, not wobbling.
+
+    Only outcomes that came with data can establish that. Counting the empty
+    record set of a BOGUS as a second dataset excused precisely the flap this
+    harness exists to catch: every secure-to-bogus alternation looked like an
+    unstable zone, and `nic.bj` flipping between SECURE and BOGUS on four
+    record types was reported as 0 verdict flaps.
+    """
+    carried = [o for o in outcomes if o.carried_data()]
+    return len({o.fingerprint()[1:] for o in carried}) > 1
 
 
 @dataclass
@@ -177,6 +216,8 @@ def our_outcome(resolver: RecursiveResolver, domain: str, rdtype: str) -> tuple[
         return Outcome(NXDOMAIN, str(exc)), violations
     if isinstance(exc, NoAnswerError):
         return Outcome(NODATA, str(exc)), violations
+    if not isinstance(exc, ResolverError):
+        return Outcome(LEAKED, f"{type(exc).__name__}: {exc}"), violations
     return Outcome(FAILED, f"{type(exc).__name__}: {exc}"), violations
 
 
@@ -261,7 +302,13 @@ def compare(ours: Outcome, references: dict[str, str]) -> str:
         return "" if secure else "we-say-secure-they-do-not"
     if ours.kind == INSECURE:
         # The dangerous direction: a signature we failed to notice.
-        return "we-say-insecure-they-say-secure" if secure and not insecure else ""
+        if secure and not insecure:
+            return "we-say-insecure-they-say-secure"
+        # The other one. We hand the data over; a majority of the panel refuses
+        # to. Whatever they caught, we did not, and the caller gets the answer.
+        if bogus and not insecure:
+            return "we-say-insecure-they-say-bogus"
+        return ""
     if ours.kind == BOGUS:
         return "" if len(bogus) >= max(2, len(verdicts) - 1) else "false-bogus"
     if ours.kind in (NXDOMAIN, NODATA):
@@ -276,8 +323,14 @@ def compare(ours: Outcome, references: dict[str, str]) -> str:
     return ""
 
 
+def leaked(outcomes: list[Outcome]) -> bool:
+    """Did any resolution raise something that is not a ResolverError?"""
+    return any(o.kind == LEAKED for o in outcomes)
+
+
 def positive_int(text: str) -> int:
-    """`--runs 0` leaves `outcomes` empty, and `outcomes[0]` then raises."""
+    """`--runs 0` leaves `outcomes` empty and `outcomes[0]` then raises;
+    `--workers 0` reaches ThreadPoolExecutor, which refuses it."""
     value = int(text)
     if value < 1:
         raise argparse.ArgumentTypeError(f"must be 1 or more, got {value}")
@@ -305,7 +358,7 @@ def main() -> int:
     parser.add_argument("--escalate", type=int, default=8, help="Resolutions for anomalous names")
     parser.add_argument("--sample", type=int, default=0, help="Random sample of N names (0 = all)")
     parser.add_argument("--seed", type=int, default=20260830, help="Sampling seed")
-    parser.add_argument("--workers", type=int, default=16, help="Concurrent names")
+    parser.add_argument("--workers", type=positive_int, default=16, help="Concurrent names")
     parser.add_argument("--timeout", type=float, default=3.0, help="Per-query timeout")
     parser.add_argument("--no-references", action="store_true", help="Skip the reference resolvers")
     parser.add_argument("--references", type=server_list, default=",".join(REFERENCES), help="Reference resolver IPs")
@@ -358,7 +411,7 @@ def main() -> int:
                 )
             )
 
-        disagreement = compare(outcomes[0], references)
+        disagreement = "we-leaked-a-non-resolver-error" if leaked(outcomes) else compare(outcomes[0], references)
         # Escalate anything suspicious: a disagreement, a violation, or a
         # verdict that is not simply "it resolved".
         suspicious = bool(disagreement or violations or len(distinct) > 1 or outcomes[0].kind in (BOGUS, UNAVAILABLE))
@@ -368,9 +421,12 @@ def main() -> int:
             violations.extend(extra)
             distinct = {o.key() for o in outcomes}
             # Re-judge on the most severe outcome seen.
-            severity = [BOGUS, FAILED, UNAVAILABLE, SECURE, INSECURE, NODATA, NXDOMAIN]
+            severity = [LEAKED, BOGUS, FAILED, UNAVAILABLE, SECURE, INSECURE, NODATA, NXDOMAIN]
             worst = min(outcomes, key=lambda o: severity.index(o.kind) if o.kind in severity else 99)
-            disagreement = compare(worst, references) or disagreement
+            if leaked(outcomes):
+                disagreement = "we-leaked-a-non-resolver-error"
+            else:
+                disagreement = compare(worst, references) or disagreement
 
         with lock:
             done += 1
@@ -378,10 +434,7 @@ def main() -> int:
                 print(f"  {done}/{len(work_items)} in {time.time() - started:.0f}s", file=sys.stderr, flush=True)
 
         counted = collections.Counter(o.key() for o in outcomes)
-        # Different answers between runs mean the zone itself is unstable, so a
-        # verdict that changes with them is following the data, not wobbling.
-        answered = [o for o in outcomes if o.kind not in RETRIEVAL_KINDS]
-        unstable_data = len({o.fingerprint()[1:] for o in answered}) > 1
+        unstable_data = data_is_unstable(outcomes)
         return Row(
             domain=domain,
             rdtype=rdtype,
@@ -440,8 +493,8 @@ def main() -> int:
 
     verdict_flaps = [r for r in rows if r.verdict_flap]
     availability_flaps = [r for r in rows if r.flapped and not r.verdict_flap]
-    verdict_disagreements = [r for r in rows if r.disagreement in VERDICT_DISAGREEMENTS]
-    availability_disagreements = [r for r in rows if r.disagreement and r.disagreement not in VERDICT_DISAGREEMENTS]
+    verdict_disagreements = [r for r in rows if gates_release(r.disagreement)]
+    availability_disagreements = [r for r in rows if r.disagreement and not gates_release(r.disagreement)]
     violated = [r for r in rows if r.violations]
 
     print(f"\n{len(rows)} lookups over {len(corpus)} names in {time.time() - started:.0f}s", file=sys.stderr)
@@ -463,7 +516,7 @@ def main() -> int:
         print(f"  VERDICT FLAP {row.domain}/{row.rdtype}: {row.ours}", file=sys.stderr)
     for row in verdict_disagreements + availability_disagreements:
         print(
-            f"  {'DISAGREE' if row.disagreement in VERDICT_DISAGREEMENTS else 'note'} "
+            f"  {'DISAGREE' if gates_release(row.disagreement) else 'note'} "
             f"{row.domain}/{row.rdtype}: {row.disagreement} ours={row.ours} refs={row.references}",
             file=sys.stderr,
         )

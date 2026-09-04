@@ -43,8 +43,13 @@ a signed domain of their own. Upgrade before relying on a `SECURE` verdict from
 ### Fixed
 
 - One unreachable or out-of-sync nameserver no longer condemns a zone. DNSKEY
-  and DS fetches, bare referrals and failed denials all sweep the NS set
-  (RFC 4035 §5.5); a stale cached delegation re-resolves its NS names.
+  and DS fetches, bare referrals, failed denials and answers carrying no
+  signature at all now sweep the NS set (RFC 4035 §5.5); a stale cached
+  delegation re-resolves its NS names. The last of those is a nameserver
+  serving a stale *unsigned* copy of a signed zone: every type it answers
+  reads as forged and its DNSKEY NODATA proves nothing, so landing on it made
+  the whole zone intermittently BOGUS. One of `nic.bj`'s four nameservers is
+  such a copy.
 - A single spoofed UDP packet no longer retires a healthy nameserver
   (RFC 5452 §9).
 - DNAME is implemented: CNAME synthesis when the server omits it, and the

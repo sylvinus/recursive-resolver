@@ -132,6 +132,14 @@ def key_of(qname, rdtype, server: str) -> str:
     return f"{qname}|{dns.rdatatype.to_text(rdtype)}|{server}"
 
 
+def positive_int(text: str) -> int:
+    """ThreadPoolExecutor refuses a worker count below one."""
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be 1 or more, got {value}")
+    return value
+
+
 # ── record ──────────────────────────────────────────────────────────────────
 
 
@@ -161,7 +169,11 @@ def record_case(domain: str, rdtype: str, timeout: float) -> dict | None:
     except ResolverError as exc:
         baseline = outcome_of(None, exc)
         records = []
-    except Exception:  # noqa: BLE001 - anything else is not a recordable case
+    except Exception as exc:  # noqa: BLE001 - not a ResolverError, so not an outcome
+        # `outcome_of` has a bucket for this and `transition_allowed` refuses
+        # it, but neither is reached if the name never becomes a cassette.
+        # Dropping it silently makes the corpus smaller and says nothing.
+        print(f"  {domain}/{rdtype}: leaked {type(exc).__name__}: {exc}", file=sys.stderr)
         return None
 
     # Complete the mesh: every server that was offered, for every question, so
@@ -201,6 +213,7 @@ def record_case(domain: str, rdtype: str, timeout: float) -> dict | None:
     # cassette every later layer has to special-case.
     replayed, _violations = replay(case)
     if replayed != baseline:
+        print(f"  {domain}/{rdtype}: recorded {baseline}, replayed {replayed}", file=sys.stderr)
         return None
     return case
 
@@ -340,7 +353,7 @@ def main() -> int:
     rec.add_argument("--types", default="A,MX")
     rec.add_argument("--sample", type=int, default=200)
     rec.add_argument("--seed", type=int, default=20260830)
-    rec.add_argument("--workers", type=int, default=12)
+    rec.add_argument("--workers", type=positive_int, default=12)
     rec.add_argument("--timeout", type=float, default=3.0)
 
     rep = sub.add_parser("replay", help="Replay cassettes offline")
@@ -349,7 +362,7 @@ def main() -> int:
     per = sub.add_parser("perturb", help="Replay under every order and fault")
     per.add_argument("--cassettes", required=True)
     per.add_argument("--max-servers", type=int, default=6, help="Servers to enumerate per case")
-    per.add_argument("--workers", type=int, default=4)
+    per.add_argument("--workers", type=positive_int, default=4)
 
     args = parser.parse_args()
 
@@ -383,9 +396,8 @@ def main() -> int:
         sizes = sum(len(c["entries"]) for c in cases)
         print(f"\n{len(cases)} cassettes, {sizes} recorded responses, {time.time() - started:.0f}s", file=sys.stderr)
         if dropped:
-            print(f"  {len(dropped)} not recorded (no stable offline reproduction):", file=sys.stderr)
-            for domain, rdtype in dropped[:20]:
-                print(f"    {domain}/{rdtype}", file=sys.stderr)
+            names = ", ".join(f"{d}/{t}" for d, t in dropped[:20])
+            print(f"  {len(dropped)} not recorded, reasons above: {names}", file=sys.stderr)
         return 0
 
     cases = [json.loads(line) for line in Path(args.cassettes).read_text(encoding="utf-8").splitlines() if line]

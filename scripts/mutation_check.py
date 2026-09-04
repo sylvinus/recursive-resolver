@@ -684,6 +684,24 @@ MUTATIONS: list[tuple[str, str, list[tuple[str, str]]]] = [
             )
         ],
     ),
+    (
+        "stale-unsigned-server-condemns-the-zone",
+        "0.1.0: one nameserver serving an unsigned copy makes the whole zone bogus",
+        [
+            (
+                """        if not ctx.dnssec or self._validator is None or state is not ValidationState.SECURE:
+            return False
+        if kind not in ("answer", "cname", "nodata", "nxdomain"):
+            return False""",
+                """        return False""",
+            )
+        ],
+    ),
+    (
+        "an-unsigned-referral-is-swept-past",
+        "the same control over-firing: a delegation NS RRset is unsigned by design",
+        [('        if kind not in ("answer", "cname", "nodata", "nxdomain"):', "        if False:")],
+    ),
 ]
 
 
@@ -702,21 +720,25 @@ def apply_mutation(target: Path, edits: list[tuple[str, str]]) -> None:
         if not old:
             raise SystemExit("mutation has an empty search string")
 
-    pending = list(edits)
+    # Indices, not the (old, new) pairs themselves: two identical edits are two
+    # rewrites to make, and comparing by value would strike both off the list
+    # the first time one of them matched.
+    pending = set(range(len(edits)))
     for name in ("resolver.py", "dnssec.py"):
         path = target / "recursive_resolver" / name
         text = path.read_text(encoding="utf-8")
-        applied = []
-        for old, new in pending:
+        applied = set()
+        for index in sorted(pending):
+            old, new = edits[index]
             if old in text:
                 text = text.replace(old, new, 1)
-                applied.append((old, new))
+                applied.add(index)
         if applied:
             path.write_text(text, encoding="utf-8")
-            pending = [edit for edit in pending if edit not in applied]
+            pending -= applied
 
     if pending:
-        raise SystemExit(f"mutation no longer applies: {pending[0][0][:60]!r}")
+        raise SystemExit(f"mutation no longer applies: {edits[min(pending)][0][:60]!r}")
 
 
 # pytest exits 0 when everything passed and 1 when a test failed. Anything else
@@ -753,14 +775,18 @@ def main() -> int:
     # An unreadable cassette file makes every perturb run fail, which reads as
     # "every mutant caught by the cassettes" - the most flattering possible
     # result, produced by the harness being broken.
+    cassettes = ""
     if args.cassettes:
-        cassettes = Path(args.cassettes)
-        if not cassettes.is_file():
+        path = Path(args.cassettes)
+        if not path.is_file():
             raise SystemExit(f"cassette file not found: {args.cassettes}")
         try:
-            cassettes.open("rb").close()
+            path.open("rb").close()
         except OSError as exc:
             raise SystemExit(f"cannot read {args.cassettes}: {exc}") from None
+        # `run` starts the child with cwd=REPO, so a path relative to wherever
+        # this was invoked from would not resolve there.
+        cassettes = str(path.resolve())
 
     survivors: list[str] = []
     print(f"{'mutation':<44}{'unit suite':<14}{'cassettes':<14}caught by")
@@ -798,7 +824,7 @@ def main() -> int:
             cassette_ok = True
             if args.cassettes:
                 cassette_ok = run(
-                    [args.python, str(REPO / "scripts/cassette.py"), "perturb", "--cassettes", args.cassettes],
+                    [args.python, str(REPO / "scripts/cassette.py"), "perturb", "--cassettes", cassettes],
                     target,
                     REPO,
                 )

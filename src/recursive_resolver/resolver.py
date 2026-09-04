@@ -576,6 +576,22 @@ class RecursiveResolver:
             kind = classification["type"]
             self._record_trace(ctx, server, qname, rdtype_text, classification, response, current_zone, chain_state)
 
+            if self._serves_an_unsigned_copy(response, kind, chain_state, ctx):
+                siblings = [ns for ns in current_nameservers if ns != server]
+                if siblings:
+                    logger.debug(
+                        "Unsigned %s for %s/%s from %s in signed zone %s, trying siblings",
+                        kind,
+                        qname,
+                        rdtype_text,
+                        server,
+                        current_zone,
+                    )
+                    current_nameservers = siblings
+                    continue
+                # Every server answers unsigned, so this is the zone and not
+                # one stale copy of it. Fall through and judge what we have.
+
             if kind == "answer":
                 return self._handle_answer(
                     response,
@@ -1791,6 +1807,47 @@ class RecursiveResolver:
             return state is not ValidationState.BOGUS
 
         return check
+
+    def _serves_an_unsigned_copy(
+        self,
+        response: dns.message.Message,
+        kind: str,
+        state: ValidationState,
+        ctx: _Context,
+    ) -> bool:
+        """Did this server answer for a signed zone without a single signature?
+
+        Same rule as :meth:`_usable_denial`, one level up. RFC 4035 §5.5: "If
+        the resolver has other servers to try, it SHOULD try one of them before
+        concluding the answer is Bogus." A server holding a stale *unsigned*
+        copy of a zone its siblings serve signed answers authoritatively with
+        no RRSIG anywhere, so every type it is asked for reads as forged and
+        its NODATA proves nothing. Found in the wild on a signed ccTLD
+        registry whose four nameservers included one such copy: landing on it
+        made the whole zone intermittently bogus, on the say-so of the one
+        machine that was wrong.
+
+        The test is syntactic and costs no crypto: under a chain of trust that
+        says the zone is signed, every positive answer and every denial carries
+        a signature, so a response with none at all is evidence about the
+        server rather than about the data. Nothing is relaxed - the sibling's
+        answer is validated exactly as this one would have been, and a zone
+        whose every server answers unsigned still ends BOGUS, because the
+        caller runs out of servers and judges the last response it holds.
+
+        Referrals are excluded: the delegation NS RRset is unsigned by design
+        (RFC 4035 §2.2), and :meth:`_advance_dnssec` fetches the DS from the
+        parent's own NS set rather than trusting what the referral carried.
+        """
+        if not ctx.dnssec or self._validator is None or state is not ValidationState.SECURE:
+            return False
+        if kind not in ("answer", "cname", "nodata", "nxdomain"):
+            return False
+        return not any(
+            rrset.rdtype == dns.rdatatype.RRSIG
+            for section in (response.answer, response.authority)
+            for rrset in section
+        )
 
     def _negative_ttl(
         self, response: dns.message.Message, qname: dns.name.Name, current_zone: dns.name.Name

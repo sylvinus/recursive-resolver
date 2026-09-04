@@ -126,7 +126,7 @@ Rules, each a failure rather than a report line:
 | Ours | Required of the references |
 |---|---|
 | `SECURE` | secure holds the majority. A lone secure among four insecure is a disagreement, not agreement |
-| `INSECURE` | secure does not hold the majority, or insecure also does. The dangerous direction is a signature we failed to notice |
+| `INSECURE` | neither secure nor bogus holds the majority, unless insecure does too. Two dangerous directions: a signature we failed to notice, and data a majority refuses that we hand over |
 | `BOGUS` | all but at most one refuse (SERVFAIL without CD, data with CD) |
 | unavailable / failed | flagged when the references all resolved it |
 
@@ -432,15 +432,47 @@ Re-running the whole pass after the fix: zero verdict flaps, zero
 disagreements, zero invariant violations. Ten BOGUS verdicts remain, all of
 them the deliberately-broken test zones, all agreed by every reference.
 
+### What the 42,000-name run found
+
+A corpus ten times the size - 42,536 names over 33,534 zones, 85,067 lookups
+for breadth and 19,143 more at full escalation over the 2,127 names the probe
+flagged - found one defect, and it was the deviation the section below used to
+list as accepted.
+
+A nameserver serving a stale **unsigned** copy of a signed zone answers
+authoritatively with no RRSIG for any type, and NODATA for DNSKEY. Landing on
+it made every record type in the zone read as forged, and the DNSKEY NODATA
+unprovable, so the zone was BOGUS on roughly half of all lookups. `nic.bj` is
+the live example: one of its four nameservers, `dns1.jenysas.bj`, is such a
+copy, and 16 of 36 lookups failed against it. RFC 4035 §5.5 covers exactly
+this, and the resolver already applied it to a denial whose proof does not
+validate - just never to a positive answer or to an unsigned denial. Extending
+the sweep costs 3 extra queries per 500 lookups, measured with both arms
+interleaved over the same names, because the case it has to sweep past is rare
+and short when it happens.
+
+The run also found a hole in the flap detector, which matters more than the
+defect. A verdict change is excused when the zone handed back different data,
+and "different data" was measured over every outcome - including the ones that
+leave as an exception and therefore carry no records at all. A BOGUS always
+has an empty record set, so every secure-to-bogus alternation looked like a
+zone changing underneath us. `nic.bj` flapping on four record types was
+reported across 120,000 lookups as **zero verdict flaps**. Only the reference
+panel caught it, and only because the panel happened to agree. The rule now
+counts a dataset only from outcomes that carried one.
+
+Re-running the escalated pass after both fixes: zero verdict flaps under the
+stricter rule, zero invariant violations, and four disagreements down from
+eight - the four remaining are two zones whose parents publish no DS, where
+the panel splits against itself.
+
+The lesson is the one the gentle re-run already argued, sharpened: breadth
+found the zone, but the detector that was supposed to gate on it had been
+silently excusing the exact shape it exists to catch. A green gate is only
+evidence if something has recently made it go red.
+
 ### Disagreements left standing
 
-- **A zone whose NS set mixes signed and unsigned copies.** RFC 4035 §5.5 says
-  a validator with other servers to try SHOULD try one before concluding an
-  answer is forged. This resolver does not: the retry would have to replace the
-  *answer*, handing the caller the RRset from the server that did sign, which
-  is a change to the answer path rather than to a verdict. The one zone in the
-  corpus that shows it has 3 of its 4 nameservers unreachable, and the public
-  validators disagreed with themselves on it within a single run.
 - **A CNAME chain load balanced across a signed and an unsigned target.** A
   14-hop chain whose last hop varies per query. The verdict follows the branch
   the query got, correctly - the chain state is the weakest link over every
@@ -478,15 +510,18 @@ would have missed, plus the opt-out NODATA above, because only real DNS is
 broken in the ways real DNS is broken. A release wants all three, and the
 audit wants repeating whenever this code changes.
 
-The mutation catalogue in `scripts/mutation_check.py` now holds 50 entries, one
-per defect found across all three methods. Each reintroduces the original bug
-into a copy of the package and confirms the suite still fails. That is the only
-evidence that the tests written alongside a fix actually test it.
+The mutation catalogue in `scripts/mutation_check.py` now holds 52 entries: one
+per defect found across all three methods, plus a plausible weakening of each
+control that replaced one. Each reintroduces the bug into a copy of the package
+and confirms the suite still fails. That is the only evidence that the tests
+written alongside a fix actually test it. The newest pair covers the unsigned-
+copy sweep in both directions - removing it, and letting it fire on a referral,
+whose NS RRset is unsigned by design.
 
 Getting there needed a fix to the harness itself. One mutation preserved the
 file's byte length and landed in the same mtime second as the `.pyc` copied
 alongside it, so Python reused the stale bytecode: the mutant never executed,
 and the report called it caught. The copy now excludes `__pycache__` and
 `*.pyc`, so every mutant is compiled from the mutated source. Re-run after the
-fix: that mutant executes, and the suite fails on it like the rest. All 50 are
-caught, and all 50 now demonstrably ran.
+fix: that mutant executes, and the suite fails on it like the rest. All 52 are
+caught, and all 52 now demonstrably ran.
