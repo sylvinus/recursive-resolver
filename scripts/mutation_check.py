@@ -747,6 +747,11 @@ def apply_mutation(target: Path, edits: list[tuple[str, str]]) -> None:
 # turns a broken run into a clean report.
 PYTEST_EXIT_CODES = frozenset({0, 1})
 
+# The same rule for the cassette harness: 0 reproduced, 1 did not. It exits 2
+# for anything else, so a truncated cassette file or a JSONDecodeError is a
+# loud failure here instead of one more mutant reported as caught.
+CASSETTE_EXIT_CODES = frozenset({0, 1})
+
 
 def run(cmd: list[str], env_src: Path, cwd: Path, expected: frozenset[int] | None = None) -> bool:
     """True when the command passes (i.e. the mutant survived this layer)."""
@@ -827,6 +832,7 @@ def main() -> int:
                     [args.python, str(REPO / "scripts/cassette.py"), "perturb", "--cassettes", cassettes],
                     target,
                     REPO,
+                    expected=CASSETTE_EXIT_CODES,
                 )
 
             caught = [name for name, ok in (("unit", unit_ok), ("cassettes", cassette_ok)) if not ok]

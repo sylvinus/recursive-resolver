@@ -53,6 +53,7 @@ import random
 import sys
 import threading
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -484,4 +485,15 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # 0 is "reproduced", 1 is "did not". Anything the harness itself gets wrong
+    # - a truncated cassette file, a JSONDecodeError, an import that fails -
+    # must not exit 1, because the mutation runner reads 1 as "this layer
+    # caught the mutant" and a broken harness would report a clean sweep.
+    try:
+        status = main()
+    except SystemExit:
+        raise
+    except Exception:
+        traceback.print_exc()
+        status = 2
+    raise SystemExit(status)

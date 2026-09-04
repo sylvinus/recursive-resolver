@@ -94,7 +94,7 @@ a signed domain of their own. Upgrade before relying on a `SECURE` verdict from
   retrieved. Deliberately not a `DNSSECError`, so "refuse to use this data"
   handling stays correct while retrieval failures fall through to retries.
 - `TESTING.md` and the harnesses it describes, including a mutation catalogue
-  of 50 reintroduced defects that confirms the suite still catches each one.
+  of 52 reintroduced defects that confirms the suite still catches each one.
 
 ## [0.1.0] - 2026-08-09
 

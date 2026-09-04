@@ -1341,6 +1341,25 @@ class TestAStaleUnsignedServerDoesNotCondemnTheZone:
         resolver = RecursiveResolver(max_resolution_time=5, trust_anchors=(root.anchor_text(),), cache_enabled=False)
         return resolver, query_once
 
+    def _first_server(self, resolver: RecursiveResolver, first: str):
+        """Pin the order of the zone's own NS set, leaving every other set alone.
+
+        `_order_servers` shuffles, so letting it decide makes the test a coin
+        flip: half the time the good server answers first, the sweep never runs,
+        and the assertions pass anyway. Only the two-address set for `test.` is
+        pinned - the root and TLD sets keep their own ordering, or the referral
+        that sets up the whole case never arrives.
+        """
+        real = resolver._order_servers
+        pair = {self.STALE, self.GOOD}
+
+        def ordered(nameservers: list[str]) -> list[str]:
+            if set(nameservers) == pair:
+                return [first, *(s for s in pair if s != first)]
+            return real(nameservers)
+
+        return patch.object(resolver, "_order_servers", side_effect=ordered)
+
     @staticmethod
     def _unsigned_answer() -> dns.message.Message:
         response = make_response()
@@ -1355,14 +1374,16 @@ class TestAStaleUnsignedServerDoesNotCondemnTheZone:
         response.answer.append(child.sign(answer))
         return response
 
-    def test_an_unsigned_answer_from_one_server_is_retried_elsewhere(self) -> None:
-        # The sweep shuffles the NS set, so this runs both orders.
-        for _ in range(8):
-            resolver, query_once = self._world(self._unsigned_answer(), self._signed_answer)
-            with patch.object(resolver, "_query_once", side_effect=query_once):
-                result = resolver.resolve_answer("test.", "A")
-            assert result.records == ["192.0.2.10"], "took the stale server's unsigned answer"
-            assert result.dnssec is ValidationState.SECURE
+    @pytest.mark.parametrize("first", [STALE, GOOD], ids=["stale-first", "good-first"])
+    def test_an_unsigned_answer_from_one_server_is_retried_elsewhere(self, first: str) -> None:
+        resolver, query_once = self._world(self._unsigned_answer(), self._signed_answer)
+        with (
+            self._first_server(resolver, first),
+            patch.object(resolver, "_query_once", side_effect=query_once),
+        ):
+            result = resolver.resolve_answer("test.", "A")
+        assert result.records == ["192.0.2.10"], "took the stale server's unsigned answer"
+        assert result.dnssec is ValidationState.SECURE
 
     def test_an_unsigned_nodata_from_one_server_is_retried_elsewhere(self) -> None:
         """The `nic.bj/DNSKEY` case: a NODATA the stale copy cannot prove.
@@ -1373,12 +1394,14 @@ class TestAStaleUnsignedServerDoesNotCondemnTheZone:
         nodata in a signed zone" with the records sitting on the next server.
         """
         stale = make_response(authority=[("test.", 300, "SOA", ["ns1.test. hm.test. 1 3600 900 604800 300"])])
-        for _ in range(8):
-            resolver, query_once = self._world(stale, self._signed_answer)
-            with patch.object(resolver, "_query_once", side_effect=query_once):
-                result = resolver.resolve_answer("test.", "DNSKEY")
-            assert result.dnssec is ValidationState.SECURE
-            assert result.records, "no DNSKEY came back"
+        resolver, query_once = self._world(stale, self._signed_answer)
+        with (
+            self._first_server(resolver, self.STALE),
+            patch.object(resolver, "_query_once", side_effect=query_once),
+        ):
+            result = resolver.resolve_answer("test.", "DNSKEY")
+        assert result.dnssec is ValidationState.SECURE
+        assert result.records, "no DNSKEY came back"
 
     def test_a_zone_every_server_serves_unsigned_is_still_bogus(self) -> None:
         """Sweeping must not turn a zone with no signatures anywhere into a pass."""
