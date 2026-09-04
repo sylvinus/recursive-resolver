@@ -107,7 +107,7 @@ def sequence(responses: list[tuple[dns.message.Message, str]]):
     """Return a _send_query side effect that replays responses in order."""
     state = {"i": 0}
 
-    def side_effect(qname, rdtype, nameservers, ctx):
+    def side_effect(qname, rdtype, nameservers, ctx, usable=None):
         i = state["i"]
         if i < len(responses):
             state["i"] += 1

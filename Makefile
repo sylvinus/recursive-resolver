@@ -4,7 +4,8 @@ CSV ?= domains.csv
 SOURCES := src/ tests/ scripts/
 
 .PHONY: help install test test-integration test-from-csv coverage coverage-all lint format typecheck \
-       check check-all build clean docker-shell release release-check
+       check check-all build clean docker-shell release release-check \
+       test-corpus test-verdicts test-record test-offline test-protocol
 
 help: ## Show this help message
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -46,6 +47,48 @@ check-all: lint typecheck ## Everything, including live DNS and the coverage gat
 
 build: ## Build sdist and wheel
 	uv build
+
+# ── Real-world testing protocol (TESTING.md) ──────────────────────────
+
+CORPUS ?= corpus.csv
+ADVERSARIAL ?= adversarial.csv
+CASSETTES ?= cassettes.jsonl
+
+# The later stages read the files the earlier ones write, so those files are the
+# dependencies - not the phony targets. A phony prerequisite would rebuild the
+# 30,000-name corpus on every verdict run; a file one reuses what is there and
+# collects only when it is missing. Delete the file to force a fresh collection.
+#
+# A collector killed halfway leaves a partial file, which Make would otherwise
+# treat as a finished one and every later stage would read as the corpus.
+.DELETE_ON_ERROR:
+
+$(CORPUS):
+	uv run python scripts/collect_domains_diverse.py -o $@ --limit 30000
+
+$(ADVERSARIAL): $(CORPUS)
+	uv run python scripts/collect_domains_adversarial.py --csv $< -o $@
+
+$(CASSETTES): $(ADVERSARIAL)
+	uv run python scripts/cassette.py record --csv $< -o $@ --types A,MX
+
+test-corpus: $(ADVERSARIAL) ## Build the adversarial corpus (network, ~10 min)
+
+test-verdicts: $(ADVERSARIAL) ## Verdict differential and flap detection (network, ~1h)
+	uv run python scripts/verdict_harness.py --csv $(ADVERSARIAL) -o verdicts.csv --escalate 8
+
+test-record: $(CASSETTES) ## Record cassettes for offline replay (network)
+
+# The only target here that must never reach the network, so it asks for the
+# cassettes rather than depending on them: a missing file is an instruction to
+# the operator, not a licence to spend ten minutes recording one.
+test-offline: ## Replay cassettes under every order and fault, then mutate (no network)
+	@test -f $(CASSETTES) || { echo "$(CASSETTES) not found; run 'make test-record' first (needs network)" >&2; exit 1; }
+	uv run python scripts/cassette.py replay --cassettes $(CASSETTES)
+	uv run python scripts/cassette.py perturb --cassettes $(CASSETTES)
+	uv run python scripts/mutation_check.py --cassettes $(CASSETTES)
+
+test-protocol: test-corpus test-verdicts test-record test-offline ## The whole protocol, before a release
 
 docker-shell: ## Drop into a Docker shell with uv, make, dig and deps installed
 	docker build -t recursive-resolver .

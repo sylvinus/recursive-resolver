@@ -76,7 +76,7 @@ Validation is **on by default** and chains from the IANA root trust anchors
 | State | Meaning | Behaviour |
 |---|---|---|
 | `SECURE` | Signed and validated back to the root | Returned |
-| `INSECURE` | Provably unsigned (an ancestor proved no DS exists), or signed only with an algorithm this build cannot verify | Returned |
+| `INSECURE` | Provably unsigned (an ancestor proved no DS exists), signed only with an algorithm this build cannot verify, or proven only by an opt-out NSEC3 or an iteration count this build will not compute | Returned |
 | `BOGUS` | Claims to be signed but does not validate | **`DNSSECValidationError`** |
 
 Only `BOGUS` is an error: most of the internet is legitimately unsigned, so
@@ -147,6 +147,13 @@ This library is designed to be pointed at names an attacker controls, which is
 exactly what happens when you verify DKIM on inbound mail.
 
 - **Nameserver address filtering.** Glue records are attacker-controlled data. An address must be globally routable and none of loopback, link-local, multicast, reserved or private: classification that follows the IANA special-purpose registries rather than a hand-maintained CIDR list. A short explicit list then adds the ranges that classification still calls routable, notably Azure's `168.63.129.16`. So a hostile zone cannot steer the resolver at `127.0.0.1` or at a cloud metadata endpoint. Opt out with `allow_private_addresses=True` only for split-horizon DNS you trust.
+
+  The filter applies to **nameserver** addresses, not to answers. A zone is
+  entitled to publish `A 127.0.0.1` for its own name, and this library returns
+  it, as other implementations do: deciding whether an answer is safe to
+  connect to is the application's business, not the resolver's. If you are
+  guarding against DNS rebinding, filter the addresses you get back before you
+  use them.
 - **Query budget.** A shared per-resolution budget bounds total queries (64), failed NS-hostname lookups (5), referrals followed (130) and NS names chased per referral (13, randomly sampled). This is the NXNSAttack / Non-Responsive-Delegation control (CVE-2020-8616, CVE-2020-12662, CVE-2022-3204); without it a hostile zone can provoke tens of thousands of upstream queries from one call.
 - **Strict downward progress.** A referral must name a zone *strictly* below the one queried, and the qname must lie at or below it. Sideways and upward referrals are rejected rather than followed in circles.
 - **Bailiwick from the query, not the response.** Glue is judged against the zone we asked, never against a zone name the responder supplied.
@@ -218,7 +225,12 @@ Every failure is a `ResolverError`. Nothing from dnspython escapes.
 | `UnsupportedRdtypeError` | Unknown or unqueryable record type |
 | `QueryBudgetExceededError` | The work budget was exhausted (likely an attack) |
 | `DNSSECValidationError` | Signed data failed validation: **do not use it** |
-| `DNSSECInsecureError` | `require_dnssec=True` and the zone is unsigned |
+| `DNSSECInsecureError` | `require_dnssec=True` and the answer, or the denial, was not authenticated |
+| `DNSSECMaterialUnavailableError` | A DNSKEY or DS could not be fetched, so no verdict was reached |
+
+`DNSSECMaterialUnavailableError` is deliberately **not** a `DNSSECError`: a lame
+nameserver says nothing about the zone, so it must not read as tampering. Code
+that treats `DNSSECError` as "refuse to proceed" keeps working unchanged.
 
 ## Configuration
 
@@ -240,6 +252,7 @@ RecursiveResolver(
     extra_blocked_networks=None,  # further CIDRs to refuse, added to the built-ins
     idna_codec=None,              # defaults to IDNA 2008 (practical)
     trust_anchors=None,           # defaults to the IANA root anchors
+    clock_skew=60,                # slack on an RRSIG's inception, in seconds
 )
 ```
 
@@ -262,7 +275,7 @@ RecursiveResolver(limits=Limits(
 ))
 ```
 
-The defaults are the values Unbound and PowerDNS ship. Raise them only
+The defaults match what the major implementations ship. Raise them only
 against a measured legitimate name that needs the headroom.
 
 ## How it works
@@ -272,15 +285,16 @@ against a measured legitimate name that needs the headroom.
 3. **Follow referrals downward**, verifying at each step that the delegation descends and stays in bailiwick.
 4. **Resolve glueless NS hostnames** when a referral carries no usable glue, under the shared budget.
 5. **Validate DNSSEC** at every zone cut: DS against the parent's keys, DNSKEY against the DS, answers against the DNSKEY, and NSEC/NSEC3 proofs for negative answers.
-6. **Chase CNAMEs**, using target records already present in the response when the server supplied them.
+6. **Chase CNAMEs**, using target records already present in the response when the server supplied them, and perform the CNAME synthesis a DNAME implies (RFC 6672) when the server did not.
 7. **Cache** answers, negatives (NXDOMAIN by name per RFC 2308/8020) and delegations, with TTLs from the wire and negative TTLs from the SOA.
 
 ## Testing
 
-The suite is 520 tests at 100% coverage: 483 unit tests with mocked DNS and 37
-integration tests against live DNS, including deliberately-bogus DNSSEC test
-domains (`dnssec-failed.org`, `rhybar.cz`, `bogus.nlnetlabs.nl`) that must be
-rejected, and real DKIM selectors that must round-trip byte-exactly.
+The suite is 723 tests at 100% statement and branch coverage: 686 unit tests
+with mocked DNS and 37 integration tests against live DNS, including
+deliberately-bogus DNSSEC test domains (`dnssec-failed.org`, `rhybar.cz`,
+`bogus.nlnetlabs.nl`) that must be rejected, and real DKIM selectors that must
+round-trip byte-exactly.
 
 `tests/test_security.py` is a regression test per defect found in the
 pre-release audit: SSRF via glue, NXNS amplification, referral ping-pong,
