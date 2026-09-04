@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.0] - 2026-09-01
+## [0.2.0] - 2026-09-03
 
 A security release. Four defects in DNSSEC validation allowed forged data to be
 accepted as authenticated; the most direct required only that the attacker own
