@@ -687,7 +687,7 @@ class RecursiveResolver:
                         return dns.name.root, list(self._root_addresses), ValidationState.SECURE, None, []
                     names = [dns.name.from_text(n) for n in delegation.ns_names]
                     if ctx is not None and delegation.unsigned_until is not None:
-                        # What is cached below this cut rests on the same proof.
+                        # Delegations cached below this cut rest on the same proof.
                         ctx.unsigned_until[delegation.zone] = delegation.unsigned_until
                     return delegation.zone, addresses, state, delegation.ds, names
         return dns.name.root, list(self._root_addresses), ValidationState.SECURE, None, []

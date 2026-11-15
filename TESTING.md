@@ -111,7 +111,7 @@ python scripts/verdict_harness.py --csv adversarial.csv -o verdicts.csv \
 Our `ValidationState` is compared with what public validators say, and each
 suspicious name is re-resolved with a fresh resolver until the escalation count
 is reached. The references do not expose a verdict, so each is asked twice:
-`SERVFAIL` that becomes an answer under CD=1 is bogus, `NOERROR` with AD is
+`SERVFAIL` that becomes an answer or an NXDOMAIN under CD=1 is bogus, `NOERROR` with AD is
 secure, `NOERROR` without AD is insecure. `SERVFAIL` under CD=1 as well means
 the reference could not resolve the name at all. That agrees with a refusal or
 a failure of ours, and is left out when the panel is weighed against an answer
@@ -145,7 +145,7 @@ off rather than DNSSEC off in every config but one.
 
 ## Layer 4: cassette replay with systematic perturbation
 
-Run for 0.3.0: 400 cassettes over 21,419 recorded responses, 19,600
+Run for 0.3.0: 400 cassettes over 21,702 recorded responses, 19,600
 perturbed replays, no failures. Four of the mutations below are caught here
 independently of the unit suite - the retrieval-failure family, which is the
 class this layer exists for. The rest survive it, and are meant to: they need
@@ -556,7 +556,7 @@ against the signed-zone fixture with only `_send_query` replaced.
 Every fix has a regression test, and each was confirmed to fail with its fix
 reverted. Seventeen of those reversions joined the catalogue.
 
-The full protocol was then run: 3,983 names, 15,916 audited lookups, 400
+The full protocol was then run: 3,979 names, 15,916 audited lookups, 400
 cassettes. No flaps, no invariant violations, no failed perturbation. It
 found one more defect, present since 0.1.0: every name in `root-servers.net`
 came back "material unavailable". The root servers serve that zone but not
@@ -587,9 +587,8 @@ Two more gaps showed while checking why the cassettes had stopped catching
 `edns-incapable-retried`. 0.3.0 added a second guard against plain DNS while
 validating, so the entry removed one of two and nothing unsigned went out. It
 now removes both. Neither that second guard nor the same rule for a response
-that does not parse had a test, and each now has one and an entry. The
-catalogue is at 73: all caught by the unit suite, four of them by the
-cassettes as well. The resolver itself did not change.
+that does not parse had a test, and each now has one and an entry, for a
+catalogue of 73. The resolver itself did not change.
 
 The verdict differential reported one disagreement, and a re-run of the 55
 flagged names two more. All three were checked by hand and none is ours:
@@ -597,6 +596,9 @@ flagged names two more. All three were checked by hand and none is ours:
 - **`_dmarc.albertthebackpacker.com`**, SOA and DNSKEY. The zone's only
   nameserver mostly times out, and `com` proves it has no DS. The "bogus"
   side is one or two references answering SERVFAIL while the others time out.
+  This was the harness misreading its panel: a SERVFAIL that stays one under
+  CD=1 is a reference failing to resolve the name, and it is now left out
+  when the panel is weighed against an answer of ours.
 - **`www.gocondominios.pt/DNSKEY`**. Three of the four Azure DNS servers
   answer a DNSKEY query at a CNAME with the CNAME unsigned; the fourth signs
   it, and all four sign it for A and DS queries. The references SERVFAIL on
@@ -604,6 +606,25 @@ flagged names two more. All three were checked by hand and none is ours:
   follow it (NODATA at the end of the chain) or report the material
   unavailable. `www.live.com/DNSKEY` is the same Azure behaviour, with a split
   panel.
+
+Review of the pull request then changed the resolver again; CHANGELOG.md has
+the list. The cap on DS records applied before the ones this build cannot
+check were set aside, an unsigned delegation outlived the proof that it is
+unsigned, and a signature that had verified was reused past its expiry.
+Eleven entries for those fixes bring the catalogue to 84.
+
+The whole protocol was run again on that code. 3,979 names, 15,916 audited
+lookups: no verdict flap, no verdict disagreement, no invariant violation.
+400 cassettes over 21,702 recorded responses, all reproducing offline, and
+19,600 perturbed replays without a failure. All 84 mutants are caught by the
+unit suite, four of them by the cassettes as well.
+
+One harness correction came after that run. A SERVFAIL that turns into
+NXDOMAIN under CD=1 was read as a failure to resolve, when it is a denial
+the reference refused, and under the new rule that would have hidden an
+NXDOMAIN of ours that the panel rejects. The references were asked again
+for the 78 lookups of the run where one of them had said SERVFAIL, and none
+of the 78 gates under the corrected reading.
 
 The query cost of a cold lookup was re-measured against live DNS: `www.gov.uk`
 went from 44 queries to 24, and with `ipv4_only=False` on a host without IPv6

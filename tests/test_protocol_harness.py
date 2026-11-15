@@ -17,6 +17,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import dns.flags
+import dns.message
 import dns.name
 import dns.rcode
 import dns.rdatatype
@@ -42,6 +43,7 @@ from verdict_harness import (  # noqa: E402
     gates_release,
     leaked,
     our_outcome,
+    reference_verdict,
 )
 
 from recursive_resolver import (  # noqa: E402
@@ -244,6 +246,29 @@ class TestReferencePanel:
         assert compare(Outcome(FAILED, ""), panel) == ""
         panel = self._panel("servfail", "servfail", "servfail", "servfail", "insecure")
         assert compare(Outcome(FAILED, ""), panel) == ""
+
+    @staticmethod
+    def _asked(under_cd: dns.rcode.Rcode) -> dict[str, str]:
+        """Three references that SERVFAIL, then answer ``under_cd`` with CD=1."""
+
+        def answer(query: dns.message.Message, server: str, timeout: float) -> tuple[dns.message.Message, bool]:
+            response = dns.message.make_response(query)
+            response.set_rcode(under_cd if query.flags & dns.flags.CD else dns.rcode.SERVFAIL)
+            return response, False
+
+        with patch("verdict_harness.dns.query.udp_with_fallback", side_effect=answer):
+            return {ref: reference_verdict("gone.test.", "A", ref, 1.0) for ref in ("ref0", "ref1", "ref2")}
+
+    def test_a_denial_refused_until_cd_is_a_refusal(self) -> None:
+        """NXDOMAIN under CD: the references resolved the name and refused its denial."""
+        panel = self._asked(dns.rcode.NXDOMAIN)
+        assert set(panel.values()) == {BOGUS}
+        assert compare(Outcome(NXDOMAIN, ""), panel) == "we-answered-they-refused"
+
+    def test_a_servfail_that_stays_one_under_cd_is_not(self) -> None:
+        panel = self._asked(dns.rcode.SERVFAIL)
+        assert set(panel.values()) == {"servfail"}
+        assert compare(Outcome(NXDOMAIN, ""), panel) == ""
 
 
 class TestEveryDisagreementIsClassified:

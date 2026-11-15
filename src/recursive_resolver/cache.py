@@ -103,7 +103,8 @@ class Delegation:
 
     ``unsigned_until`` is when the proof that the zone, or one above it, is
     unsigned stops holding, on the monotonic clock. A resolution resumed here
-    caches nothing below the cut for longer. ``None`` where nothing proved it.
+    caches no delegation below the cut for longer. ``None`` where nothing
+    proved it.
     """
 
     zone: dns.name.Name

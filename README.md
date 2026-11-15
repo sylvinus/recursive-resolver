@@ -310,7 +310,7 @@ against a measured legitimate name that needs the headroom.
 
 ## Testing
 
-The suite is 909 tests at 100% statement and branch coverage: 872 unit tests
+The suite is 911 tests at 100% statement and branch coverage: 874 unit tests
 with mocked DNS and 37 integration tests against live DNS, including
 deliberately-bogus DNSSEC test domains (`dnssec-failed.org`, `rhybar.cz`,
 `bogus.nlnetlabs.nl`) that must be rejected, and real DKIM selectors that must

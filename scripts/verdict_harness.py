@@ -10,10 +10,10 @@ out of eight. Two things are needed for that, and both are here:
 1. **Compare the verdict.** For every name, our ``ValidationState`` is checked
    against what public validating resolvers say. They do not expose their
    verdict directly, so each is asked twice: once normally, and once with CD=1.
-   ``SERVFAIL`` that turns into an answer under CD is bogus; ``NOERROR`` with
-   AD is secure; ``NOERROR`` without AD is insecure. ``SERVFAIL`` under CD as
-   well means the reference could not resolve the name, which is not a
-   verdict on its signatures.
+   ``SERVFAIL`` that turns into an answer or an NXDOMAIN under CD is bogus;
+   ``NOERROR`` with AD is secure; ``NOERROR`` without AD is insecure.
+   ``SERVFAIL`` under CD as well means the reference could not resolve the
+   name, which is not a verdict on its signatures.
 2. **Run it more than once.** Each name is resolved K times with a fresh
    resolver, so nameserver ordering is re-randomised. Any name that produces
    more than one distinct outcome is a failure in its own right, whatever the
@@ -266,7 +266,9 @@ def reference_verdict(domain: str, rdtype: str, server: str, timeout: float) -> 
     has_data = any(rrset.rdtype != dns.rdatatype.RRSIG for rrset in plain.answer)
     if rcode == dns.rcode.SERVFAIL:
         relaxed = ask(True)
-        if relaxed is not None and relaxed.rcode() == dns.rcode.NOERROR:
+        # NXDOMAIN counts as resolved: a denial that fails validation is
+        # refused the same way an answer is.
+        if relaxed is not None and relaxed.rcode() in (dns.rcode.NOERROR, dns.rcode.NXDOMAIN):
             return BOGUS
         return "servfail"
     if rcode == dns.rcode.NXDOMAIN:
