@@ -132,6 +132,24 @@ class TestCNAME:
         assert answer.records == ["5.6.7.8"]
         assert answer.canonical_name == dns.name.from_text("target.other.com.")
 
+    def test_time_spent_on_the_target_comes_off_the_cname_ttl(self) -> None:
+        resolver = _resolver()
+        ctx = resolver._new_context()
+        qname, target = dns.name.from_text("www.example.com."), dns.name.from_text("target.other.com.")
+        rrset = dns.rrset.from_text(target, 300, "IN", "A", "5.6.7.8")
+        clock = [1000.0]
+
+        def resolve_target(*args):
+            clock[0] += 7.5
+            return Answer(target, target, dns.rdatatype.A, rrset, 300, ValidationState.INSECURE)
+
+        with (
+            patch("time.monotonic", side_effect=lambda: clock[0]),
+            patch.object(resolver, "_resolve_iterative", side_effect=resolve_target),
+        ):
+            answer = resolver._follow_cname(qname, target, dns.rdatatype.A, ctx, 0, [], ValidationState.INSECURE, 60)
+        assert answer.ttl == 53
+
     def test_inline_cname_target_avoids_a_second_walk(self) -> None:
         """A CNAME answered together with its target must not restart from root."""
         resolver = _resolver()
@@ -794,6 +812,33 @@ class TestGluelessNSUsesBothFamilies:
         assert tried == ["2001:db8::1", "192.0.2.1"]
         assert ctx.unreachable_families == {6}
         assert ctx.budget.queries_sent == 1
+
+    def test_a_family_that_has_answered_is_not_given_up_for_one_destination(self) -> None:
+        """A TCP retry can be told "network unreachable" by a router on the way to one server."""
+        import errno
+
+        from recursive_resolver.resolver import _FatalServerError
+
+        resolver = _resolver()
+        ctx = resolver._new_context()
+        tried: list[str] = []
+
+        def query_once(qname, rdtype, server, payload, timeout, ctx_):
+            tried.append(server)
+            if server == "192.0.2.2":
+                raise _FatalServerError("no route", errno=errno.ENETUNREACH)
+            return make_response(answer=[("example.com.", 300, "A", ["1.2.3.4"])])
+
+        qname = dns.name.from_text("example.com.")
+        with (
+            patch.object(resolver, "_order_servers", side_effect=lambda s: list(s)),
+            patch.object(resolver, "_query_once", side_effect=query_once),
+        ):
+            resolver._send_query(qname, dns.rdatatype.A, ["192.0.2.1"], ctx)
+            _response, server = resolver._send_query(qname, dns.rdatatype.A, ["192.0.2.2", "192.0.2.3"], ctx)
+        assert server == "192.0.2.3"
+        assert ctx.unreachable_families == set()
+        assert ctx.budget.queries_sent == 3
 
     def test_only_a_is_queried_by_default(self) -> None:
         resolver = _resolver()

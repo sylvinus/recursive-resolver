@@ -81,16 +81,52 @@ class TestExceptionTranslation:
         assert udp.call_args.kwargs["ignore_unexpected"] is True
         assert udp.call_args.kwargs["ignore_errors"] is True
 
+    @staticmethod
+    def _udp_taking(clock: list[float], seconds: float):
+        """A UDP exchange that ends truncated after that long on ``clock``."""
+        truncated = make_response(answer=[("example.com.", 300, "A", ["1.1.1.1"])], tc=True)
+
+        def udp(*args, **kwargs):
+            clock[0] += seconds
+            raise dns.message.Truncated(message=truncated)
+
+        return udp
+
     def test_tcp_fallback_gets_the_remaining_time_not_a_fresh_allowance(self) -> None:
         resolver = _resolver(timeout=2.0, max_resolution_time=1.0)
-        truncated = make_response(answer=[("example.com.", 300, "A", ["1.1.1.1"])], tc=True)
         good = make_response(answer=[("example.com.", 300, "A", ["1.1.1.1"])])
+        clock = [1000.0]
         with (
-            patch("dns.query.udp", side_effect=dns.message.Truncated(message=truncated)),
+            patch("time.monotonic", side_effect=lambda: clock[0]),
+            patch("dns.query.udp", side_effect=self._udp_taking(clock, 0.75)),
             patch("dns.query.tcp", return_value=good) as tcp,
         ):
             assert _query_once(resolver) is good
-        assert 0 < tcp.call_args.kwargs["timeout"] <= 1.0
+        assert tcp.call_args.kwargs["timeout"] == pytest.approx(0.25)
+
+    def test_tcp_fallback_is_skipped_when_udp_used_up_the_deadline(self) -> None:
+        resolver = _resolver(timeout=2.0, max_resolution_time=1.0)
+        clock = [1000.0]
+        with (
+            patch("time.monotonic", side_effect=lambda: clock[0]),
+            patch("dns.query.udp", side_effect=self._udp_taking(clock, 1.0)),
+            patch("dns.query.tcp") as tcp,
+            pytest.raises(_RetryableError, match="no time left"),
+        ):
+            _query_once(resolver)
+        tcp.assert_not_called()
+
+    def test_a_truncated_answer_shows_the_family_is_reachable(self) -> None:
+        resolver = _resolver()
+        ctx = resolver._new_context()
+        truncated = make_response(answer=[("example.com.", 300, "A", ["1.1.1.1"])], tc=True)
+        with (
+            patch("dns.query.udp", side_effect=dns.message.Truncated(message=truncated)),
+            patch("dns.query.tcp", side_effect=OSError(errno.ENETUNREACH, "unreachable")),
+            pytest.raises(_FatalServerError),
+        ):
+            resolver._query_once(QNAME, dns.rdatatype.A, "9.9.9.9", 1232, 1.0, ctx)
+        assert ctx.reachable_families == {4}
 
     def test_tcp_fallback_is_skipped_once_the_deadline_has_passed(self) -> None:
         import time

@@ -11,7 +11,9 @@ out of eight. Two things are needed for that, and both are here:
    against what public validating resolvers say. They do not expose their
    verdict directly, so each is asked twice: once normally, and once with CD=1.
    ``SERVFAIL`` that turns into an answer under CD is bogus; ``NOERROR`` with
-   AD is secure; ``NOERROR`` without AD is insecure.
+   AD is secure; ``NOERROR`` without AD is insecure. ``SERVFAIL`` under CD as
+   well means the reference could not resolve the name, which is not a
+   verdict on its signatures.
 2. **Run it more than once.** Each name is resolved K times with a fresh
    resolver, so nameserver ordering is re-randomised. Any name that produces
    more than one distinct outcome is a failure in its own right, whatever the
@@ -279,6 +281,13 @@ def reference_verdict(domain: str, rdtype: str, server: str, timeout: float) -> 
 def compare(ours: Outcome, references: dict[str, str]) -> str:
     """Return "" when the verdicts are compatible, or a disagreement label."""
     verdicts = [v for v in references.values() if v not in ("timeout",)]
+    if ours.kind not in (BOGUS, UNAVAILABLE, FAILED):
+        # "servfail" is a SERVFAIL that stayed one under CD: the reference
+        # could not resolve the name at all. That agrees with a refusal or a
+        # failure of ours, and is no verdict to hold against an answer of
+        # ours. One resolver failing on a zone whose only nameserver mostly
+        # times out used to read as "they say bogus".
+        verdicts = [v for v in verdicts if v != "servfail"]
     if not verdicts:
         return ""
     secure = [v for v in verdicts if v in (SECURE, "nodata-secure", "nxdomain-secure")]

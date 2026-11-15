@@ -80,6 +80,15 @@ class TestAuthenticatedTTLIsCappedBySignatureValidity:
         cap = min(data.ttl, sig.ttl, int(signature.original_ttl), int(signature.expiration) - int(time.time()))
         assert cap <= 30, "a day-long TTL survived a 30-second signature"
 
+    def test_a_remembered_signature_is_not_reused_past_its_expiry(self, zone: SignedZone) -> None:
+        """A resolution checks the same records more than once, and can outlast a signature."""
+        data = rrset_of("example.test.", "A", "192.0.2.1", ttl=300)
+        sig = self._signed_for(zone, data, 30)
+        validator, keys, budget = DNSSECValidator(), zone.keyring(), QueryBudget()
+        assert validator.validated_rrsig(data, sig, keys, budget=budget) is not None
+        with patch("time.time", return_value=time.time() + 60):
+            assert validator.validated_rrsig(data, sig, keys, budget=budget) is None
+
     def test_a_long_lived_signature_does_not_shorten_the_ttl(self, zone: SignedZone) -> None:
         data = rrset_of("example.test.", "A", "192.0.2.1", ttl=300)
         signature = DNSSECValidator().validated_rrsig(data, zone.sign(data), zone.keyring())

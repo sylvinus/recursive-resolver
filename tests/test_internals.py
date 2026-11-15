@@ -16,6 +16,9 @@ from unittest.mock import patch
 import dns.exception
 import dns.name
 import dns.rcode
+import dns.rdata
+import dns.rdataclass
+import dns.rdataset
 import dns.rdatatype
 import pytest
 from conftest import make_response, offline_resolver, referral, root_to_com
@@ -257,6 +260,13 @@ class TestInputValidationEdges:
 
     def test_relative_names_are_made_absolute(self) -> None:
         assert offline_resolver()._normalize_qname("example.com", "A").is_absolute()
+
+    def test_a_relative_name_with_no_room_for_the_root_label_is_refused(self) -> None:
+        from recursive_resolver import InvalidNameError
+
+        relative = dns.name.Name([b"a" * 63, b"a" * 63, b"a" * 63, b"a" * 62])
+        with pytest.raises(InvalidNameError, match="255 octets"):
+            offline_resolver().resolve(relative, "A")
 
     def test_non_string_input(self) -> None:
         from recursive_resolver import InvalidNameError
@@ -1023,6 +1033,135 @@ class TestDelegationAndKeyLifetimes:
         response.authority[-1] = parent.sign(nsec, expiration=int(time.time()) - 1)
         resolver._cache_delegation(*args, response, ValidationState.INSECURE)
         assert resolver.cache.get_delegation(dns.name.from_text("example.com.")) is None
+
+    @staticmethod
+    def _unsigned_cut(proof_seconds: int | None, ns_ttl: int = 3600):
+        """A referral to example.com, with a no-DS proof valid that long if asked for."""
+        from signed_zone import SignedZone, rrset_of
+
+        response = make_response(authority=[("example.com.", ns_ttl, "NS", ["ns1.example.com."])], aa=False)
+        if proof_seconds is not None:
+            nsec = rrset_of("example.com.", "NSEC", "f.com. NS RRSIG NSEC")
+            signed = SignedZone.create("com.").sign(nsec, expiration=int(time.time()) + proof_seconds)
+            response.authority += [nsec, signed]
+        return (dns.name.from_text("example.com."), [dns.name.from_text("ns1.example.com.")], ["9.9.9.9"], response)
+
+    @staticmethod
+    def _lifetime(resolver: RecursiveResolver, zone: str = "example.com.") -> float:
+        return resolver.cache._cache[("DG", dns.name.from_text(zone), 0, 0)].expiry - time.monotonic()
+
+    def test_the_cache_floor_does_not_lift_it_past_that_proof(self) -> None:
+        resolver = RecursiveResolver(dnssec=False, cache_enabled=True, min_ttl=600)
+        resolver._cache_delegation(*self._unsigned_cut(30), ValidationState.INSECURE)
+        assert self._lifetime(resolver) <= 30
+        assert resolver.cache.get_delegation(dns.name.from_text("example.com.")).secure is False
+
+    def test_the_cache_floor_still_applies_where_nothing_was_proven(self) -> None:
+        resolver = RecursiveResolver(dnssec=False, cache_enabled=True, min_ttl=600)
+        resolver._cache_delegation(*self._unsigned_cut(None, ns_ttl=60), ValidationState.INSECURE)
+        assert self._lifetime(resolver) > 590
+
+    def test_a_proof_from_a_ds_response_of_its_own_caps_the_cut_and_those_below(self) -> None:
+        """The referral carries none of it, so the walk has to have kept it."""
+        resolver = RecursiveResolver(dnssec=False, cache_enabled=True)
+        ctx = resolver._new_context()
+        ctx.unsigned_until[dns.name.from_text("example.com.")] = time.monotonic() + 30
+        resolver._cache_delegation(*self._unsigned_cut(None), ValidationState.INSECURE, None, ctx)
+        assert self._lifetime(resolver) <= 30
+
+        below = make_response(authority=[("sub.example.com.", 3600, "NS", ["ns1.example.com."])], aa=False)
+        args = (dns.name.from_text("sub.example.com."), [dns.name.from_text("ns1.example.com.")], ["9.9.9.9"])
+        resolver._cache_delegation(*args, below, ValidationState.INSECURE, None, ctx)
+        assert self._lifetime(resolver, "sub.example.com.") <= 30
+
+        beside = make_response(authority=[("example.org.", 3600, "NS", ["ns1.example.com."])], aa=False)
+        args = (dns.name.from_text("example.org."), [dns.name.from_text("ns1.example.com.")], ["9.9.9.9"])
+        resolver._cache_delegation(*args, beside, ValidationState.INSECURE, None, ctx)
+        assert self._lifetime(resolver, "example.org.") > 3590
+
+    def test_the_ds_lookup_keeps_how_long_its_denial_holds(self) -> None:
+        from signed_zone import SignedZone, rrset_of
+
+        resolver = RecursiveResolver(dnssec=True)
+        ctx = resolver._new_context()
+        parent = SignedZone.create("com.")
+        nsec = rrset_of("example.com.", "NSEC", "f.com. NS RRSIG NSEC")
+        denial = make_response()
+        denial.authority += [nsec, parent.sign(nsec, expiration=int(time.time()) + 30)]
+        keys = ZoneKeys(parent.name, parent.dnskey_rrset, ValidationState.SECURE)
+        child = dns.name.from_text("example.com.")
+        with patch.object(resolver, "_send_query", return_value=(denial, "9.9.9.9")):
+            state, _ds, is_cut = resolver._chain_step(child, keys, ["9.9.9.9"], ctx)
+        assert (state, is_cut) == (ValidationState.INSECURE, True)
+        assert 0 < ctx.unsigned_until[child] - time.monotonic() <= 30
+
+    def test_a_referral_carrying_its_own_denial_keeps_it_for_the_cuts_below(self) -> None:
+        from signed_zone import SignedZone, rrset_of
+
+        resolver = RecursiveResolver(dnssec=True)
+        ctx = resolver._new_context()
+        parent = SignedZone.create("com.")
+        nsec = rrset_of("example.com.", "NSEC", "f.com. NS RRSIG NSEC")
+        referral_ = make_response(authority=[("example.com.", 3600, "NS", ["ns1.example.com."])], aa=False)
+        referral_.authority += [nsec, parent.sign(nsec, expiration=int(time.time()) + 30)]
+        keys = ZoneKeys(parent.name, parent.dnskey_rrset, ValidationState.SECURE)
+        child = dns.name.from_text("example.com.")
+        with patch.object(resolver, "_get_zone_keys", return_value=keys):
+            state, _ds = resolver._advance_dnssec(
+                referral_, child, parent.name, ["9.9.9.9"], ValidationState.SECURE, parent.ds_rdataset(parent), ctx
+            )
+        assert state is ValidationState.INSECURE
+        assert 0 < ctx.unsigned_until[child] - time.monotonic() <= 30
+
+    def test_a_lookup_resumed_at_an_unsigned_cut_caches_nothing_below_it_for_longer(self) -> None:
+        """The zones below are unsigned on the strength of the same proof."""
+        resolver = RecursiveResolver(dnssec=True, cache_enabled=True)
+        resolver._cache_delegation(*self._unsigned_cut(30), ValidationState.INSECURE)
+        cached = resolver.cache.get_delegation(dns.name.from_text("example.com."))
+        assert 0 < cached.unsigned_until - time.monotonic() <= 30
+
+        below = referral("sub.example.com.", ["ns1.sub.example.com."], {"ns1.sub.example.com.": "1.2.3.4"})
+        answer = make_response(answer=[("www.sub.example.com.", 300, "A", ["5.6.7.8"])])
+        replies = iter([below])
+        with patch.object(resolver, "_send_query", side_effect=lambda *a, **k: (next(replies, answer), "9.9.9.9")):
+            assert resolver.resolve("www.sub.example.com", "A") == ["5.6.7.8"]
+        assert self._lifetime(resolver, "sub.example.com.") <= 30
+        deeper = resolver.cache.get_delegation(dns.name.from_text("sub.example.com."))
+        assert deeper.unsigned_until == pytest.approx(cached.unsigned_until, abs=1.5)
+
+    def test_time_spent_before_caching_comes_off_what_the_ds_allows(self) -> None:
+        """Resolving the NS names of a glueless referral can take seconds."""
+        resolver = RecursiveResolver(dnssec=False, cache_enabled=True)
+        ds = dns.rdataset.Rdataset(dns.rdataclass.IN, dns.rdatatype.DS)
+        ds.add(dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.DS, "1 13 2 " + "AB" * 32), ttl=30)
+        validated = time.monotonic() - 10
+        resolver._cache_delegation(*self._unsigned_cut(None), ValidationState.SECURE, ds, None, validated)
+        assert self._lifetime(resolver) <= 20
+
+    def test_the_walk_says_when_the_verdict_was_reached(self) -> None:
+        resolver = RecursiveResolver(dnssec=False, cache_enabled=True)
+        answer = make_response(answer=[("www.example.com.", 300, "A", ["1.2.3.4"])])
+        replies = iter([root_to_com(), referral("example.com.", ["ns1.example.com."], {"ns1.example.com.": "1.2.3.4"})])
+        before = time.monotonic()
+        with (
+            patch.object(resolver, "_send_query", side_effect=lambda *a, **k: (next(replies, answer), "1.2.3.4")),
+            patch.object(resolver, "_cache_delegation", wraps=resolver._cache_delegation) as cached,
+        ):
+            resolver.resolve("www.example.com", "A")
+        assert cached.call_count == 2
+        for call in cached.call_args_list:
+            assert call.args[6] is not None
+            assert before <= call.args[7] <= time.monotonic()
+
+    def test_a_denial_lives_no_longer_than_the_records_proving_it(self) -> None:
+        """RFC 4035 §5.3.3 counts the TTL the record arrived with, not only its signature's."""
+        from signed_zone import SignedZone, rrset_of
+
+        nsec = rrset_of("example.com.", "NSEC", "f.com. NS RRSIG NSEC", ttl=3600)
+        signed = SignedZone.create("com.").sign(nsec)
+        nsec.ttl = 20
+        assert RecursiveResolver._denial_ttl_cap([nsec, signed]) == 20
+        assert RecursiveResolver._denial_ttl_cap([nsec]) is None
 
     def test_without_dnssec_material_the_ns_ttl_stands(self) -> None:
         resolver = RecursiveResolver(dnssec=False, cache_enabled=True)

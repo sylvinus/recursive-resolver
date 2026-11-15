@@ -1399,6 +1399,19 @@ class TestDSWithAnAlgorithmWeCannotCheck:
         ds.add(dns.dnssec.make_ds(zone.name, gost, "SHA256"), ttl=300)
         assert DNSSECValidator().validate_dnskey(zone.name, zone.dnskey_rrset, None, ds) is ValidationState.INSECURE
 
+    def test_unsupported_ds_records_sent_first_do_not_hide_the_supported_one(self) -> None:
+        """Only so many DS are digested, and the order of an RRset is not signed."""
+        from recursive_resolver.dnssec import MAX_DS_PER_ZONE, DNSSECValidator
+
+        zone = SignedZone.create("z.test.")
+        ds = dns.rdataset.Rdataset(dns.rdataclass.IN, dns.rdatatype.DS)
+        for tag in range(MAX_DS_PER_ZONE):
+            ds.add(dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.DS, f"{tag} 12 2 " + "AB" * 32), ttl=300)
+        for genuine in zone.ds_rdataset(zone):
+            ds.add(genuine, ttl=300)
+        state = DNSSECValidator().validate_dnskey(zone.name, zone.dnskey_rrset, zone.signed_dnskey(), ds)
+        assert state is ValidationState.SECURE
+
     def test_a_sha1_ds_is_ignored_beside_a_sha256_one(self) -> None:
         """RFC 4509 §3, so a weak digest cannot stand in for the strong one."""
         from recursive_resolver.dnssec import DNSSECValidator

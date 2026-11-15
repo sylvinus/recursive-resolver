@@ -33,6 +33,19 @@ genuine, public record or field out of place. Upgrade before relying on a
   unsupported key. Whether a zone is verifiable is now read off the signed DS
   RRset (RFC 4035 §5.2), and a SHA-1 DS is ignored beside a stronger one
   (RFC 4509 §3).
+- Only the first eight DS records of a zone were considered, and the order of
+  an RRset is not signed: with eight that this build cannot check sent first,
+  the zone read as unsigned whatever followed. Records that cannot be checked
+  are now set aside before the cap applies.
+- An unsigned delegation could stay cached past the proof that it is
+  unsigned, and every delegation below it was cached for its own NS TTL.
+  `min_ttl` no longer lifts one past that proof, and the proof now counts
+  when it arrived in a DS response of its own, for the delegations below the
+  cut, and across lookups resumed from the cache, as do the TTLs of its NSEC
+  or NSEC3 records and the time spent resolving glueless nameservers before
+  the delegation is cached.
+- A signature that verified earlier in a resolution is checked for expiry
+  again before that verdict is reused.
 - Validated DNSKEY and DS records were cached for their wire TTL, up to a day,
   with a 60 second floor, past the expiry of their signatures. They are now
   capped like any authenticated data (RFC 4035 §5.3.3), so a rollover or an
@@ -103,7 +116,22 @@ genuine, public record or field out of place. Upgrade before relying on a
   hostile zone could write a log line per referral.
 - Exceptions survive pickling, so they cross process pools and task queues.
 - `"example.com "` is stripped rather than resolved with a trailing `\032`,
-  and `"@"` is refused rather than resolved as the root.
+  and `"@"` is refused rather than resolved as the root. A relative
+  `dns.name.Name` with no room for the root label raises `InvalidNameError`
+  rather than dnspython's `NameTooLong`.
+- `Answer.ttl` behind a CNAME counts the time spent resolving its target.
+- "Network unreachable" for one server no longer rules out its whole address
+  family for the rest of the lookup once a server of that family has
+  answered.
+- `scripts/mutation_check.py` reported every mutant as caught by the unit
+  suite, in 0.2.0 too: one test module could not be imported from the copy it
+  runs in, and under `-x` pytest exits 1 for that as it does for a failed
+  test. It now leaves that module and the live-DNS tests out, and requires
+  both suites to pass on an unmutated copy first. Run for real, four entries
+  survived, and two more gaps showed in the EDNS fallback; all six have tests.
+- `scripts/verdict_harness.py` counted a reference's SERVFAIL as a bogus
+  verdict even when it persisted with checking disabled, so one public
+  resolver failing to reach a flaky zone read as "they say bogus".
 
 ### Changed
 
@@ -133,8 +161,8 @@ genuine, public record or field out of place. Upgrade before relying on a
   `resolve()`, where `qname` can be a CNAME target or a nameserver hostname.
 - `Trace`, exported from the package.
 - Python 3.15 in the CI matrix.
-- Nineteen entries in the mutation catalogue, covering the fixes above that
-  it can express, for 71 in all.
+- Thirty-two entries in the mutation catalogue, covering the fixes above that
+  it can express, for 84 in all.
 
 ## [0.2.0] - 2026-09-03
 

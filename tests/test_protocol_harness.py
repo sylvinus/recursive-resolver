@@ -226,6 +226,25 @@ class TestReferencePanel:
         panel = self._panel("bogus", "insecure", "insecure", "insecure", "insecure")
         assert compare(Outcome("insecure", ""), panel) == ""
 
+    def test_a_reference_that_could_not_resolve_it_is_no_verdict_on_our_answer(self) -> None:
+        """SERVFAIL under CD too: a nameserver that mostly times out, not a signature."""
+        panel = self._panel("servfail", "servfail", "timeout", "timeout", "timeout")
+        assert compare(Outcome("insecure", ""), panel) == ""
+        assert compare(Outcome(NODATA, ""), panel) == ""
+        panel = self._panel("servfail", "servfail", "insecure", "timeout", "timeout")
+        assert compare(Outcome("insecure", ""), panel) == ""
+
+    def test_nor_does_it_dilute_the_references_that_did_reach_one(self) -> None:
+        panel = self._panel("bogus", "bogus", "servfail", "servfail", "insecure")
+        assert compare(Outcome(NODATA, ""), panel) == "we-answered-they-refused"
+
+    def test_it_still_agrees_with_a_refusal_or_a_failure_of_ours(self) -> None:
+        panel = self._panel("bogus", "servfail", "servfail", "servfail", "insecure")
+        assert compare(Outcome(BOGUS, ""), panel) == ""
+        assert compare(Outcome(FAILED, ""), panel) == ""
+        panel = self._panel("servfail", "servfail", "servfail", "servfail", "insecure")
+        assert compare(Outcome(FAILED, ""), panel) == ""
+
 
 class TestEveryDisagreementIsClassified:
     """A label `compare` can return must be a deliberate gate-or-not decision.

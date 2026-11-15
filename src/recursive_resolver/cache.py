@@ -100,6 +100,10 @@ class Delegation:
     ``ds`` carries the validated DS rdataset for the zone so a resumed
     resolution can rebuild the chain of trust without depending on a separate
     DNSKEY cache still being warm.
+
+    ``unsigned_until`` is when the proof that the zone, or one above it, is
+    unsigned stops holding, on the monotonic clock. A resolution resumed here
+    caches nothing below the cut for longer. ``None`` where nothing proved it.
     """
 
     zone: dns.name.Name
@@ -107,6 +111,7 @@ class Delegation:
     ns_names: list[str] = field(default_factory=list)
     secure: bool = False
     ds: Any = None
+    unsigned_until: float | None = None
 
 
 @dataclass
@@ -413,8 +418,12 @@ class DNSCache:
 
     # ── delegations ─────────────────────────────────────────────────────
 
-    def put_delegation(self, delegation: Delegation, ttl: int) -> None:
-        """Cache the nameservers for a zone cut, subject to the depth limit."""
+    def put_delegation(self, delegation: Delegation, ttl: int, floor: bool = True) -> None:
+        """Cache the nameservers for a zone cut, subject to the depth limit.
+
+        ``floor=False`` for an unsigned cut whose TTL the proof that it is
+        unsigned has capped: ``min_ttl`` must not lift it back up.
+        """
         depth = len(delegation.zone) - 1  # dns.name length includes the root label
         if self.max_delegation_depth is not None and depth > self.max_delegation_depth:
             return
@@ -423,7 +432,7 @@ class DNSCache:
         # to the same rule as an authenticated answer: no floor (see _clamp).
         entry = CacheEntry(
             rrset=self._isolate(delegation),
-            expiry=time.monotonic() + self._clamp(ttl, secure=delegation.secure),
+            expiry=time.monotonic() + self._clamp(ttl, secure=delegation.secure or not floor),
             secure=delegation.secure,
         )
         with self._lock:

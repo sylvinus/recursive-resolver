@@ -112,7 +112,10 @@ Our `ValidationState` is compared with what public validators say, and each
 suspicious name is re-resolved with a fresh resolver until the escalation count
 is reached. The references do not expose a verdict, so each is asked twice:
 `SERVFAIL` that becomes an answer under CD=1 is bogus, `NOERROR` with AD is
-secure, `NOERROR` without AD is insecure.
+secure, `NOERROR` without AD is insecure. `SERVFAIL` under CD=1 as well means
+the reference could not resolve the name at all. That agrees with a refusal or
+a failure of ours, and is left out when the panel is weighed against an answer
+of ours: it is not a verdict on any signature.
 
 The panel is first reduced to a verdict of its own. Each reference falls into
 one of secure, bogus or insecure, and a group counts only with a two-thirds
@@ -127,7 +130,7 @@ Rules, each a failure rather than a report line:
 |---|---|
 | `SECURE` | secure holds the majority. A lone secure among four insecure is a disagreement, not agreement |
 | `INSECURE` | neither secure nor bogus holds the majority, unless insecure does too. Two dangerous directions: a signature we failed to notice, and data a majority refuses that we hand over |
-| `BOGUS` | all but at most one refuse (SERVFAIL without CD, data with CD) |
+| `BOGUS` | all but at most one refuse (SERVFAIL without CD, whatever CD then gives) |
 | unavailable / failed | flagged when the references all resolved it |
 
 Every resolution runs under the Layer 0 audit, and any name that produces more
@@ -143,7 +146,7 @@ off rather than DNSSEC off in every config but one.
 ## Layer 4: cassette replay with systematic perturbation
 
 Run for 0.3.0: 400 cassettes over 21,419 recorded responses, 19,600
-perturbed replays, no failures. Three of the mutations below are caught here
+perturbed replays, no failures. Four of the mutations below are caught here
 independently of the unit suite - the retrieval-failure family, which is the
 class this layer exists for. The rest survive it, and are meant to: they need
 input the honest internet does not send.
@@ -212,6 +215,11 @@ suites are re-run against it, reporting which layer catches it. A mutant that
 survives every layer is a hole in the protocol. The catalogue is explicit source
 rewrites, so each entry names the defect it reproduces and a rewrite that no
 longer applies fails loudly instead of silently passing.
+
+The unit suite here is the offline one, without the tests of the harnesses
+themselves, which need the repository around them. Both suites are first run
+on an unmutated copy and must pass: a suite that fails there fails on every
+mutant, and each one reads as caught.
 
 Per-layer coverage attribution is **not implemented**. The intent: a branch in
 `resolver.py` or `dnssec.py` reached only by unit tests is a branch whose
@@ -531,6 +539,9 @@ and the report called it caught. The copy now excludes `__pycache__` and
 fix: that mutant executes, and the suite fails on it like the rest. All 52 are
 caught, and all 52 now demonstrably ran.
 
+That report was wrong, for a second reason found at 0.3.0 and described below:
+the suite failed on every copy, mutated or not.
+
 ## The 0.3.0 run
 
 A whole-project review, including the dnspython code paths the resolver relies
@@ -546,14 +557,39 @@ Every fix has a regression test, and each was confirmed to fail with its fix
 reverted. Seventeen of those reversions joined the catalogue.
 
 The full protocol was then run: 3,983 names, 15,916 audited lookups, 400
-cassettes. No flaps, no invariant violations, no failed perturbation, and
-every mutant caught by the unit layer. It found one more defect, present
-since 0.1.0: every name in `root-servers.net` came back "material
-unavailable". The root servers serve that zone but not `net`, and refer to
-the `net` servers when asked for `net`'s keys or for the DS of
-`root-servers.net`. The chain walk only ever asked the servers it started
-with. It now follows that referral, and two entries for it bring the
+cassettes. No flaps, no invariant violations, no failed perturbation. It
+found one more defect, present since 0.1.0: every name in `root-servers.net`
+came back "material unavailable". The root servers serve that zone but not
+`net`, and refer to the `net` servers when asked for `net`'s keys or for the
+DS of `root-servers.net`. The chain walk only ever asked the servers it
+started with. It now follows that referral, and two entries for it bring the
 catalogue to 71.
+
+The mutation check reported all 71 caught by the unit suite, as it had
+reported all 52 at 0.2.0, and both reports were empty. The tests are copied
+next to the mutated package, and one module among them, the tests of these
+harnesses, imports from `scripts/`, which is not copied. pytest runs with
+`-x`, and under `-x` a module that cannot be imported ends the run with exit
+code 1, the code for a failed test. A comment-only mutation was reported
+caught. The check now leaves that module out, and the live-DNS tests with it,
+and refuses to start unless both suites pass on an unmutated copy.
+
+Run again, four of the 71 survived both layers:
+
+- the AA bit on a DNSKEY answer was never tested;
+- neither was the strict-mode check on a cached denial;
+- nor an opt-out NSEC3 covering the wildcard in an NXDOMAIN proof;
+- the nested-wildcard entry rewrote the code into a different defect from the
+  one it names, and a wildcard NODATA two labels above the queried name had
+  no test. The entry now reproduces its defect.
+
+Two more gaps showed while checking why the cassettes had stopped catching
+`edns-incapable-retried`. 0.3.0 added a second guard against plain DNS while
+validating, so the entry removed one of two and nothing unsigned went out. It
+now removes both. Neither that second guard nor the same rule for a response
+that does not parse had a test, and each now has one and an entry. The
+catalogue is at 73: all caught by the unit suite, four of them by the
+cassettes as well. The resolver itself did not change.
 
 The verdict differential reported one disagreement, and a re-run of the 55
 flagged names two more. All three were checked by hand and none is ours:

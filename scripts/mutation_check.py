@@ -783,8 +783,8 @@ MUTATIONS: list[tuple[str, str, list[tuple[str, str]]]] = [
         "0.2.0 review: a forged DNSKEY RRset keeping only the unsupported key reads as unsigned",
         [
             (
-                "ds for ds in candidate_ds if _digest_supported(ds.digest_type) and algorithm_supported(ds.algorithm)",
-                "ds for ds in candidate_ds if _digest_supported(ds.digest_type)",
+                "ds for ds in ds_rdataset if _digest_supported(ds.digest_type) and algorithm_supported(ds.algorithm)",
+                "ds for ds in ds_rdataset if _digest_supported(ds.digest_type)",
             ),
             (
                 """            return ValidationState.BOGUS, None
@@ -912,6 +912,108 @@ MUTATIONS: list[tuple[str, str, list[tuple[str, str]]]] = [
                 "                    bailiwick = zone\n"
                 "                    step",
                 "                    raise\n                    step",
+            )
+        ],
+    ),
+    (
+        "remembered-signature-reused-past-its-expiry",
+        "0.3.0 PR review: a signature that verified earlier in the resolution is reused after it expired",
+        [
+            (
+                "                if found is None or _serial_le(int(time.time()) & 0xFFFFFFFF, int(found.expiration)):",
+                "                if True:",
+            )
+        ],
+    ),
+    (
+        "uncheckable-ds-records-hide-the-rest",
+        "0.3.0 PR review: eight DS records we cannot check, sent first, make the zone read as unsigned",
+        [
+            (
+                "for ds in ds_rdataset if _digest_supported",
+                "for ds in list(ds_rdataset)[:MAX_DS_PER_ZONE] if _digest_supported",
+            )
+        ],
+    ),
+    (
+        "relative-name-too-long-escapes",
+        "0.3.0 PR review: a relative Name with no room for the root label raises dnspython's NameTooLong",
+        [
+            (
+                """            try:
+                return qname.concatenate(dns.name.root)
+            except dns.name.NameTooLong as exc:
+                raise InvalidNameError(str(qname), "name exceeds 255 octets") from exc""",
+                "            return qname.concatenate(dns.name.root)",
+            )
+        ],
+    ),
+    (
+        "cname-ttl-ignores-time-spent-on-its-target",
+        "0.3.0 PR review: the answer's TTL runs past the CNAME's by the time its target took to resolve",
+        [("        cname_ttl = max(0, cname_ttl - int(time.monotonic() - started))\n", "")],
+    ),
+    (
+        "min-ttl-lifts-a-proven-unsigned-cut",
+        "0.3.0 PR review: the cache floor holds an unsigned delegation past the proof that it is unsigned",
+        [("            floor=not caps,\n", "")],
+    ),
+    (
+        "no-ds-proof-in-its-own-response-forgotten",
+        "0.3.0 PR review: a denial fetched by a DS query of its own does not bound the delegation's TTL",
+        [
+            (
+                """        if state is ValidationState.INSECURE:
+            self._note_unsigned(next_zone, records, ctx)
+""",
+                "",
+            )
+        ],
+    ),
+    (
+        "referral-denial-not-kept-for-the-cuts-below",
+        "0.3.0: delegations below an unsigned cut outlive the proof carried by the referral to it",
+        [
+            (
+                """        if child_state is ValidationState.INSECURE:
+            self._note_unsigned(child_zone, list(response.authority), ctx)
+""",
+                "",
+            )
+        ],
+    ),
+    (
+        "resumed-lookup-forgets-the-unsigned-proof",
+        "0.3.0: a lookup resumed at a cached unsigned cut caches what is below it for the NS TTL",
+        [
+            (
+                "                        ctx.unsigned_until[delegation.zone] = delegation.unsigned_until",
+                "                        pass",
+            )
+        ],
+    ),
+    (
+        "time-resolving-ns-names-not-counted",
+        "0.3.0 PR review: seconds spent on glueless NS names are added to what the DS allows",
+        [("        age = 0 if validated is None else int(now - validated)", "        age = 0")],
+    ),
+    (
+        "one-unreachable-server-condemns-its-family",
+        "0.3.0 PR review: 'network unreachable' for one server stops every server of its address family",
+        [
+            (
+                "if exc.errno in _FAMILY_ERRNOS and _family(server) not in ctx.reachable_families:",
+                "if exc.errno in _FAMILY_ERRNOS:",
+            )
+        ],
+    ),
+    (
+        "denial-outlives-the-records-proving-it",
+        "0.3.0 PR review: a denial's lifetime ignores the TTL its NSEC or NSEC3 records arrived with",
+        [
+            (
+                "        return min(caps + [int(rrset.ttl) for rrset in authority if rrset.rdtype in proving])",
+                "        return min(caps)",
             )
         ],
     ),

@@ -378,7 +378,11 @@ class DNSSECValidator:
             memo_key = (id(rrset), id(rrsig_rrset), exact_owner, tuple(id(v) for v in keys.values()))
             hit = budget.signature_memo.get(memo_key)
             if hit is not None:
-                return hit[-1]
+                found = hit[-1]
+                # One that has expired since it verified is looked for again:
+                # another signature over the same records may still stand.
+                if found is None or _serial_le(int(time.time()) & 0xFFFFFFFF, int(found.expiration)):
+                    return found
         found = self._find_valid_rrsig(rrset, rrsig_rrset, keys, now, budget, exact_owner)
         if memo_key is not None and budget is not None:
             budget.signature_memo[memo_key] = (rrset, rrsig_rrset, tuple(keys.values()), found)
@@ -485,15 +489,17 @@ class DNSSECValidator:
             only the unsupported key in a forged DNSKEY answer, and have the
             zone downgraded to unsigned.
         """
-        # Bound the DS x DNSKEY digest cross-product (KeyTrap).
-        candidate_ds = list(ds_rdataset)[:MAX_DS_PER_ZONE]
         usable_ds = [
-            ds for ds in candidate_ds if _digest_supported(ds.digest_type) and algorithm_supported(ds.algorithm)
+            ds for ds in ds_rdataset if _digest_supported(ds.digest_type) and algorithm_supported(ds.algorithm)
         ]
         # RFC 4509 §3: SHA-1 DS records are ignored when a stronger digest is
         # present, or a broken SHA-1 would be enough to stand in for the rest.
         if any(ds.digest_type != dns.dnssec.DSDigest.SHA1 for ds in usable_ds):
             usable_ds = [ds for ds in usable_ds if ds.digest_type != dns.dnssec.DSDigest.SHA1]
+        # Bound the DS x DNSKEY digest cross-product (KeyTrap). Only now: the
+        # order of an RRset is not signed, so capping first would let a prefix
+        # of records we cannot check hide the ones we can.
+        usable_ds = usable_ds[:MAX_DS_PER_ZONE]
         if not usable_ds:
             logger.debug("No DS for %s uses a digest and algorithm we support; treating the zone as unsigned", zone)
             return ValidationState.INSECURE, None

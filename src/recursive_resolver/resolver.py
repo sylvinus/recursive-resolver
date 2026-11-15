@@ -81,9 +81,10 @@ _RANDOM = secrets.SystemRandom()
 # here": retrying is pointless, so the server is abandoned immediately.
 _FATAL_ERRNOS = frozenset({errno.EHOSTUNREACH, errno.ENETUNREACH, errno.EAFNOSUPPORT, errno.EADDRNOTAVAIL})
 
-# The subset raised by the local stack before anything is sent, and which hold
-# for every address of the family: no route at all, no IPv6 configured. One is
-# enough to stop trying that family for the rest of the resolution.
+# The subset that can mean the whole family: no route at all, no IPv6
+# configured. One is enough to stop trying that family for the rest of the
+# resolution, unless a server of that family has answered in it: then the
+# failure is that destination's alone.
 _FAMILY_ERRNOS = frozenset({errno.ENETUNREACH, errno.EAFNOSUPPORT, errno.EADDRNOTAVAIL})
 
 # How many NS hostnames of a glueless delegation are resolved before the zone
@@ -226,6 +227,11 @@ class _Context:
     ns_addresses: dict[tuple[dns.name.Name, int], list[str] | None] = field(default_factory=dict)
     # Address families the local stack cannot send to at all.
     unreachable_families: set[int] = field(default_factory=set)
+    # Address families a server has answered from.
+    reachable_families: set[int] = field(default_factory=set)
+    # Cuts proven unsigned, and until when on the monotonic clock; see
+    # `_note_unsigned`.
+    unsigned_until: dict[dns.name.Name, float] = field(default_factory=dict)
     # (zone, server) pairs that answered that zone with an error rcode.
     failed_servers: set[tuple[dns.name.Name, str]] = field(default_factory=set)
     # DS lookups made while walking a chain of trust, by (zone, child).
@@ -518,7 +524,12 @@ class RecursiveResolver:
     def _normalize_qname(self, qname: str | dns.name.Name, rdtype: int) -> dns.name.Name:
         """Validate the query name, IDNA-encoding it and handling PTR reversal."""
         if isinstance(qname, dns.name.Name):
-            return qname if qname.is_absolute() else qname.concatenate(dns.name.root)
+            if qname.is_absolute():
+                return qname
+            try:
+                return qname.concatenate(dns.name.root)
+            except dns.name.NameTooLong as exc:
+                raise InvalidNameError(str(qname), "name exceeds 255 octets") from exc
         if not isinstance(qname, str) or not qname.strip():
             raise InvalidNameError(str(qname), "empty name")
         qname = qname.strip()
@@ -644,7 +655,7 @@ class RecursiveResolver:
         )
 
     def _starting_point(
-        self, qname: dns.name.Name, rdtype: dns.rdatatype.RdataType
+        self, qname: dns.name.Name, rdtype: dns.rdatatype.RdataType, ctx: _Context | None = None
     ) -> tuple[dns.name.Name, list[str], ValidationState, Any, list[dns.name.Name]]:
         """Pick where to begin: a cached delegation if we have one, else the root.
 
@@ -675,6 +686,9 @@ class RecursiveResolver:
                     if self.dnssec and state is ValidationState.SECURE and unprovable:
                         return dns.name.root, list(self._root_addresses), ValidationState.SECURE, None, []
                     names = [dns.name.from_text(n) for n in delegation.ns_names]
+                    if ctx is not None and delegation.unsigned_until is not None:
+                        # What is cached below this cut rests on the same proof.
+                        ctx.unsigned_until[delegation.zone] = delegation.unsigned_until
                     return delegation.zone, addresses, state, delegation.ds, names
         return dns.name.root, list(self._root_addresses), ValidationState.SECURE, None, []
 
@@ -732,7 +746,7 @@ class RecursiveResolver:
         """Core iterative resolution loop."""
         rdtype_text = dns.rdatatype.to_text(rdtype)
         current_zone, current_nameservers, chain_state, current_ds, cached_ns_names = self._starting_point(
-            qname, rdtype
+            qname, rdtype, ctx
         )
         # `current_nameservers` is pruned as servers fail, but DNSSEC key
         # fetches must keep talking to the zone's full server set: otherwise a
@@ -827,6 +841,7 @@ class RecursiveResolver:
                     current_ds,
                     ctx,
                 )
+                validated = time.monotonic()
                 ns_names: list[dns.name.Name] = classification["ns_names"]
                 pending_ns_names = [n for n in ns_names if not n.is_subdomain(child_zone)]
                 glue = self._select_glue(response, ns_names, current_zone, child_zone)
@@ -841,7 +856,7 @@ class RecursiveResolver:
                     raise ServfailError(
                         str(qname), rdtype_text, reason=f"no usable address for any nameserver of {child_zone}"
                     )
-                self._cache_delegation(child_zone, ns_names, glue, response, chain_state, current_ds)
+                self._cache_delegation(child_zone, ns_names, glue, response, chain_state, current_ds, ctx, validated)
                 current_zone = child_zone
                 current_nameservers = glue
                 zone_nameservers = list(glue)
@@ -1024,7 +1039,10 @@ class RecursiveResolver:
     ) -> Answer:
         """Resolve a CNAME's target and present the result as the answer for ``qname``."""
         self._check_cname_chain(qname, target, cname_chain)
+        started = time.monotonic()
         answer = self._resolve_iterative(target, rdtype, ctx, depth + 1, [*cname_chain, qname])
+        # The CNAME has aged while its target was being resolved.
+        cname_ttl = max(0, cname_ttl - int(time.monotonic() - started))
         return Answer(
             qname=qname,
             canonical_name=answer.canonical_name,
@@ -1402,7 +1420,15 @@ class RecursiveResolver:
         response: dns.message.Message,
         state: ValidationState,
         ds: dns.rdataset.Rdataset | None = None,
+        ctx: _Context | None = None,
+        validated: float | None = None,
     ) -> None:
+        """Cache a zone cut with the DNSSEC verdict reached on it.
+
+        ``validated`` is when that verdict was reached, on the monotonic clock:
+        resolving the NS names of a glueless referral can take seconds, and
+        they come off what the verdict's proof allows.
+        """
         if self.cache is None or not addresses:
             return
         ttl = 0
@@ -1427,12 +1453,21 @@ class RecursiveResolver:
         # The DNSSEC verdict cached with the cut must not outlive what proved
         # it: the DS's signature for a signed child, the denial's for an
         # unsigned one (RFC 4035 §5.3.3).
+        now = time.monotonic()
+        age = 0 if validated is None else int(now - validated)
+        caps: list[int] = []
         if ds is not None:
-            ttl = min(ttl, int(ds.ttl))
+            caps.append(int(ds.ttl) - age)
         elif state is ValidationState.INSECURE:
             proof_ttl = self._denial_ttl_cap(list(response.authority))
             if proof_ttl is not None:
-                ttl = min(ttl, proof_ttl)
+                caps.append(proof_ttl - age)
+            if ctx is not None:
+                # A denial this referral shows nothing of: it came in a DS
+                # response of its own, or it is for a cut above this one.
+                caps += [int(until - now) for cut, until in ctx.unsigned_until.items() if zone.is_subdomain(cut)]
+        if caps:
+            ttl = min(ttl, *caps)
         if ttl <= 0:
             return
         self.cache.put_delegation(
@@ -1442,8 +1477,12 @@ class RecursiveResolver:
                 ns_names=[str(n) for n in ns_names],
                 secure=state is ValidationState.SECURE,
                 ds=ds,
+                unsigned_until=now + min(caps) if caps and ds is None else None,
             ),
             ttl=ttl,
+            # A TTL a proof has capped is not lifted back up, for an unsigned
+            # cut any more than for a signed one.
+            floor=not caps,
         )
 
     # ── glueless NS resolution ──────────────────────────────────────────
@@ -1819,11 +1858,24 @@ class RecursiveResolver:
         records = list(response.answer) + list(response.authority)
         keyring = keys.as_keyring()
         state, next_ds = self._validator.validate_ds(next_zone, records, keyring, budget=ctx.budget)
+        if state is ValidationState.INSECURE:
+            self._note_unsigned(next_zone, records, ctx)
         if state is ValidationState.BOGUS and self._validator.prove_no_delegation(
             next_zone, records, keyring, budget=ctx.budget
         ):
             return state, None, False
         return state, next_ds, True
+
+    def _note_unsigned(self, zone: dns.name.Name, records: list[dns.rrset.RRset], ctx: _Context) -> None:
+        """Keep until when ``records`` prove ``zone`` unsigned.
+
+        Delegations at and below the cut are cached on that verdict, most of
+        them from referrals that carry none of these records, and must not
+        outlive it (RFC 4035 §5.3.3). See `_cache_delegation`.
+        """
+        proof_ttl = self._denial_ttl_cap(records)
+        if proof_ttl is not None:
+            ctx.unsigned_until[zone] = time.monotonic() + proof_ttl
 
     def _referred_servers(
         self, rejected: list[dns.message.Message], zone: dns.name.Name, bailiwick: dns.name.Name
@@ -1974,6 +2026,8 @@ class RecursiveResolver:
             raise DNSSECValidationError(
                 str(child_zone), "DS", f"delegation from {parent_zone} is neither signed nor provably unsigned"
             )
+        if child_state is ValidationState.INSECURE:
+            self._note_unsigned(child_zone, list(response.authority), ctx)
         return child_state, ds
 
     def _validate_answer(
@@ -2183,18 +2237,22 @@ class RecursiveResolver:
         is served as proven for as long as ``max_negative_ttl`` allows.
 
         The minimum is taken over every RRSIG in the authority section rather
-        than the one that verified, which the prover does not report back. That
-        can only shorten the lifetime, never extend it.
+        than the one that verified, which the prover does not report back, and
+        over the TTL of every record such a signature can cover. That can only
+        shorten the lifetime, never extend it.
         """
         now = int(time.time())
+        proving = (dns.rdatatype.NSEC, dns.rdatatype.NSEC3, dns.rdatatype.SOA)
         caps = [
             min(int(rrset.ttl), int(sig.original_ttl), max(0, int(sig.expiration) - now))
             for rrset in authority
             if rrset.rdtype == dns.rdatatype.RRSIG
             for sig in rrset
-            if sig.type_covered in (dns.rdatatype.NSEC, dns.rdatatype.NSEC3, dns.rdatatype.SOA)
+            if sig.type_covered in proving
         ]
-        return min(caps) if caps else None
+        if not caps:
+            return None
+        return min(caps + [int(rrset.ttl) for rrset in authority if rrset.rdtype in proving])
 
     def _proven_denial(
         self,
@@ -2415,7 +2473,7 @@ class RecursiveResolver:
                     abandoned.add(server)
                     if exc.errno in _FATAL_ERRNOS:
                         unreachable.add(server)
-                    if exc.errno in _FAMILY_ERRNOS:
+                    if exc.errno in _FAMILY_ERRNOS and _family(server) not in ctx.reachable_families:
                         # Nothing was sent, so nothing is charged, and no other
                         # address of this family is tried for the rest of the
                         # resolution: on a host without IPv6 every AAAA-derived
@@ -2435,6 +2493,7 @@ class RecursiveResolver:
                         abandoned.add(server)
                     continue
 
+                ctx.reachable_families.add(_family(server))
                 rcode = response.rcode()
                 if payload is not None and rcode in _EDNS_UNSUPPORTED_RCODES:
                     # FORMERR / NOTIMP / SERVFAIL / BADVERS are all emitted by
@@ -2524,6 +2583,9 @@ class RecursiveResolver:
                     ignore_unexpected=True,
                 )
             except dns.message.Truncated as exc:
+                # An answer all the same: whatever TCP runs into next, the
+                # family is not what is unreachable.
+                ctx.reachable_families.add(_family(server))
                 if not self.use_tcp_fallback:
                     raise _RetryableError("truncated response and TCP fallback is disabled") from exc
                 # What is left of the whole call's deadline, not a fresh
