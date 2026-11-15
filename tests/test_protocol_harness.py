@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 from audit import Fetch, Ledger, audited  # noqa: E402
 from cassette import apply_fault, outcome_of, transition_allowed  # noqa: E402
+from mutation_check import PYTEST_EXIT_CODES, copy_package, run, unit_command  # noqa: E402
 from verdict_harness import (  # noqa: E402
     BOGUS,
     FAILED,
@@ -349,3 +350,17 @@ class TestALeakedExceptionFailsTheRun:
         panel = {"ref0": "servfail", "ref1": "servfail", "ref2": "servfail"}
         assert compare(Outcome(LEAKED, ""), panel) == ""
         assert gates_release("we-leaked-a-non-resolver-error")
+
+
+class TestTheMutationCheckCanTellMutantsApart:
+    """A suite that cannot start in the copy reads as every mutant caught.
+
+    Under -x pytest exits 1 for a module it cannot import, the same as for a
+    failed test. One such module had the whole catalogue reported as caught by
+    the unit suite, a comment-only change included.
+    """
+
+    def test_the_copied_suite_collects(self, tmp_path: Path) -> None:
+        copy_package(tmp_path)
+        command = [*unit_command(sys.executable, tmp_path), "--collect-only"]
+        assert run(command, tmp_path, tmp_path, expected=PYTEST_EXIT_CODES)

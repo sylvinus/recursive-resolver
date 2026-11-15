@@ -25,6 +25,9 @@ host.
 pip install recursive-resolver
 ```
 
+Requires Python 3.11 or later and dnspython 2.9.2 or later (see
+[Security](#security) for why).
+
 ## Quick start
 
 ```python
@@ -53,7 +56,7 @@ split**. RFC 6376 (DKIM) and RFC 7208 (SPF) both require the chunks to be joined
 with no separator; DNS presentation format renders them as `"chunk1" "chunk2"`.
 Code that strips the quotes naively corrupts the value. An RSA-2048 DKIM key
 does not fit in one chunk, and publishers may split it at any boundary they
-like, into two chunks or more — so the invariant to hold on to is
+like, into two chunks or more, so the invariant to hold on to is
 concatenation with no separator. This is the difference between a key that
 verifies and one that never does.
 
@@ -78,6 +81,7 @@ Validation is **on by default** and chains from the IANA root trust anchors
 | `SECURE` | Signed and validated back to the root | Returned |
 | `INSECURE` | Provably unsigned (an ancestor proved no DS exists), signed only with an algorithm this build cannot verify, or proven only by an opt-out NSEC3 or an iteration count this build will not compute | Returned |
 | `BOGUS` | Claims to be signed but does not validate | **`DNSSECValidationError`** |
+| `DISABLED` | The resolver was built with `dnssec=False`: nothing was checked | Returned |
 
 Only `BOGUS` is an error: most of the internet is legitimately unsigned, so
 rejecting `INSECURE` would reject the majority of domains. A zone signed with
@@ -97,7 +101,7 @@ policy and an SSHFP fingerprint are all trust decisions delegated to DNS, so
 whoever can spoof the response picks the answer. DNSSEC closes that hole **for
 signed zones whose answers validate**. It cannot close it for an unsigned zone,
 and the default `RecursiveResolver()` returns those answers as `INSECURE`
-rather than refusing them — so if a credential's zone must be signed for you to
+rather than refusing them. So if a credential's zone must be signed for you to
 trust the value, say so with `require_dnssec=True` and handle the error.
 
 DNSSEC needs the `cryptography` package, which ships as part of the default
@@ -123,7 +127,7 @@ Zone cuts (root -> `com` -> `example.com`) are cached separately from answers.
 every upstream cache miss begins with a query to a root server, which at any
 real volume is abusive to the root operators and will get you rate-limited.
 (Answer and negative hits still short-circuit, so this is not literally every
-call — but it is every call that has to go out on the wire.)
+call, but it is every call that has to go out on the wire.)
 
 **When freshness matters**, such as key rotation or GSLB failover, keep
 delegations cached but not answers:
@@ -140,6 +144,9 @@ resolver = RecursiveResolver(max_delegation_cache_depth=1)
 
 Concurrent lookups of the same name are collapsed into a single walk, so a
 thread pool hammering one domain does not produce N independent query storms.
+A lookup that fails with a server failure or a DNSSEC error is remembered for 5
+seconds (RFC 9520), so callers retrying a broken name do not each repeat the
+whole walk.
 
 ## Security
 
@@ -157,10 +164,11 @@ exactly what happens when you verify DKIM on inbound mail.
 - **Query budget.** A shared per-resolution budget bounds total queries (64), failed NS-hostname lookups (5), referrals followed (130) and NS names chased per referral (13, randomly sampled). This is the NXNSAttack / Non-Responsive-Delegation control (CVE-2020-8616, CVE-2020-12662, CVE-2022-3204); without it a hostile zone can provoke tens of thousands of upstream queries from one call.
 - **Strict downward progress.** A referral must name a zone *strictly* below the one queried, and the qname must lie at or below it. Sideways and upward referrals are rejected rather than followed in circles.
 - **Bailiwick from the query, not the response.** Glue is judged against the zone we asked, never against a zone name the responder supplied.
-- **AA required**, answers matched on class as well as type, `NXDOMAIN`-carrying-answers rejected, truncated responses never treated as complete.
-- **EDNS payload 1232** (DNS Flag Day 2020), with a downgrade ladder to 512 and then to plain DNS, so a broken-PMTU path does not silently blackhole large responses.
-- **KeyTrap hardening** (CVE-2023-50387 / CVE-2023-50868). A zone publishing many DNSKEYs and RRSIGs that collide on key tag can force quadratic signature verification. At most 2 keys and 2 signatures per (tag, algorithm) are tried, at most 8 signatures per RRset, and the whole resolution is bounded to 96 signature verifications and 600 NSEC3 hashes. NSEC3 iteration counts above 100 are refused.
+- **AA required** on answers, on CNAME and DNAME redirections and on negative answers. Answers are matched on class as well as type, `NXDOMAIN`-carrying-answers are rejected, and a truncated response is never treated as complete, over UDP or TCP.
+- **EDNS payload 1232** (DNS Flag Day 2020), with a downgrade ladder to 512 and then to plain DNS, so a broken-PMTU path does not silently blackhole large responses. The plain-DNS rung is skipped while the chain of trust is secure, because an answer without the DO bit cannot be validated; below an unsigned delegation it is used.
+- **KeyTrap hardening** (CVE-2023-50387 / CVE-2023-50868). A zone publishing many DNSKEYs and RRSIGs that collide on key tag can force quadratic signature verification. At most 2 keys and 2 signatures per (tag, algorithm) are tried, at most 8 signatures per RRset, and the whole resolution is bounded to 96 signature verifications and 600 NSEC3 hashes. NSEC3 iteration counts above 100 are not computed: the proof is downgraded to insecure, as RFC 9276 §3.2 allows and the major implementations do.
 - **IDNA 2008.** IDNA 2003 maps `ß` to `ss`, which would resolve `straße.de` as the entirely different, separately registrable `strasse.de`.
+- **dnspython 2.9.2 or later.** Every response this library parses comes from a nameserver picked by whoever owns the domain being resolved, so a parsing bug in dnspython is reachable by anyone who registers a domain. dnspython before 2.9.0 lets a crafted message with a long chain of compression pointers burn excessive CPU while decoding names ([CVE-2026-114605](https://github.com/rthalley/dnspython/security/advisories/GHSA-45c3-73f7-pv4m)). 2.9.1 tightens DNSSEC validation, and 2.9.2 fixes [CVE-2026-128089](https://github.com/rthalley/dnspython/security/advisories/GHSA-vvf4-9x63-8xvv), which does not affect this library but would make dependency scanners flag it. dnspython 2.9 dropped Python 3.10, so this library did too.
 
 See [SECURITY.md](https://github.com/sylvinus/recursive-resolver/blob/main/SECURITY.md) for the threat model and reporting process.
 
@@ -203,22 +211,32 @@ $ recursive-resolver cloudflare.com A 2>/dev/null   # just the values
 resolver.resolve(name, rdtype)         # -> list[str]      presentation format
 resolver.resolve_rrset(name, rdtype)   # -> dns.rrset.RRset  raw rdata
 resolver.resolve_answer(name, rdtype)  # -> Answer         records + DNSSEC state
-resolver.trace_answer(name, rdtype)    # -> (Answer | None, list[TraceStep])
+resolver.trace_answer(name, rdtype)    # -> (Answer | None, Trace)
 ```
+
+`name` may be a string or a `dns.name.Name`, and `rdtype` a string or a
+`dns.rdatatype.RdataType`. A `Trace` is a list of `TraceStep`; when resolution
+failed, its `error` attribute holds the exception. `Answer.cname_chain` lists
+the names that were redirected, in order.
 
 `RecursiveResolver` is thread-safe; share one instance across a thread pool to
 get the benefit of the shared cache and query deduplication.
 
 ### Exceptions
 
-Every failure is a `ResolverError`. Nothing from dnspython escapes.
+Every resolution failure is a `ResolverError`, and nothing from dnspython
+escapes. (Invalid constructor arguments raise `ValueError`, before anything is
+resolved.) An error's `qname` is the name being resolved when it happened, which
+can be a CNAME target or a nameserver hostname; `query_name` and `query_type`
+are what was passed to `resolve()`. Every error can be pickled, so they cross
+process pools and task queues intact.
 
 | Exception | Raised when |
 |---|---|
 | `NXDOMAINError` | The name does not exist |
 | `NoAnswerError` | The name exists but has no records of that type |
 | `CNAMELoopError` | A CNAME loop or over-long chain |
-| `ServfailError` | Every nameserver returned an error |
+| `ServfailError` | No nameserver could answer: error responses, servers refusing the zone, or none reachable |
 | `ResolutionTimeoutError` | Nameservers timed out, or the deadline elapsed |
 | `MaxDepthError` | Delegation depth exceeded |
 | `InvalidNameError` | Malformed name (bad label, too long, IDNA failure) |
@@ -234,6 +252,8 @@ that treats `DNSSECError` as "refuse to proceed" keeps working unchanged.
 
 ## Configuration
 
+Every argument is keyword-only, and out-of-range values raise `ValueError`.
+
 ```python
 RecursiveResolver(
     timeout=2.0,                  # per-query timeout
@@ -245,7 +265,7 @@ RecursiveResolver(
     edns_payload=1232,
     dnssec=True,
     require_dnssec=False,
-    require_authoritative=True,   # demand the AA bit
+    require_authoritative=True,   # demand the AA bit on answers, redirections and denials
     ipv4_only=True,
     use_tcp_fallback=True,
     allow_private_addresses=False,
@@ -283,14 +303,14 @@ against a measured legitimate name that needs the headroom.
 1. **Start at the root** (or at the deepest cached delegation) using hardcoded root hints.
 2. **Query with RD=0** so servers answer only from their own authority.
 3. **Follow referrals downward**, verifying at each step that the delegation descends and stays in bailiwick.
-4. **Resolve glueless NS hostnames** when a referral carries no usable glue, under the shared budget.
+4. **Resolve glueless NS hostnames** when a referral carries no usable glue, two at a time and only as many as needed, under the shared budget.
 5. **Validate DNSSEC** at every zone cut: DS against the parent's keys, DNSKEY against the DS, answers against the DNSKEY, and NSEC/NSEC3 proofs for negative answers.
-6. **Chase CNAMEs**, using target records already present in the response when the server supplied them, and perform the CNAME synthesis a DNAME implies (RFC 6672) when the server did not.
-7. **Cache** answers, negatives (NXDOMAIN by name per RFC 2308/8020) and delegations, with TTLs from the wire and negative TTLs from the SOA.
+6. **Chase CNAMEs**, using target records already present in the response when the server supplied them. Under a DNAME, the CNAME is always synthesised from the DNAME itself (RFC 6672), never taken from the server.
+7. **Cache** answers, negatives and delegations, with TTLs from the wire and negative TTLs from the SOA, and authenticated data, keys included, held no longer than its signature. NXDOMAIN is cached by name (RFC 2308); an authenticated one also covers every name below it (RFC 8020).
 
 ## Testing
 
-The suite is 723 tests at 100% statement and branch coverage: 686 unit tests
+The suite is 881 tests at 100% statement and branch coverage: 844 unit tests
 with mocked DNS and 37 integration tests against live DNS, including
 deliberately-bogus DNSSEC test domains (`dnssec-failed.org`, `rhybar.cz`,
 `bogus.nlnetlabs.nl`) that must be rejected, and real DKIM selectors that must

@@ -19,24 +19,29 @@ This library is designed to be pointed at domain names chosen by an attacker. Th
 | Attack | Control |
 |---|---|
 | **DNS-driven SSRF**: glue pointing at `127.0.0.1`, RFC1918, or `169.254.169.254` to probe internal networks or a cloud metadata endpoint | Every candidate nameserver address must be globally routable and none of loopback, link-local, multicast, reserved or private, per the IANA special-purpose registries as tracked by Python's `ipaddress`. A short explicit list adds ranges classification does not refuse, or did not always refuse: Azure's `168.63.129.16`, 6to4 relay anycast, ORCHIDv2, deprecated site-local, and the IPv6 transition prefixes that carry an IPv4 address inside them (6to4, Teredo, NAT64, IPv4-compatible). CVE-2024-4032 changed how the standard library classifies several of those prefixes; the others a current stdlib already refuses, and are listed as explicit policy so the control behaves the same on every supported Python. IPv4-mapped IPv6 is unwrapped first so it cannot bypass the v4 rules |
-| **NXNSAttack / Non-Responsive Delegation amplification** (CVE-2020-8616, CVE-2020-12662, CVE-2022-3204): a zone that answers every query with a glueless referral to many fresh NS names, using the resolver as a DDoS amplifier | A budget shared across the whole resolution and all sub-resolutions: 64 queries, 5 failed NS targets, 130 referrals, 13 NS names per referral (randomly sampled, not a prefix) |
+| **NXNSAttack / Non-Responsive Delegation amplification** (CVE-2020-8616, CVE-2020-12662, CVE-2022-3204): a zone that answers every query with a glueless referral to many fresh NS names, using the resolver as a DDoS amplifier | A budget shared across the whole resolution and all sub-resolutions: 64 queries, 5 failed NS targets, 130 referrals, 13 NS names per referral (randomly sampled, not a prefix). NS names are resolved two at a time, only as far as needed |
+| **Lame-zone amplification**: a zone whose servers all refuse or fail, used to aim queries at them | A server that refused a zone is not asked about it again in the same resolution, NS names inside the failing zone are never re-resolved through it, and a SERVFAIL sweep costs one query per server |
 | **Referral loops and lame delegation** | A referral must name a zone strictly below the zone queried; sideways and upward referrals are rejected |
 | **Cache poisoning via out-of-bailiwick glue** | Bailiwick is evaluated against the zone we queried, never against a zone name supplied in the response |
-| **Answer injection** | Answers are matched on owner name, type *and* class, must carry the AA bit, and `NXDOMAIN` responses carrying answer records are rejected |
+| **Answer injection** | Answers are matched on owner name, type *and* class, must carry the AA bit (CNAME and DNAME redirections too), and `NXDOMAIN` responses carrying answer records are rejected |
 | **Off-path spoofing** | dnspython validates the source address, query ID and question section; DNSSEC validation provides cryptographic assurance where the zone is signed |
+| **Query abort by a junk packet**: a datagram with a wrong ID, a mangled body, or from another address, sent to our ephemeral port | Ignored while the real answer is awaited, rather than ending the query |
 | **EDNS downgrade by a spoofed packet** | Unmatched or unparseable responses do not trigger an EDNS downgrade or retire a nameserver |
 | **IP fragmentation attacks** | EDNS payload defaults to 1232 (DNS Flag Day 2020) rather than 4096 |
-| **Truncation-based data loss** | A truncated response is never treated as complete, on any code path |
-| **Random-subdomain (water torture) floods** | NXDOMAIN is cached by name and suppresses everything below it (RFC 8020) |
+| **Truncation-based data loss** | A truncated response is never treated as complete, on any code path, TCP included |
+| **Random-subdomain (water torture) floods** | NXDOMAIN is cached by name, and an authenticated one suppresses everything below it (RFC 8020). An unproven one covers only its own name, so one spoofed packet cannot hide a subtree such as `_domainkey.example.` |
+| **Retry storms against a broken name** | A server failure or DNSSEC failure is remembered for 5 seconds (RFC 9520) |
 | **IDN homograph confusion** | IDNA 2008 is used, so `straße.de` is not silently resolved as `strasse.de` |
 | **KeyTrap** (CVE-2023-50387, CVE-2023-50868): colliding key tags forcing quadratic signature verification | At most 2 keys and 2 signatures per (tag, algorithm), 8 signatures per RRset, 8 DS records per zone; per-resolution budget of 96 signature verifications and 600 NSEC3 hashes |
 | **NSEC3 CPU exhaustion** | NSEC3 iteration counts above 100 are not computed. The proof is downgraded to insecure rather than refused, which is what the major implementations do (RFC 9276 §3.2 permits either) |
 | **Signature forgery by a zone that owns one** | An RRSIG counts only if the zone it names as signer contains the RRset it covers (RFC 4035 §5.3.1), and only a key the parent's DS matched authenticates the DNSKEY RRset (§5.2). A revoked key is never used (RFC 5011 §2.1) |
-| **Forged denial of existence** | A denial must come from the zone holding the name, not the parent side of its cut (RFC 6840 §4.1, RFC 5155 §8.3); only the wildcard at the closest encloser can have answered; an opt-out cover proves a missing DS and nothing else |
-| **Decisions taken from attacker-ordered data** | An RRSIG RRset may carry several rdata, only one of which verified. Every check reads the signature that validated; the signing zone comes from the keyring, never the wire |
-| **Authenticated data outliving its signature** | A validated RRset's cache TTL is capped by the time left on its RRSIG (RFC 4035 §5.3.3) |
+| **Forged denial of existence** | A denial must come from the zone holding the name, not the parent side of its cut (RFC 6840 §4.1, RFC 5155 §8.3); only the wildcard at the closest encloser can have answered; an opt-out cover proves a missing DS and nothing else; a denial record counts only with a signature made for its own owner name, so a wildcard's NSEC cannot be replayed under another |
+| **Redirection forged beside a signed DNAME** | The CNAME a DNAME implies is synthesised from the DNAME (RFC 6672 §3.4); whatever CNAME the server sent with it is ignored |
+| **Decisions taken from attacker-ordered data** | An RRSIG RRset may carry several rdata, only one of which verified. Every check reads the signature that validated; the signing zone comes from the keyring, never the wire. Where an RRSIG's signer field picks which zone to walk the chain of trust down to, it must contain the name being judged, so it cannot point at an unrelated unsigned delegation |
+| **Downgrade by algorithm** | Whether a zone is unverifiable is read off the signed DS RRset, never off the DNSKEY RRset served alongside it; a SHA-1 DS is ignored when a stronger one is present (RFC 4509 §3) |
+| **Authenticated data outliving its signature** | A validated RRset's cache TTL, and that of the DNSKEY and DS records it rests on, is capped by the time left on the signature (RFC 4035 §5.3.3) |
 | **One broken nameserver condemning a zone** | Validation material and unproven denials are re-sought from the zone's other nameservers before any BOGUS verdict (RFC 4035 §5.5), with no relaxation of what is then checked |
-| **Unbounded resolution time** | A hard wall-clock deadline applies to the whole call, including all sub-resolutions |
+| **Unbounded resolution time** | A hard wall-clock deadline applies to the whole call, including all sub-resolutions, TCP retries and time spent waiting on an identical concurrent call |
 
 ### What is not defended against
 
@@ -44,7 +49,7 @@ This library is designed to be pointed at domain names chosen by an attacker. Th
 - **Traffic analysis.** QNAME minimisation (RFC 9156) is not implemented, so the full query name is visible to root and TLD servers.
 - **Resource exhaustion from your own call volume.** The budget bounds a single `resolve()`; rate-limiting your callers is your responsibility.
 - **DNS rebinding.** The address filter applies to nameserver addresses, not to answers: a zone may legitimately publish `A 127.0.0.1` for its own name, and this library returns it, as other implementations do. Filter the addresses you get back before connecting to them.
-- **An unsigned answer from a zone whose other nameservers serve it signed.** RFC 4035 §5.5 says to try another server before concluding an answer is forged. Denials do this; answers do not, because the retry would have to replace the returned RRset. Such a zone yields an intermittent `DNSSECValidationError`.
+- **A zone with several servers serving a stale unsigned copy.** RFC 4035 §5.5 says to try another server before concluding a response is forged. A response with no signature at all is retried on one sibling; if that sibling is stale too, the response is judged as it stands, and such a zone yields an intermittent `DNSSECValidationError`.
 - **Malicious `allow_private_addresses=True`.** That flag disables the SSRF control by design. Only enable it for split-horizon DNS you fully control.
 
 ## Supported versions
@@ -55,4 +60,12 @@ Security fixes are applied to the latest released version. Given the pre-1.0 sta
 
 The only runtime dependency is `dnspython` (ISC licence), with its `dnssec` extra pulling in `cryptography` and its `idna` extra pulling in `idna`.
 
-The floor is `dnspython>=2.8.0`. Versions below 2.6.1 are affected by [CVE-2023-29483](https://nvd.nist.gov/vuln/detail/CVE-2023-29483) ("TuDoor"), and 2.6.0 additionally regressed truncation handling in a way that breaks UDP→TCP failover.
+The floor is `dnspython>=2.9.2`, which requires Python 3.11 or later. Earlier releases are affected by:
+
+- [CVE-2026-114605](https://github.com/rthalley/dnspython/security/advisories/GHSA-45c3-73f7-pv4m) (fixed in 2.9.0): a crafted DNS message with a long chain of compression pointers makes name decoding consume excessive CPU. This applies directly to this library: every response we parse comes from an authoritative server chosen by whoever owns the domain being resolved.
+- [CVE-2026-128089](https://github.com/rthalley/dnspython/security/advisories/GHSA-vvf4-9x63-8xvv) (fixed in 2.9.2): a crafted WKS record in a zone file consumes excessive memory and CPU. This library does not read zone files, but the floor includes it so dependency scanners do not flag installs.
+- [CVE-2023-29483](https://nvd.nist.gov/vuln/detail/CVE-2023-29483) ("TuDoor", fixed in 2.6.1); 2.6.0 also regressed truncation handling in a way that breaks UDP→TCP failover.
+
+2.9.1 also tightened DNSSEC validation (RRSIG type covered and class checked against the RRset, revoked keys refused, ECDSA and DSA signature lengths enforced). This library already refused revoked keys on its own; the other checks are new protection.
+
+The `dnssec` extra requires `cryptography>=50`, the version dnspython 2.9 needs to enable DNSSEC at all.

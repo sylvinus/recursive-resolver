@@ -16,27 +16,35 @@ establishes one of three states, following RFC 4035:
 
 Only ``BOGUS`` is an error. Treating ``INSECURE`` as an error would reject the
 majority of the internet, so that is opt-in via ``require_dnssec=True``.
+
+A fourth value, ``DISABLED``, only ever appears on an answer from a resolver
+built with ``dnssec=False``: nothing was checked, which is not the same as a
+zone proven to be unsigned.
 """
 
 from __future__ import annotations
 
 import base64
+import functools
 import logging
 import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+import dns._features
 import dns.dnssec
+import dns.dnssecalgs
 import dns.exception
 import dns.name
 import dns.rdata
 import dns.rdataclass
 import dns.rdataset
 import dns.rdatatype
+import dns.rdtypes.ANY.DNSKEY
 import dns.rrset
-from dns.rdtypes.ANY.NSEC3 import b32_normal_to_hex
 
+from .budget import QueryBudget
 from .roots import ROOT_TRUST_ANCHORS
 
 logger = logging.getLogger(__name__)
@@ -61,9 +69,10 @@ def _serial_le(first: int, second: int) -> bool:
     return ((second - first) & 0xFFFFFFFF) < 0x80000000
 
 
-# Reject absurd NSEC3 iteration counts outright rather than burning CPU on
-# them. RFC 9276 requires zones to publish 0; .com/.net/.org already do, and
-# common ccTLDs stay in single digits, so 100 rejects only abuse.
+# NSEC3 iteration counts above this are not computed, and a proof that needs
+# them is downgraded to insecure (see `nsec3_beyond_our_limits`). RFC 9276
+# requires zones to publish 0; .com/.net/.org already do, and common ccTLDs
+# stay in single digits, so 100 only affects legacy or abusive zones.
 MAX_NSEC3_ITERATIONS = 100
 
 # KeyTrap (CVE-2023-50387) hardening. The attack publishes many DNSKEYs and
@@ -82,30 +91,85 @@ class ValidationState(Enum):
     SECURE = "secure"
     INSECURE = "insecure"
     BOGUS = "bogus"
+    DISABLED = "disabled"
+
+
+# A keyring as dnspython takes it: zone name to its DNSKEY RRset.
+Keyring = dict[dns.name.Name, Any]
+
+# RSA/SHA-1, as algorithm 5 (RSASHA1) and 7 (RSASHA1-NSEC3-SHA1) use it.
+_SHA1_ALGORITHMS = frozenset({dns.dnssec.Algorithm.RSASHA1, dns.dnssec.Algorithm.RSASHA1NSEC3SHA1})
+
+# A genuine RSASHA1 signature over a fixed TXT record, used to find out whether
+# this host can verify SHA-1 signatures at all. Some OpenSSL builds refuse them
+# by system policy (the RHEL 9 family's DEFAULT crypto policy), and there every
+# algorithm 5 or 7 zone would otherwise come back BOGUS instead of unverifiable.
+_SHA1_PROBE_KEY = (
+    "256 3 5 AwEAAbmJBwh4SN/px/sB4gzktlXuHdWaAcI7J6bbAtjdZxsaR6AUv69JvFqkd0iYPnmmll5cD4Rngjkkvs9O3rjN"
+    "iOqZrEOBql7QajydhKb8DEuorXy1kgKHS8j2j3cVyLrCN760vu2HS+8sx6oWQOO7wQhui5fKrZ64c3/qJTuC6zzT"
+)
+_SHA1_PROBE_SIG = (
+    "TXT 5 1 0 20380119031408 19700101000001 39625 probe. ARENLr/1NcnY1lLP2yH/sTGLsGVaBEDflH+vJV2L3xx"
+    "iEyKVgXPPv4UBemzZbXUwP2K8FBoRSW8u9ElQSX6xBxnIxPCUlX7xkrHohTHEUK5xnZ5jTeeidjCHXvWFLGYcFjYyFoh+tDi"
+    "hHv0k/aEJX3dwr213rhP/9qpXGf8NChg="
+)
+
+
+@functools.cache
+def _sha1_signatures_verify() -> bool:
+    """Can this host verify an RSA/SHA-1 signature? Checked once per process."""
+    owner = dns.name.from_text("probe.")
+    rrset = dns.rrset.from_text(owner, 0, "IN", "TXT", '"sha1"')
+    key = dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.DNSKEY, _SHA1_PROBE_KEY)
+    sig: Any = dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.RRSIG, _SHA1_PROBE_SIG)
+    try:
+        dns.dnssec.validate_rrsig(rrset, sig, {owner: dns.rrset.from_rdata(owner, 0, key)}, now=100)
+    except Exception as exc:
+        logger.warning(
+            "RSA/SHA-1 signatures cannot be verified here (%s); algorithms 5 and 7 count as unsupported", exc
+        )
+        return False
+    return True
 
 
 def algorithm_supported(algorithm: int) -> bool:
     """True if signatures made with this DNSSEC algorithm can be verified here.
 
     Which algorithms work depends on the installed dnspython and cryptography,
-    so this is a property of the build rather than a fixed list. A zone signed
-    only with an algorithm we lack is unverifiable, which RFC 4035 §5.2 says to
-    treat as unsigned rather than as an attack.
+    on dnspython's validation policy (which refuses the algorithms RFC 8624
+    says must not be validated), and on whether the host's crypto library
+    allows SHA-1. A zone signed only with an algorithm we cannot verify is
+    unverifiable, which RFC 4035 §5.2 says to treat as unsigned rather than as
+    an attack.
     """
     try:
-        dns.dnssec.get_algorithm_cls(algorithm)
+        dns.dnssecalgs.get_algorithm_cls(algorithm)
     except Exception:
         return False
-    return True
+    probe = dns.rdtypes.ANY.DNSKEY.DNSKEY(dns.rdataclass.IN, dns.rdatatype.DNSKEY, FLAG_ZONE_KEY, 3, algorithm, b"")
+    if not dns.dnssec.default_policy.ok_to_validate(probe):
+        return False
+    return algorithm not in _SHA1_ALGORITHMS or _sha1_signatures_verify()
+
+
+def _digest_supported(digest_type: int) -> bool:
+    """True if this build can compute and is allowed to check a DS digest type."""
+    if digest_type not in _DS_DIGESTS:
+        return False
+    return dns.dnssec.default_policy.ok_to_validate_ds(dns.dnssec.DSDigest(digest_type))
+
+
+_DS_DIGESTS = frozenset({dns.dnssec.DSDigest.SHA1, dns.dnssec.DSDigest.SHA256, dns.dnssec.DSDigest.SHA384})
 
 
 def cryptography_available() -> bool:
-    """True if the optional `cryptography` dependency is importable."""
-    try:
-        import cryptography  # noqa: F401
-    except ImportError:
-        return False
-    return True
+    """True if dnspython can do DNSSEC here.
+
+    dnspython enables its DNSSEC code only when `cryptography` is installed
+    *and* recent enough, so importability alone is not the test: an older
+    `cryptography` would let the resolver start and then fail every lookup.
+    """
+    return dns._features.have("dnssec")
 
 
 def _types_in_bitmap(rdata: Any) -> set[int]:
@@ -136,7 +200,29 @@ def _rrset_of(rrsets: list[dns.rrset.RRset], name: dns.name.Name, rdtype: int) -
     return None
 
 
-def _trim_keyring(keys: dict[dns.name.Name, Any]) -> dict[dns.name.Name, Any]:
+def _owner_labels(name: dns.name.Name) -> int:
+    """The RRSIG Labels value for data owned by ``name`` itself (RFC 4034 §3.1.3).
+
+    The root label is not counted, nor is a leading ``*``.
+    """
+    return len(name.labels) - 1 - (1 if name.is_wild() else 0)
+
+
+def authenticated_ttl(rrset: dns.rrset.RRset, rrsig_rrset: dns.rrset.RRset, signature: Any) -> int:
+    """How long validated data may be cached (RFC 4035 §5.3.3).
+
+    No longer than the RRset's TTL, the RRSIG's TTL, the signature's Original
+    TTL, or the time left before the signature expires.
+    """
+    return min(
+        int(rrset.ttl),
+        int(rrsig_rrset.ttl),
+        int(signature.original_ttl),
+        max(0, int(signature.expiration) - int(time.time())),
+    )
+
+
+def _trim_keyring(keys: Keyring) -> Keyring:
     """Keep at most MAX_KEYS_PER_TAG usable keys per (key tag, algorithm).
 
     Colliding key tags are the core of KeyTrap: without this a single answer can
@@ -153,7 +239,7 @@ def _trim_keyring(keys: dict[dns.name.Name, Any]) -> dict[dns.name.Name, Any]:
     the one exception the RFC allows (validating the revocation itself) and
     simply never uses such a key.
     """
-    trimmed: dict[dns.name.Name, Any] = {}
+    trimmed: Keyring = {}
     for name, keyset in keys.items():
         if keyset is None:
             continue
@@ -203,7 +289,7 @@ class ZoneKeys:
     state: ValidationState
     expiry: float = field(default=0.0)
 
-    def as_keyring(self) -> dict[dns.name.Name, Any]:
+    def as_keyring(self) -> Keyring:
         return {self.zone: self.dnskey_rrset}
 
 
@@ -215,7 +301,8 @@ class DNSSECValidator:
             Must be non-empty: an empty anchor set can never validate anything,
             so it is rejected rather than silently treated as "use the
             defaults".
-        max_nsec3_iterations: Reject NSEC3 records above this iteration count.
+        max_nsec3_iterations: NSEC3 iteration counts above this are not
+            computed; a proof that needs them is downgraded to insecure.
         clock_skew: Seconds of slack allowed on an RRSIG's inception, for
             signers whose clock runs ahead of ours (60 by default). Applies to
             inception only: expiration is checked against the real time, so
@@ -245,20 +332,24 @@ class DNSSECValidator:
         self,
         rrset: dns.rrset.RRset,
         rrsig_rrset: dns.rrset.RRset | None,
-        keys: dict[dns.name.Name, Any],
+        keys: Keyring,
         now: float | None = None,
-        budget: Any = None,
+        budget: QueryBudget | None = None,
+        exact_owner: bool = False,
     ) -> bool:
-        """Verify ``rrset`` against its RRSIG using ``keys``."""
-        return self.validated_rrsig(rrset, rrsig_rrset, keys, now=now, budget=budget) is not None
+        """Verify ``rrset`` against its RRSIG using ``keys``. See :meth:`validated_rrsig`."""
+        return (
+            self.validated_rrsig(rrset, rrsig_rrset, keys, now=now, budget=budget, exact_owner=exact_owner) is not None
+        )
 
     def validated_rrsig(
         self,
         rrset: dns.rrset.RRset,
         rrsig_rrset: dns.rrset.RRset | None,
-        keys: dict[dns.name.Name, Any],
+        keys: Keyring,
         now: float | None = None,
-        budget: Any = None,
+        budget: QueryBudget | None = None,
+        exact_owner: bool = False,
     ) -> Any | None:
         """The RRSIG rdata that authenticates ``rrset``, or None.
 
@@ -269,14 +360,47 @@ class DNSSECValidator:
         The winning signature is returned rather than a bare yes, because how
         long the data may be cached depends on *which* signature vouched for it
         (RFC 4035 §5.3.3).
+
+        Args:
+            exact_owner: Only accept a signature made for the owner name itself,
+                not one made for a wildcard the owner could be an expansion of.
+                Denial records need this: see `_validated_nsec_rrsets`.
         """
         if rrsig_rrset is None:
             return None
+        # A denial proof re-checks the same records several times, and so may a
+        # sweep across siblings. The result for the same objects cannot change
+        # within one resolution, so it is remembered there. The objects
+        # themselves are kept in the entry: that pins them, so their ids cannot
+        # be reused by something else while the entry exists.
+        memo_key = None
+        if budget is not None and now is None:
+            memo_key = (id(rrset), id(rrsig_rrset), exact_owner, tuple(id(v) for v in keys.values()))
+            hit = budget.signature_memo.get(memo_key)
+            if hit is not None:
+                return hit[-1]
+        found = self._find_valid_rrsig(rrset, rrsig_rrset, keys, now, budget, exact_owner)
+        if memo_key is not None and budget is not None:
+            budget.signature_memo[memo_key] = (rrset, rrsig_rrset, tuple(keys.values()), found)
+        return found
+
+    def _find_valid_rrsig(
+        self,
+        rrset: dns.rrset.RRset,
+        rrsig_rrset: dns.rrset.RRset,
+        keys: Keyring,
+        now: float | None,
+        budget: QueryBudget | None,
+        exact_owner: bool,
+    ) -> Any | None:
         trimmed_keys = _trim_keyring(keys)
         if not trimmed_keys:
             return None
         wall = time.time() if now is None else now
         for rrsig in _trim_rrsigs(rrsig_rrset):
+            if exact_owner and rrsig.labels != _owner_labels(rrset.name):
+                logger.debug("RRSIG for %s was made for a wildcard, not for the name itself", rrset.name)
+                continue
             # RFC 4034 §3.1.5 defines inception and expiration as serial
             # numbers, so they are compared per RFC 1982 rather than as plain
             # integers, and the inception is allowed a little slack for a
@@ -321,8 +445,22 @@ class DNSSECValidator:
         dnskey_rrset: dns.rrset.RRset,
         rrsig_rrset: dns.rrset.RRset | None,
         ds_rdataset: dns.rdataset.Rdataset,
-        budget: Any = None,
+        budget: QueryBudget | None = None,
     ) -> ValidationState:
+        """Verify a zone's DNSKEY RRset against the DS records held by its parent.
+
+        See :meth:`check_dnskey`, which also returns the signature that verified.
+        """
+        return self.check_dnskey(zone, dnskey_rrset, rrsig_rrset, ds_rdataset, budget=budget)[0]
+
+    def check_dnskey(
+        self,
+        zone: dns.name.Name,
+        dnskey_rrset: dns.rrset.RRset,
+        rrsig_rrset: dns.rrset.RRset | None,
+        ds_rdataset: dns.rdataset.Rdataset,
+        budget: QueryBudget | None = None,
+    ) -> tuple[ValidationState, Any | None]:
         """Verify a zone's DNSKEY RRset against the DS records held by its parent.
 
         At least one DS must match a key with the ZONE flag set, and that key
@@ -332,47 +470,53 @@ class DNSSECValidator:
         KSK does not set it is unusual rather than wrong.
 
         Returns:
-            SECURE when that holds. INSECURE when the DS RRset names only
-            digest types or signing algorithms this build cannot compute:
-            RFC 4035 §5.2 and RFC 6840 §5.2 say a child we have no way to
-            check must be treated as unsigned, not as forged. BOGUS otherwise.
+            The state, and when SECURE the RRSIG that verified the DNSKEY
+            RRset, which bounds how long the keys may be cached.
+
+            SECURE when that holds. INSECURE when no DS names both a digest
+            type and a signing algorithm this build can check: RFC 4035 §5.2
+            and RFC 6840 §5.2 say a child we have no way to check must be
+            treated as unsigned, not as forged. BOGUS otherwise.
+
+            "Can check" is read off the DS RRset, which the parent signed,
+            and never off the DNSKEY RRset, which is not authenticated yet.
+            Judging by the keys present would let an attacker serve a zone
+            whose DS lists an algorithm we support and one we do not, keep
+            only the unsupported key in a forged DNSKEY answer, and have the
+            zone downgraded to unsigned.
         """
-        matched: list[Any] = []
-        # Digest computations we completed, versus ones we could not perform.
-        # Only "we could never compute one" means unverifiable; a zone that
-        # publishes no usable key at all is broken, not merely unsupported.
-        compared = 0
-        undigestable = 0
         # Bound the DS x DNSKEY digest cross-product (KeyTrap).
         candidate_ds = list(ds_rdataset)[:MAX_DS_PER_ZONE]
+        usable_ds = [
+            ds for ds in candidate_ds if _digest_supported(ds.digest_type) and algorithm_supported(ds.algorithm)
+        ]
+        # RFC 4509 §3: SHA-1 DS records are ignored when a stronger digest is
+        # present, or a broken SHA-1 would be enough to stand in for the rest.
+        if any(ds.digest_type != dns.dnssec.DSDigest.SHA1 for ds in usable_ds):
+            usable_ds = [ds for ds in usable_ds if ds.digest_type != dns.dnssec.DSDigest.SHA1]
+        if not usable_ds:
+            logger.debug("No DS for %s uses a digest and algorithm we support; treating the zone as unsigned", zone)
+            return ValidationState.INSECURE, None
+
+        matched: list[Any] = []
         for key in dnskey_rrset:
             if not key.flags & FLAG_ZONE_KEY:
                 continue
-            for ds in candidate_ds:
+            for ds in usable_ds:
+                if ds.algorithm != key.algorithm:
+                    continue
                 try:
                     computed = dns.dnssec.make_ds(zone, key, ds.digest_type, validating=True)
                 except Exception as exc:
                     logger.debug("Cannot compute DS for %s (digest type %s): %s", zone, ds.digest_type, exc)
-                    undigestable += 1
                     continue
-                compared += 1
                 if computed == ds:
                     matched.append(key)
                     break
 
         if not matched:
-            if undigestable and not compared:
-                logger.debug("No usable DS digest type for %s; treating the zone as unsigned", zone)
-                return ValidationState.INSECURE
             logger.debug("No DS record matches any DNSKEY for %s", zone)
-            return ValidationState.BOGUS
-
-        # A key we matched but whose signatures we cannot verify leaves us in
-        # the same position: unable to check the zone, so unable to call it
-        # forged.
-        if not any(algorithm_supported(key.algorithm) for key in matched):
-            logger.debug("DS for %s names only unsupported algorithms; treating the zone as unsigned", zone)
-            return ValidationState.INSECURE
+            return ValidationState.BOGUS, None
 
         # The DNSKEY RRset must be signed by a key the DS matched, and only by
         # such a key. RFC 4035 §5.2 requires that "the corresponding private
@@ -388,42 +532,56 @@ class DNSSECValidator:
         for key in matched:
             entry_points.add(key)
         entry_points.ttl = dnskey_rrset.ttl
-        if self.validate_rrset(dnskey_rrset, rrsig_rrset, {zone: entry_points}, budget=budget):
-            return ValidationState.SECURE
-        return ValidationState.BOGUS
+        signature = self.validated_rrsig(dnskey_rrset, rrsig_rrset, {zone: entry_points}, budget=budget)
+        if signature is not None:
+            return ValidationState.SECURE, signature
+        return ValidationState.BOGUS, None
 
     def validate_root_dnskey(
-        self, dnskey_rrset: dns.rrset.RRset, rrsig_rrset: dns.rrset.RRset | None, budget: Any = None
+        self, dnskey_rrset: dns.rrset.RRset, rrsig_rrset: dns.rrset.RRset | None, budget: QueryBudget | None = None
     ) -> bool:
-        """Verify the root DNSKEY RRset against the built-in trust anchors.
+        """Verify the root DNSKEY RRset against the built-in trust anchors."""
+        return self.check_root_dnskey(dnskey_rrset, rrsig_rrset, budget=budget)[0] is ValidationState.SECURE
+
+    def check_root_dnskey(
+        self, dnskey_rrset: dns.rrset.RRset, rrsig_rrset: dns.rrset.RRset | None, budget: QueryBudget | None = None
+    ) -> tuple[ValidationState, Any | None]:
+        """:meth:`check_dnskey` for the root, against the built-in trust anchors.
 
         The root is the anchor, so there is no "treat as unsigned" option here:
-        anything short of a full match is a failure.
+        anything short of a full match is BOGUS.
         """
-        state = self.validate_dnskey(dns.name.root, dnskey_rrset, rrsig_rrset, self._root_ds, budget=budget)
-        return state is ValidationState.SECURE
+        state, signature = self.check_dnskey(dns.name.root, dnskey_rrset, rrsig_rrset, self._root_ds, budget=budget)
+        if state is ValidationState.SECURE:
+            return state, signature
+        return ValidationState.BOGUS, None
 
     def validate_ds(
         self,
         child: dns.name.Name,
         authority: list[dns.rrset.RRset],
-        parent_keys: dict[dns.name.Name, Any],
-        budget: Any = None,
+        parent_keys: Keyring,
+        budget: QueryBudget | None = None,
     ) -> tuple[ValidationState, dns.rdataset.Rdataset | None]:
         """Establish whether ``child`` is a signed delegation.
 
         Returns ``(SECURE, ds_rdataset)`` when a validated DS exists,
         ``(INSECURE, None)`` when the parent proves no DS exists, and
         ``(BOGUS, None)`` when neither can be established.
+
+        The returned rdataset's TTL is already capped by the signature that
+        validated it (RFC 4035 §5.3.3), so whatever caches it inherits the cap.
         """
         ds_rrset = _rrset_of(authority, child, dns.rdatatype.DS)
         if ds_rrset is not None:
             rrsig = find_rrsig(authority, child, dns.rdatatype.DS)
-            if not self.validate_rrset(ds_rrset, rrsig, parent_keys, budget=budget):
+            signature = self.validated_rrsig(ds_rrset, rrsig, parent_keys, budget=budget)
+            if rrsig is None or signature is None:
                 return ValidationState.BOGUS, None
+            ttl = authenticated_ttl(ds_rrset, rrsig, signature)
             rdataset = dns.rdataset.Rdataset(dns.rdataclass.IN, dns.rdatatype.DS)
             for rr in ds_rrset:
-                rdataset.add(rr, ttl=ds_rrset.ttl)
+                rdataset.add(rr, ttl=ttl)
             return ValidationState.SECURE, rdataset
 
         # No DS: the parent must prove its absence, or the delegation is bogus.
@@ -436,7 +594,7 @@ class DNSSECValidator:
     # ── denial of existence ─────────────────────────────────────────────
 
     def _validated_nsec_rrsets(
-        self, authority: list[dns.rrset.RRset], keys: dict[dns.name.Name, Any], rdtype: int, budget: Any = None
+        self, authority: list[dns.rrset.RRset], keys: Keyring, rdtype: int, budget: QueryBudget | None = None
     ) -> list[dns.rrset.RRset]:
         """Return the NSEC (or NSEC3) RRsets in ``authority`` whose RRSIGs validate.
 
@@ -445,6 +603,16 @@ class DNSSECValidator:
         record that sets one is asserting something this validator cannot
         interpret, and guessing at it is how a future flag gets silently
         ignored rather than noticed.
+
+        The signature must have been made for the record's own owner name. An
+        NSEC owned by a wildcard is signed with a Labels count one short of its
+        owner, and dnspython verifies such a signature against the rebuilt
+        ``*.<parent>`` name, so the same record and signature verify under any
+        owner below that parent. Accepted as is, the zone's public wildcard
+        NSEC replayed as ``_dmarc.example.`` proves that name has no TXT, and
+        one renamed to sort just before the queried name proves NXDOMAIN.
+        Denial records are never synthesised from a wildcard, so a signature
+        that says otherwise is refused here.
         """
         out: list[dns.rrset.RRset] = []
         for rrset in authority:
@@ -454,12 +622,12 @@ class DNSSECValidator:
                 logger.debug("Ignoring NSEC3 at %s with reserved flags %#x", rrset.name, rrset[0].flags)
                 continue
             rrsig = find_rrsig(authority, rrset.name, rdtype)
-            if self.validate_rrset(rrset, rrsig, keys, budget=budget):
+            if self.validate_rrset(rrset, rrsig, keys, budget=budget, exact_owner=True):
                 out.append(rrset)
         return out
 
     @staticmethod
-    def _signing_zone(keys: dict[dns.name.Name, Any]) -> dns.name.Name | None:
+    def _signing_zone(keys: Keyring) -> dns.name.Name | None:
         """The zone these proofs are being validated against.
 
         Read from the keyring, never from the RRSIG on the wire. A signature
@@ -531,8 +699,8 @@ class DNSSECValidator:
     def nsec3_beyond_our_limits(
         self,
         authority: list[dns.rrset.RRset],
-        keys: dict[dns.name.Name, Any],
-        budget: Any = None,
+        keys: Keyring,
+        budget: QueryBudget | None = None,
     ) -> bool:
         """True when this response's NSEC3 parameters are more than we will compute.
 
@@ -553,8 +721,8 @@ class DNSSECValidator:
         self,
         child: dns.name.Name,
         authority: list[dns.rrset.RRset],
-        keys: dict[dns.name.Name, Any],
-        budget: Any = None,
+        keys: Keyring,
+        budget: QueryBudget | None = None,
     ) -> bool:
         """Prove that no DS record exists for ``child`` (an insecure delegation)."""
         # NSEC: a record matching the child whose bitmap has NS but not DS. A
@@ -582,6 +750,9 @@ class DNSSECValidator:
                 continue
             if hashed == nsec3.name:
                 types = _types_in_bitmap(params)
+                # The child apex's own record, as in the NSEC branch above.
+                if dns.rdatatype.SOA in types and child != dns.name.root:
+                    continue
                 if dns.rdatatype.DS not in types and dns.rdatatype.NS in types:
                     return True
 
@@ -610,8 +781,8 @@ class DNSSECValidator:
         self,
         name: dns.name.Name,
         authority: list[dns.rrset.RRset],
-        keys: dict[dns.name.Name, Any],
-        budget: Any = None,
+        keys: Keyring,
+        budget: QueryBudget | None = None,
     ) -> bool:
         """Prove that ``name`` is not a zone cut, so it can hold no DS.
 
@@ -659,7 +830,7 @@ class DNSSECValidator:
         return False
 
     def _nsec3_owner(
-        self, name: dns.name.Name, nsec3_owner: dns.name.Name, params: Any, budget: Any = None
+        self, name: dns.name.Name, nsec3_owner: dns.name.Name, params: Any, budget: QueryBudget | None = None
     ) -> dns.name.Name | None:
         """Hash ``name`` with ``params`` and return the resulting NSEC3 owner name."""
         if budget is not None:
@@ -675,7 +846,9 @@ class DNSSECValidator:
         except dns.exception.DNSException:  # pragma: no cover - digest is always a valid label
             return None
 
-    def _nsec3_covers(self, name: dns.name.Name, nsec3: dns.rrset.RRset, params: Any, budget: Any = None) -> bool:
+    def _nsec3_covers(
+        self, name: dns.name.Name, nsec3: dns.rrset.RRset, params: Any, budget: QueryBudget | None = None
+    ) -> bool:
         """True if the NSEC3 record covers (but does not match) ``name``'s hash.
 
         ``params`` supplies the zone-wide hashing parameters (salt, iterations,
@@ -690,7 +863,7 @@ class DNSSECValidator:
         try:
             # The next-hashed-owner is stored as raw bytes; render it in the
             # same base32hex alphabet dnspython uses for the owner name.
-            encoded = base64.b32encode(nsec3[0].next).translate(b32_normal_to_hex).decode("ascii")
+            encoded = base64.b32hexencode(nsec3[0].next).decode("ascii")
             zone = nsec3.name.parent() if len(nsec3.name) > 1 else dns.name.root
             next_label = dns.name.from_text(encoded, origin=zone)
         except (dns.exception.DNSException, ValueError, TypeError) as exc:
@@ -702,8 +875,8 @@ class DNSSECValidator:
         self,
         qname: dns.name.Name,
         authority: list[dns.rrset.RRset],
-        keys: dict[dns.name.Name, Any],
-        budget: Any = None,
+        keys: Keyring,
+        budget: QueryBudget | None = None,
     ) -> ValidationState:
         """Prove that ``qname`` does not exist at all.
 
@@ -767,8 +940,8 @@ class DNSSECValidator:
         qname: dns.name.Name,
         labels: int,
         authority: list[dns.rrset.RRset],
-        keys: dict[dns.name.Name, Any],
-        budget: Any = None,
+        keys: Keyring,
+        budget: QueryBudget | None = None,
     ) -> ValidationState:
         """Prove a wildcard-expanded answer was legitimate (RFC 4035 §5.3.4).
 
@@ -897,7 +1070,7 @@ class DNSSECValidator:
         return False
 
     def _closest_encloser_nsec3(
-        self, qname: dns.name.Name, nsec3s: list[dns.rrset.RRset], params: Any, budget: Any = None
+        self, qname: dns.name.Name, nsec3s: list[dns.rrset.RRset], params: Any, budget: QueryBudget | None = None
     ) -> dns.name.Name | None:
         """Find the deepest ancestor of ``qname`` with a matching NSEC3 record.
 
@@ -946,8 +1119,8 @@ class DNSSECValidator:
         qname: dns.name.Name,
         rdtype: int,
         authority: list[dns.rrset.RRset],
-        keys: dict[dns.name.Name, Any],
-        budget: Any = None,
+        keys: Keyring,
+        budget: QueryBudget | None = None,
     ) -> ValidationState:
         """Prove that ``qname`` exists but has no records of type ``rdtype``.
 

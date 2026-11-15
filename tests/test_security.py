@@ -23,10 +23,13 @@ import dns.rdatatype
 import dns.rrset
 import pytest
 from conftest import make_response, offline_resolver, referral, root_to_com
+from signed_zone import SignedZone, rrset_of
 
 from recursive_resolver import (
     AddressFilter,
     DNSCache,
+    DNSSECInsecureError,
+    DNSSECValidationError,
     Limits,
     NoAnswerError,
     NXDOMAINError,
@@ -456,6 +459,45 @@ class TestEDNSDowngrade:
         assert response is None
         assert payloads == [1232], "the server must be abandoned, not retried without DO"
 
+    def test_a_server_mangling_its_response_is_abandoned_while_validating(self) -> None:
+        """The other sign of a server that cannot do EDNS, and the same answer to it."""
+        from recursive_resolver.resolver import _MalformedResponseError
+
+        resolver = RecursiveResolver(cache_enabled=False)
+        payloads: list[int | None] = []
+
+        def query_once(qname, rdtype, server, payload, timeout, ctx):
+            payloads.append(payload)
+            raise _MalformedResponseError("garbage")
+
+        with patch.object(resolver, "_query_once", side_effect=query_once):
+            ctx = resolver._new_context()
+            response, _ = resolver._send_query(
+                dns.name.from_text("example.com."), dns.rdatatype.DNSKEY, ["9.9.9.9"], ctx
+            )
+
+        assert response is None
+        assert payloads == [1232]
+
+    def test_a_server_known_not_to_do_edns_is_still_sent_it_while_validating(self) -> None:
+        """What was learned below an unsigned cut lasts the whole resolution.
+
+        The same address can serve a signed zone later in it.
+        """
+        resolver = RecursiveResolver(cache_enabled=False)
+        payloads: list[int | None] = []
+
+        def query_once(qname, rdtype, server, payload, timeout, ctx):
+            payloads.append(payload)
+            return make_response()
+
+        with patch.object(resolver, "_query_once", side_effect=query_once):
+            ctx = resolver._new_context()
+            ctx.no_edns.add("9.9.9.9")
+            resolver._send_query(dns.name.from_text("example.com."), dns.rdatatype.DNSKEY, ["9.9.9.9"], ctx)
+
+        assert payloads == [1232]
+
     def test_a_servfail_still_reaches_the_caller_while_validating(self) -> None:
         """Abandoning the server must not hide the failure it reported.
 
@@ -840,12 +882,38 @@ class TestNegativeCacheScoping:
             assert resolver.resolve("example.com", "A") == ["1.2.3.4"]
 
     def test_a_name_below_the_missing_name_is_denied(self) -> None:
-        """The other half of RFC 8020: below the NXDOMAIN really is denied."""
+        """The other half of RFC 8020: below an authenticated NXDOMAIN really is denied."""
         resolver = RecursiveResolver(dnssec=False)
         assert resolver.cache is not None
-        resolver.cache.put_nxdomain(dns.name.from_text("missing.example.com."), 300)
+        resolver.cache.put_nxdomain(dns.name.from_text("missing.example.com."), 300, secure=True)
         assert resolver.cache.get_nxdomain_ancestor(dns.name.from_text("a.b.missing.example.com.")) is not None
         assert resolver.cache.get_nxdomain_ancestor(dns.name.from_text("present.example.com.")) is None
+
+    def test_an_unproven_nxdomain_hides_nothing_below_it(self) -> None:
+        """One broken server or spoofed packet must not deny a whole subtree.
+
+        Without a proof, `_domainkey.example.com` answering NXDOMAIN says
+        nothing reliable about `sel._domainkey.example.com`, which is queried
+        upstream as usual.
+        """
+        resolver = RecursiveResolver(dnssec=False)
+        assert resolver.cache is not None
+        resolver.cache.put_nxdomain(dns.name.from_text("_domainkey.example.com."), 300)
+        txt = make_response(answer=[("sel._domainkey.example.com.", 300, "TXT", ['"v=DKIM1; p=KEY"'])])
+        chain = [
+            (root_to_com(), "198.41.0.4"),
+            (referral("example.com.", ["ns.example.com."], {"ns.example.com.": "9.9.9.9"}), "192.5.6.30"),
+            (txt, "9.9.9.9"),
+        ]
+        step = {"i": 0}
+
+        def send(qname, rdtype, nameservers, ctx, usable=None):
+            i = step["i"]
+            step["i"] += 1
+            return chain[i] if i < len(chain) else (None, "")
+
+        with patch.object(resolver, "_send_query", side_effect=send):
+            assert resolver.resolve("sel._domainkey.example.com", "TXT") == ['"v=DKIM1; p=KEY"']
 
 
 class TestWeakestState:
@@ -942,9 +1010,9 @@ class TestUnverifiableAlgorithmsAreInsecureNotBogus:
         keys.add(dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.DNSKEY, "257 3 8 AwEAAaz/tAm8yTn4Mfeh5eyI96WS"))
         keys.ttl = 300
         ds = dns.rdataset.Rdataset(dns.rdataclass.IN, dns.rdatatype.DS)
-        ds.add(dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.DS, "12345 8 2 " + "AB" * 32), ttl=300)
-        with patch("dns.dnssec.make_ds", side_effect=dns.dnssec.UnsupportedAlgorithm("no such digest")):
-            assert validator.validate_dnskey(dns.name.from_text("z.test."), keys, None, ds) is ValidationState.INSECURE
+        # Digest type 3 (GOST R 34.11-94) is one dnspython cannot compute.
+        ds.add(dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.DS, "12345 8 3 " + "AB" * 32), ttl=300)
+        assert validator.validate_dnskey(dns.name.from_text("z.test."), keys, None, ds) is ValidationState.INSECURE
 
     def test_a_genuine_mismatch_is_still_bogus(self) -> None:
         """The distinction must not weaken real forgery detection."""
@@ -973,14 +1041,20 @@ class TestSpoofedPacketsDoNotRetireANameserver:
 
     @staticmethod
     @contextlib.contextmanager
-    def _server(spoofs: int):
-        """A nameserver that emits ``spoofs`` junk packets before answering."""
+    def _server(spoofs: int, from_elsewhere: bool = False):
+        """A nameserver that emits ``spoofs`` junk packets before answering.
+
+        With ``from_elsewhere``, the junk comes from another socket: an
+        exact reply to the query, from an address the query was not sent to.
+        """
         import socket
         import threading
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
+        other = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        other.bind(("127.0.0.1", 0))
         finished = threading.Event()
 
         def serve() -> None:
@@ -988,6 +1062,11 @@ class TestSpoofedPacketsDoNotRetireANameserver:
                 data, addr = sock.recvfrom(4096)
                 query = dns.message.from_wire(data)
                 for _ in range(spoofs):
+                    if from_elsewhere:
+                        junk = dns.message.make_response(query)
+                        junk.answer.append(dns.rrset.from_text("a.test.", 300, "IN", "A", "6.6.6.6"))
+                        other.sendto(junk.to_wire(), addr)
+                        continue
                     # A well-formed response to a *different* query: exactly
                     # what a blind spoofer's guess looks like on the wire.
                     junk = dns.message.make_query("guessed.example.", "A")
@@ -1008,30 +1087,36 @@ class TestSpoofedPacketsDoNotRetireANameserver:
         finally:
             finished.wait(timeout=5)
             sock.close()
+            other.close()
 
     @staticmethod
     @contextlib.contextmanager
-    def _on_port(port: int, tcp_fallback: bool):
-        """Send to the ephemeral test port while leaving the resolver's code intact.
-
-        Only the entry point the resolver actually calls is redirected, so
-        ``udp_with_fallback`` still reaches the real ``udp`` underneath.
-        """
-        name = "dns.query.udp_with_fallback" if tcp_fallback else "dns.query.udp"
-        real = dns.query.udp_with_fallback if tcp_fallback else dns.query.udp
+    def _on_port(port: int):
+        """Send to the ephemeral test port while leaving the resolver's code intact."""
+        real = dns.query.udp
 
         def send(query, where, *args, **kwargs):
             kwargs["port"] = port
             return real(query, where, *args, **kwargs)
 
-        with patch(name, side_effect=send):
+        with patch("dns.query.udp", side_effect=send):
             yield
 
     def _ask(self, port: int, **kwargs):
         resolver = offline_resolver(dnssec=False, **kwargs)
         ctx = resolver._new_context()
-        with self._on_port(port, resolver.use_tcp_fallback):
+        with self._on_port(port):
             return resolver._query_once(dns.name.from_text("a.test."), dns.rdatatype.A, "127.0.0.1", 1232, 4.0, ctx)
+
+    def test_a_packet_from_a_third_address_does_not_abort_the_query(self) -> None:
+        """No spoofing needed: just send to our ephemeral port from anywhere.
+
+        Such a reply matches the query perfectly except for its source, so it
+        must be ignored, and the real answer behind it still used.
+        """
+        with self._server(spoofs=2, from_elsewhere=True) as port:
+            response = self._ask(port)
+        assert [str(rr) for rrset in response.answer for rr in rrset] == ["1.2.3.4"]
 
     def test_a_spoofed_reply_before_the_real_one_is_discarded(self) -> None:
         with self._server(spoofs=1) as port:
@@ -1047,3 +1132,668 @@ class TestSpoofedPacketsDoNotRetireANameserver:
         with self._server(spoofs=1) as port:
             response = self._ask(port, use_tcp_fallback=False)
         assert response.answer
+
+
+# ── Attacks on a signed zone, with real keys and signatures ─────────────────
+#
+# Each of these models an attacker who can answer in place of the zone's
+# servers (on-path, or a successful spoof) but holds none of its keys. Only
+# `_send_query` is replaced; everything the resolver does with the responses,
+# including every signature check, is the real code.
+
+
+def _dnskey_response(zone: SignedZone) -> dns.message.Message:
+    response = make_response()
+    response.answer += [zone.dnskey_rrset, zone.signed_dnskey()]
+    return response
+
+
+def _signed_referral(child: SignedZone, parent: SignedZone, address: str) -> dns.message.Message:
+    zone = str(child.name)
+    response = make_response(
+        authority=[(zone, 3600, "NS", [f"ns.{zone}"])], additional=[(f"ns.{zone}", 3600, "A", [address])], aa=False
+    )
+    ds = parent.ds_rrset(child)
+    response.authority += [ds, parent.sign(ds)]
+    return response
+
+
+_SOA = "ns.test. admin.test. 1 3600 900 604800 300"
+
+
+class _World:
+    """The root and `test.`, both signed, with `test.` answering through ``handler``.
+
+    ``handler(qname, rdtype)`` returns the response from the `test.` servers,
+    or None to fall through to the defaults: each zone's own DNSKEY, and the
+    root's signed referral to `test.`.
+    """
+
+    def __init__(self, handler, *, extra_zones: tuple[SignedZone, ...] = (), **resolver_kwargs) -> None:
+        self.root = SignedZone.create(".")
+        self.tld = SignedZone.create("test.")
+        self.zones = {z.name: z for z in (self.root, self.tld, *extra_zones)}
+        self.handler = handler
+        self.queries: list[tuple[str, str]] = []
+        resolver_kwargs.setdefault("max_resolution_time", 5)
+        self.resolver = RecursiveResolver(trust_anchors=(self.root.anchor_text(),), **resolver_kwargs)
+
+    def send(self, qname, rdtype, nameservers, ctx, usable=None):
+        self.queries.append((str(qname), dns.rdatatype.to_text(rdtype)))
+        if rdtype == dns.rdatatype.DNSKEY and qname in self.zones:
+            response, server = _dnskey_response(self.zones[qname]), nameservers[0]
+        elif set(nameservers) & set(self.resolver._root_addresses):
+            child = next(z for z in self.zones.values() if z is not self.root and qname.is_subdomain(z.name))
+            response, server = _signed_referral(child, self.root, "9.9.9.9"), nameservers[0]
+        else:
+            response, server = self.handler(qname, rdtype), "9.9.9.9"
+            if response is None:
+                return None, ""
+        if usable is not None and not usable(response):
+            return None, ""
+        return response, server
+
+    def resolve(self, qname: str, rdtype: str = "A"):
+        with patch.object(self.resolver, "_send_query", side_effect=self.send):
+            return self.resolver.resolve_answer(qname, rdtype)
+
+
+class TestAnUnsignedCNAMEBesideASignedDNAME:
+    """RFC 6672 §3.4: the resolver synthesises the CNAME a DNAME implies.
+
+    The CNAME a server sends beside a DNAME is unsigned by design, and used to
+    be what the target was read from, while the verdict came from the DNAME's
+    genuine signature. Anyone able to answer for the zone could point it
+    anywhere and have the result come back SECURE.
+    """
+
+    def _world(self, *, forged: bool) -> _World:
+        dname = rrset_of("sub.test.", "DNAME", "target.test.")
+        target = rrset_of("foo.target.test.", "A", "192.0.2.10")
+
+        def handler(qname, rdtype):
+            if qname == dns.name.from_text("foo.sub.test."):
+                cname_target = "www.evil." if forged else "foo.target.test."
+                response = make_response()
+                response.answer += [dname, world.tld.sign(dname), rrset_of("foo.sub.test.", "CNAME", cname_target)]
+                return response
+            if qname == dns.name.from_text("foo.target.test."):
+                response = make_response()
+                response.answer += [target, world.tld.sign(target)]
+                return response
+            return None
+
+        world = _World(handler)
+        return world
+
+    def test_the_target_comes_from_the_dname_not_the_wire_cname(self) -> None:
+        answer = self._world(forged=True).resolve("foo.sub.test.")
+        assert answer.canonical_name == dns.name.from_text("foo.target.test.")
+        assert answer.records == ["192.0.2.10"]
+        assert answer.dnssec is ValidationState.SECURE
+
+    def test_a_consistent_server_cname_changes_nothing(self) -> None:
+        answer = self._world(forged=False).resolve("foo.sub.test.")
+        assert answer.canonical_name == dns.name.from_text("foo.target.test.")
+        assert answer.dnssec is ValidationState.SECURE
+
+
+class TestReplayedWildcardNSEC:
+    """A wildcard's NSEC, renamed, must not deny anything.
+
+    Its signature has a Labels count one short of its owner, so dnspython
+    verifies it against the rebuilt `*.<parent>` and it verifies under any
+    owner below that parent. Both the record and the signature are public.
+    """
+
+    @staticmethod
+    def _renamed(zone: SignedZone, nsec_text: str, wildcard: str, owner: str) -> list[dns.rrset.RRset]:
+        genuine = rrset_of(wildcard, "NSEC", nsec_text)
+        signature = zone.sign(genuine)
+        assert signature[0].labels == len(genuine.name.labels) - 2
+        nsec = dns.rrset.RRset(dns.name.from_text(owner), dns.rdataclass.IN, dns.rdatatype.NSEC)
+        nsec.add(genuine[0])
+        nsec.ttl = 300
+        sig = dns.rrset.RRset(dns.name.from_text(owner), dns.rdataclass.IN, dns.rdatatype.RRSIG)
+        sig.add(signature[0])
+        sig.ttl = 300
+        return [nsec, sig]
+
+    def test_it_does_not_prove_nodata_for_another_name(self) -> None:
+        """`_dmarc.test.` really holds a TXT record; the replay claims it has none."""
+        from recursive_resolver.dnssec import DNSSECValidator
+
+        zone = SignedZone.create("test.")
+        authority = self._renamed(zone, "_dmarc.test. A RRSIG NSEC", "*.test.", "_dmarc.test.")
+        state = DNSSECValidator().prove_nodata(
+            dns.name.from_text("_dmarc.test."), dns.rdatatype.TXT, authority, zone.keyring()
+        )
+        assert state is ValidationState.BOGUS
+
+    def test_it_does_not_prove_nxdomain(self) -> None:
+        from recursive_resolver.dnssec import DNSSECValidator
+
+        zone = SignedZone.create("cdn.")
+        authority = self._renamed(zone, "cdn. A RRSIG NSEC", "*.cdn.", "!.cdn.")
+        state = DNSSECValidator().prove_nxdomain(dns.name.from_text("www.cdn."), authority, zone.keyring())
+        assert state is ValidationState.BOGUS
+
+    def test_the_genuine_record_under_its_own_name_still_counts(self) -> None:
+        """The wildcard owner's own NSEC is fine: its Labels count is right for `*.test.`."""
+        from recursive_resolver.dnssec import DNSSECValidator
+
+        zone = SignedZone.create("test.")
+        nsec = rrset_of("*.test.", "NSEC", "_dmarc.test. A RRSIG NSEC")
+        state = DNSSECValidator().prove_nodata(
+            dns.name.from_text("*.test."), dns.rdatatype.TXT, [nsec, zone.sign(nsec)], zone.keyring()
+        )
+        assert state is ValidationState.SECURE
+
+    def test_the_resolver_refuses_the_forged_denial_end_to_end(self) -> None:
+        def handler(qname, rdtype):
+            soa = rrset_of("test.", "SOA", _SOA)
+            response = make_response()
+            response.authority += [soa, world.tld.sign(soa)]
+            response.authority += self._renamed(world.tld, "_dmarc.test. A RRSIG NSEC", "*.test.", "_dmarc.test.")
+            return response
+
+        world = _World(handler)
+        with pytest.raises(DNSSECValidationError):
+            world.resolve("_dmarc.test.", "TXT")
+        assert world.resolver.cache.get_nodata("_dmarc.test.", "TXT") is None
+
+
+class TestAForgedSignerFieldCannotDowngradeASignedZone:
+    """The signer field is unverified; the chain of trust must not follow it sideways.
+
+    `test.` is signed and really has an unsigned delegation, `unsigned.test.`,
+    whose missing DS it proves with a genuine NSEC. An RRSIG whose signer
+    field merely *says* `unsigned.test.` used to send the chain walk there,
+    and the genuine proof of that zone's missing DS was then applied to
+    whatever name was being judged.
+    """
+
+    def _world(self, spoofed: dns.message.Message, final: dns.message.Message | None = None) -> _World:
+        victim = SignedZone.create("victim.test.")
+        junk = rrset_of("x.test.", "NSEC", "y.test. A")
+
+        def handler(qname, rdtype):
+            if rdtype == dns.rdatatype.DS and qname == dns.name.from_text("unsigned.test."):
+                soa = rrset_of("test.", "SOA", _SOA)
+                nsec = rrset_of("unsigned.test.", "NSEC", "v.test. NS RRSIG NSEC")
+                response = make_response()
+                response.authority += [soa, world.tld.sign(soa), nsec, world.tld.sign(nsec)]
+                return response
+            if final is not None and qname == victim.name and rdtype == dns.rdatatype.TXT and world.referred:
+                return final
+            if spoofed.authority and spoofed.authority[0].rdtype == dns.rdatatype.NS:
+                world.referred = True
+            return spoofed
+
+        # Any signature at all, as long as its signer field names the unsigned zone.
+        impostor = SignedZone(
+            name=dns.name.from_text("unsigned.test."),
+            private_key=victim.private_key,
+            dnskey=victim.dnskey,
+            dnskey_rrset=victim.dnskey_rrset,
+        )
+        spoofed.authority += [junk, impostor.sign(junk)]
+        world = _World(handler, extra_zones=(victim,))
+        world.tld_zone = world.tld
+        world.referred = False
+        return world
+
+    def test_a_forged_nxdomain_is_still_bogus(self) -> None:
+        nx = make_response(rcode=dns.rcode.NXDOMAIN, authority=[("test.", 300, "SOA", [_SOA])])
+        with pytest.raises(DNSSECValidationError):
+            self._world(nx).resolve("victim.test.", "TXT")
+
+    def test_a_forged_nodata_at_the_apex_is_still_bogus(self) -> None:
+        nd = make_response(authority=[("test.", 300, "SOA", [_SOA])])
+        with pytest.raises(DNSSECValidationError):
+            self._world(nd).resolve("test.", "CAA")
+
+    def test_a_forged_referral_with_the_ds_stripped_is_still_bogus(self) -> None:
+        referral_ = make_response(
+            authority=[("victim.test.", 3600, "NS", ["ns.victim.test."])],
+            additional=[("ns.victim.test.", 3600, "A", ["6.6.6.6"])],
+            aa=False,
+        )
+        forged = make_response(answer=[("victim.test.", 300, "TXT", ['"v=DKIM1; p=ATTACKERKEY"'])])
+        world = self._world(referral_, forged)
+        with pytest.raises(DNSSECValidationError):
+            world.resolve("victim.test.", "TXT")
+        assert world.resolver.cache.get_delegation(dns.name.from_text("victim.test.")) is None
+
+
+class TestDSWithAnAlgorithmWeCannotCheck:
+    """RFC 4035 §5.2: "unverifiable" is read off the signed DS, never off the keys served.
+
+    The DS RRset lists an algorithm 13 key and an algorithm 12 one, which this
+    build cannot verify. A forged DNSKEY answer holding only the algorithm 12
+    key used to make the zone look unverifiable, so it was treated as
+    unsigned.
+    """
+
+    def test_dropping_the_supported_key_is_bogus_not_insecure(self) -> None:
+        from recursive_resolver.dnssec import DNSSECValidator
+
+        zone = SignedZone.create("z.test.")
+        gost = dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.DNSKEY, "257 3 12 " + "AAAA" * 16)
+        ds = zone.ds_rdataset(zone)
+        ds.add(dns.dnssec.make_ds(zone.name, gost, "SHA256"))
+        only_gost = dns.rrset.RRset(zone.name, dns.rdataclass.IN, dns.rdatatype.DNSKEY)
+        only_gost.add(gost)
+        only_gost.ttl = 300
+        assert DNSSECValidator().validate_dnskey(zone.name, only_gost, None, ds) is ValidationState.BOGUS
+        # The genuine RRset still validates against the same DS set.
+        genuine = DNSSECValidator().validate_dnskey(zone.name, zone.dnskey_rrset, zone.signed_dnskey(), ds)
+        assert genuine is ValidationState.SECURE
+
+    def test_a_ds_set_naming_only_unsupported_algorithms_is_insecure(self) -> None:
+        from recursive_resolver.dnssec import DNSSECValidator
+
+        zone = SignedZone.create("z.test.")
+        gost = dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.DNSKEY, "257 3 12 " + "AAAA" * 16)
+        ds = dns.rdataset.Rdataset(dns.rdataclass.IN, dns.rdatatype.DS)
+        ds.add(dns.dnssec.make_ds(zone.name, gost, "SHA256"), ttl=300)
+        assert DNSSECValidator().validate_dnskey(zone.name, zone.dnskey_rrset, None, ds) is ValidationState.INSECURE
+
+    def test_a_sha1_ds_is_ignored_beside_a_sha256_one(self) -> None:
+        """RFC 4509 §3, so a weak digest cannot stand in for the strong one."""
+        from recursive_resolver.dnssec import DNSSECValidator
+
+        zone = SignedZone.create("z.test.")
+        other = SignedZone.create("z.test.")
+        # dnspython refuses to *create* SHA-1 DS records by default, not to check them.
+        sha1 = dns.dnssec.make_ds(zone.name, other.dnskey, "SHA1", policy=dns.dnssec.allow_all_policy)
+        ds = zone.ds_rdataset(zone)
+        ds.add(sha1)
+        state = DNSSECValidator().validate_dnskey(zone.name, other.dnskey_rrset, other.signed_dnskey(), ds)
+        assert state is ValidationState.BOGUS
+        alone = dns.rdataset.Rdataset(dns.rdataclass.IN, dns.rdatatype.DS)
+        alone.add(sha1, ttl=300)
+        state = DNSSECValidator().validate_dnskey(zone.name, other.dnskey_rrset, other.signed_dnskey(), alone)
+        assert state is ValidationState.SECURE
+
+
+class TestKeysDoNotOutliveTheirSignatures:
+    """RFC 4035 §5.3.3 applies to DNSKEY and DS as much as to answers.
+
+    Keys used to be cached for their wire TTL, up to a day, with a 60 second
+    floor: a rollover or an emergency revocation went unnoticed for that long.
+    """
+
+    def test_validated_keys_expire_with_their_signature(self) -> None:
+        import time
+
+        world = _World(lambda q, t: None, cache_enabled=True)
+        zone = world.tld
+        soon = int(time.time()) + 30
+        rrsig = zone.sign(zone.dnskey_rrset, expiration=soon)
+        response = make_response()
+        response.answer += [zone.dnskey_rrset, rrsig]
+        ctx = world.resolver._new_context()
+        with patch.object(world.resolver, "_send_query", return_value=(response, "9.9.9.9")):
+            keys = world.resolver._get_zone_keys(zone.name, world.root.ds_rdataset(zone), ["9.9.9.9"], ctx)
+        assert keys.state is ValidationState.SECURE
+        assert 0 < keys.expiry - time.monotonic() <= 30
+
+    def test_a_validated_ds_carries_its_signature_cap(self) -> None:
+        import time
+
+        from recursive_resolver.dnssec import DNSSECValidator
+
+        parent, child = SignedZone.create("test."), SignedZone.create("z.test.")
+        ds = parent.ds_rrset(child)
+        authority = [ds, parent.sign(ds, expiration=int(time.time()) + 30)]
+        state, rdataset = DNSSECValidator().validate_ds(child.name, authority, parent.keyring())
+        assert state is ValidationState.SECURE and rdataset is not None
+        assert rdataset.ttl <= 30
+
+
+class TestLameZonesAreNotAnAmplifier:
+    """A zone whose servers all refuse it must cost about one query per server.
+
+    Its in-zone NS names used to be resolved again through the same failing
+    servers, recursively, until the budget ran out: 44 to 64 queries at the
+    victim's servers per call, reported as a budget attack.
+    """
+
+    def test_refusing_in_zone_servers_are_each_asked_once(self) -> None:
+        resolver = offline_resolver(dnssec=False)
+        servers = {f"ns{i}.example.com.": f"9.9.9.{i}" for i in range(1, 5)}
+        sent: list[str] = []
+
+        def query_once(qname, rdtype, server, payload, timeout, ctx):
+            sent.append(server)
+            if server in resolver._root_addresses:
+                return root_to_com()
+            if server == "192.5.6.30":
+                return referral("example.com.", list(servers), servers)
+            return make_response(rcode=dns.rcode.REFUSED, aa=False)
+
+        with patch.object(resolver, "_query_once", side_effect=query_once), pytest.raises(ServfailError):
+            resolver.resolve("www.example.com", "A")
+        assert len([s for s in sent if s.startswith("9.9.9.")]) == 4
+
+    def test_servfail_from_every_server_while_validating_is_one_sweep(self) -> None:
+        """Each SERVFAIL was held back while the sweep went on, then only one server dropped: N squared."""
+        resolver = RecursiveResolver(cache_enabled=False)
+        servers = [f"9.9.9.{i}" for i in range(1, 9)]
+        sent: list[str] = []
+
+        def query_once(qname, rdtype, server, payload, timeout, ctx):
+            sent.append(server)
+            return make_response(rcode=dns.rcode.SERVFAIL, aa=False)
+
+        start = (dns.name.from_text("example.com."), list(servers), ValidationState.SECURE, None, [])
+        with (
+            patch.object(resolver, "_starting_point", return_value=start),
+            patch.object(resolver, "_query_once", side_effect=query_once),
+            pytest.raises(ServfailError),
+        ):
+            resolver.resolve("www.example.com", "A")
+        assert len(sent) == len(servers)
+
+    def test_servfail_from_every_server_without_validation_is_linear(self) -> None:
+        """Each server is asked with EDNS, then once without: never again on later passes."""
+        resolver = offline_resolver(dnssec=False)
+        servers = [f"9.9.9.{i}" for i in range(1, 9)]
+        sent: list[str] = []
+
+        def query_once(qname, rdtype, server, payload, timeout, ctx):
+            sent.append(server)
+            return make_response(rcode=dns.rcode.SERVFAIL, aa=False)
+
+        start = (dns.name.from_text("example.com."), list(servers), ValidationState.INSECURE, None, [])
+        with (
+            patch.object(resolver, "_starting_point", return_value=start),
+            patch.object(resolver, "_query_once", side_effect=query_once),
+            pytest.raises(ServfailError),
+        ):
+            resolver.resolve("www.example.com", "A")
+        assert len(sent) <= 2 * len(servers)
+
+
+class TestRedundantQueries:
+    def test_an_nxdomain_is_confirmed_by_one_sibling_not_two(self) -> None:
+        resolver = offline_resolver(dnssec=False)
+        asked: list[list[str]] = []
+        nx = make_response(rcode=dns.rcode.NXDOMAIN, authority=[("example.com.", 300, "SOA", [_SOA])])
+
+        def send(qname, rdtype, nameservers, ctx, usable=None):
+            asked.append(list(nameservers))
+            if set(nameservers) & set(resolver._root_addresses):
+                return root_to_com(), nameservers[0]
+            if nameservers == ["192.5.6.30"]:
+                glue = {f"ns{i}.example.com.": f"9.9.9.{i}" for i in range(1, 5)}
+                return referral("example.com.", list(glue), glue), "192.5.6.30"
+            return nx, nameservers[0]
+
+        with patch.object(resolver, "_send_query", side_effect=send), pytest.raises(NXDOMAINError):
+            resolver.resolve("nope.example.com", "A")
+        assert len(asked) == 2 + 2
+
+    def test_cname_chain_lists_each_redirected_name_once(self) -> None:
+        resolver = RecursiveResolver(dnssec=False, cache_enabled=True)
+        records = {
+            "a.example.com.": ("CNAME", "b.example.com."),
+            "b.example.com.": ("CNAME", "c.example.com."),
+            "c.example.com.": ("A", "1.2.3.4"),
+        }
+        upstream = {"n": 0}
+
+        def send(qname, rdtype, nameservers, ctx, usable=None):
+            upstream["n"] += 1
+            kind, value = records[str(qname)]
+            return make_response(answer=[(str(qname), 300, kind, [value])]), "9.9.9.9"
+
+        start = (dns.name.from_text("example.com."), ["9.9.9.9"], ValidationState.INSECURE, None, [])
+        with (
+            patch.object(resolver, "_send_query", side_effect=send),
+            patch.object(resolver, "_starting_point", return_value=start),
+        ):
+            cold = resolver.resolve_answer("a.example.com", "A")
+            before = upstream["n"]
+            warm = resolver.resolve_answer("a.example.com", "A")
+        expected = [dns.name.from_text("a.example.com."), dns.name.from_text("b.example.com.")]
+        assert cold.cname_chain == expected
+        assert warm.cname_chain == expected
+        assert warm.canonical_name == dns.name.from_text("c.example.com.")
+        # The cached CNAMEs are followed without asking anyone.
+        assert upstream["n"] == before
+
+    def test_a_failure_is_remembered_briefly(self) -> None:
+        """RFC 9520: retrying callers must not each send the full set of queries again."""
+        resolver = RecursiveResolver(dnssec=False, cache_enabled=True)
+        upstream = {"n": 0}
+
+        def send(qname, rdtype, nameservers, ctx, usable=None):
+            upstream["n"] += 1
+            return make_response(rcode=dns.rcode.REFUSED, aa=False), nameservers[0]
+
+        with patch.object(resolver, "_send_query", side_effect=send):
+            for _ in range(3):
+                with pytest.raises(ServfailError) as caught:
+                    resolver.resolve("broken.example.com", "A")
+        first = upstream["n"]
+        assert first < 20
+        with patch.object(resolver, "_send_query", side_effect=send), pytest.raises(ServfailError):
+            resolver.resolve("broken.example.com", "A")
+        assert upstream["n"] == first
+        assert caught.value.query_name == "broken.example.com."
+
+    def test_an_unsigned_copy_is_retried_on_one_sibling_only(self) -> None:
+        resolver = RecursiveResolver(cache_enabled=False)
+        sent: list[str] = []
+        unsigned = make_response(answer=[("www.example.com.", 300, "A", ["1.2.3.4"])])
+
+        def query_once(qname, rdtype, server, payload, timeout, ctx):
+            sent.append(server)
+            return unsigned
+
+        servers = [f"9.9.9.{i}" for i in range(1, 7)]
+        start = (dns.name.from_text("example.com."), servers, ValidationState.SECURE, None, [])
+        with (
+            patch.object(resolver, "_starting_point", return_value=start),
+            patch.object(resolver, "_query_once", side_effect=query_once),
+            patch.object(resolver, "_insecurely_delegated", return_value=True),
+        ):
+            resolver.resolve("www.example.com", "A")
+        assert len(sent) == 2
+
+
+class TestNoDowngradeOfTheEDNSLadderBelowAnUnsignedCut:
+    """With validation on, plain DNS used to be off for every zone, signed or not.
+
+    A server that cannot do EDNS was unreachable even for an unsigned zone,
+    where nothing is validated and a DO-less answer loses nothing.
+    """
+
+    def test_plain_dns_is_tried_where_the_chain_is_insecure(self) -> None:
+        resolver = RecursiveResolver(cache_enabled=False)
+        payloads: list[int | None] = []
+
+        def query_once(qname, rdtype, server, payload, timeout, ctx):
+            payloads.append(payload)
+            if payload is not None:
+                return make_response(rcode=dns.rcode.FORMERR, aa=False)
+            return make_response(answer=[("www.example.com.", 300, "A", ["1.2.3.4"])])
+
+        start = (dns.name.from_text("example.com."), ["9.9.9.9"], ValidationState.INSECURE, None, [])
+        with (
+            patch.object(resolver, "_starting_point", return_value=start),
+            patch.object(resolver, "_query_once", side_effect=query_once),
+        ):
+            assert resolver.resolve("www.example.com", "A") == ["1.2.3.4"]
+        assert payloads[-1] is None
+
+    def test_a_secure_chain_still_never_drops_edns(self) -> None:
+        resolver = RecursiveResolver(cache_enabled=False)
+        payloads: list[int | None] = []
+
+        def query_once(qname, rdtype, server, payload, timeout, ctx):
+            payloads.append(payload)
+            return make_response(rcode=dns.rcode.FORMERR, aa=False)
+
+        start = (dns.name.from_text("example.com."), ["9.9.9.9"], ValidationState.SECURE, None, [])
+        with (
+            patch.object(resolver, "_starting_point", return_value=start),
+            patch.object(resolver, "_query_once", side_effect=query_once),
+            pytest.raises(ResolverError),
+        ):
+            resolver.resolve("www.example.com", "A")
+        assert None not in payloads
+
+
+class TestRedirectionsNeedTheAABit:
+    """A CNAME or DNAME is an answer, and held to the same rule as one."""
+
+    @pytest.mark.parametrize(
+        ("rdtype", "owner", "target"),
+        [("CNAME", "www.example.com.", "evil.example.net."), ("DNAME", "example.com.", "example.net.")],
+    )
+    def test_a_redirection_without_aa_is_an_error(self, rdtype: str, owner: str, target: str) -> None:
+        resolver = offline_resolver()
+        response = make_response(answer=[(owner, 300, rdtype, [target])], aa=False)
+        classification = resolver._classify_response(
+            response, dns.name.from_text("www.example.com."), dns.rdatatype.A, dns.name.from_text("example.com.")
+        )
+        assert classification["type"] == "error"
+        assert "AA" in classification["detail"]
+
+
+class TestDSInReferralForm:
+    """A parent may answer a DS query as a referral, with the DS and its RRSIG in AUTHORITY."""
+
+    def test_the_signature_is_looked_for_where_the_ds_is(self) -> None:
+        world = _World(lambda q, t: None)
+        child = SignedZone.create("z.test.")
+        ds = world.tld.ds_rrset(child)
+        response = make_response(
+            authority=[("z.test.", 3600, "NS", ["ns.z.test."])], additional=[("ns.z.test.", 3600, "A", ["9.9.9.9"])]
+        )
+        response.authority += [ds, world.tld.sign(ds)]
+        world.handler = lambda q, t: response
+        answer = world.resolve("z.test.", "DS")
+        assert answer.dnssec is ValidationState.SECURE
+
+
+class TestDNSSECChecksMatchWhatCanBeVerified:
+    def test_algorithms_dnspython_refuses_to_validate_are_unsupported(self) -> None:
+        """RSAMD5 and DSA zones are unverifiable, so unsigned (RFC 8624), not BOGUS."""
+        from recursive_resolver.dnssec import algorithm_supported
+
+        assert algorithm_supported(1) is False
+        assert algorithm_supported(3) is False
+        assert algorithm_supported(6) is False
+        assert algorithm_supported(8) is True
+
+    def test_a_host_that_refuses_sha1_treats_rsasha1_as_unsupported(self) -> None:
+        from recursive_resolver import dnssec
+
+        assert dnssec._sha1_signatures_verify() is True, "this host verifies SHA-1"
+        assert dnssec.algorithm_supported(5) is True
+        with patch.object(dnssec, "_sha1_signatures_verify", return_value=False):
+            assert dnssec.algorithm_supported(5) is False
+            assert dnssec.algorithm_supported(7) is False
+            assert dnssec.algorithm_supported(8) is True
+
+    def test_the_sha1_probe_fails_closed(self) -> None:
+        from recursive_resolver import dnssec
+
+        dnssec._sha1_signatures_verify.cache_clear()
+        try:
+            with patch("dns.dnssec.validate_rrsig", side_effect=dns.dnssec.ValidationFailure("policy")):
+                assert dnssec._sha1_signatures_verify() is False
+        finally:
+            dnssec._sha1_signatures_verify.cache_clear()
+
+
+class TestNoDSProofFromTheChildApex:
+    def test_an_nsec3_bearing_soa_cannot_deny_the_ds(self) -> None:
+        """The NSEC branch already refused the child's own apex record; NSEC3 did not."""
+        from recursive_resolver.dnssec import DNSSECValidator
+
+        parent = SignedZone.create("test.")
+        child = dns.name.from_text("z.test.")
+        owner = dns.dnssec.nsec3_hash(child, "", 0, 1)
+        nsec3 = rrset_of(f"{owner}.test.", "NSEC3", "1 0 0 - " + "0" * 31 + "G NS SOA RRSIG DNSKEY")
+        authority = [nsec3, parent.sign(nsec3)]
+        assert DNSSECValidator().prove_no_ds(child, authority, parent.keyring()) is False
+
+
+class TestAZoneServedByItsGrandparent:
+    """The root servers serve `root-servers.net` but not `net`.
+
+    Asked for `net`'s keys, or for the DS of `root-servers.net`, they refer to
+    the `net` servers. The chain walk used to ask only the servers it started
+    with, so every name in `root-servers.net` came back "material unavailable".
+    Here `rs.test.` plays that part.
+    """
+
+    TLD_SERVER = "9.9.9.53"
+
+    def _resolver(self, **kwargs) -> tuple[RecursiveResolver, list[tuple[str, str, str]]]:
+        root, tld = SignedZone.create("."), SignedZone.create("test.")
+        resolver = RecursiveResolver(trust_anchors=(root.anchor_text(),), max_resolution_time=5, **kwargs)
+        roots = set(resolver._root_addresses)
+        queries: list[tuple[str, str, str]] = []
+        rs = dns.name.from_text("rs.test.")
+        soa = "ns.rs.test. admin.rs.test. 1 3600 900 604800 300"
+
+        def query_once(qname, rdtype, server, payload, timeout, ctx):
+            queries.append((str(qname), dns.rdatatype.to_text(rdtype), server))
+            if server == self.TLD_SERVER:
+                if rdtype == dns.rdatatype.DNSKEY and qname == tld.name:
+                    return _dnskey_response(tld)
+                nsec = rrset_of("rs.test.", "NSEC", "z.test. NS RRSIG NSEC")
+                tld_soa = rrset_of("test.", "SOA", _SOA)
+                response = make_response()
+                response.authority += [tld_soa, tld.sign(tld_soa), nsec, tld.sign(nsec)]
+                return response
+            assert server in roots
+            if rdtype == dns.rdatatype.DNSKEY and qname == dns.name.root:
+                return _dnskey_response(root)
+            if rdtype == dns.rdatatype.DS and qname == tld.name:
+                ds = root.ds_rrset(tld)
+                response = make_response()
+                response.answer += [ds, root.sign(ds)]
+                return response
+            if qname.is_subdomain(rs) and rdtype != dns.rdatatype.DS:
+                return make_response(authority=[("rs.test.", 300, "SOA", [soa])])
+            # Like the root: anything about `test.` itself is a referral.
+            response = make_response(
+                authority=[("test.", 3600, "NS", ["ns.test."])],
+                additional=[("ns.test.", 3600, "A", [self.TLD_SERVER])],
+                aa=False,
+            )
+            ds = root.ds_rrset(tld)
+            response.authority += [ds, root.sign(ds)]
+            return response
+
+        resolver._query_once = query_once
+        return resolver, queries
+
+    def test_the_referral_is_followed_for_the_keys(self) -> None:
+        resolver, queries = self._resolver()
+        with pytest.raises(NoAnswerError):
+            resolver.resolve("rs.test.", "A")
+        assert ("test.", "DNSKEY", self.TLD_SERVER) in queries
+        assert ("rs.test.", "DS", self.TLD_SERVER) in queries
+
+    def test_and_for_the_ds_when_the_keys_are_cached(self) -> None:
+        resolver, queries = self._resolver()
+        with pytest.raises(NoAnswerError):
+            resolver.resolve("rs.test.", "A")
+        queries.clear()
+        with pytest.raises(NoAnswerError):
+            resolver.resolve("rs.test.", "TXT")
+        assert not any(rdtype == "DNSKEY" for _name, rdtype, _server in queries)
+        assert ("rs.test.", "DS", self.TLD_SERVER) in queries
+
+    def test_the_verdict_is_insecure(self) -> None:
+        resolver, _queries = self._resolver(require_dnssec=True)
+        with pytest.raises(DNSSECInsecureError):
+            resolver.resolve("rs.test.", "A")

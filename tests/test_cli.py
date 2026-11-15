@@ -7,6 +7,7 @@ import os
 from unittest.mock import patch
 
 import pytest
+from conftest import make_response
 
 from recursive_resolver import Answer, NXDOMAINError, TraceStep, ValidationState, __version__
 from recursive_resolver.cli import main
@@ -275,9 +276,25 @@ class TestDNSSECVerdictOnStderr:
         assert out == "1.2.3.4\n"
 
     def test_no_dnssec_says_so_rather_than_claiming_unsigned(self, capsys: pytest.CaptureFixture) -> None:
-        """--no-dnssec leaves the default INSECURE state, which is not a proof."""
-        _, err = self._run(["--no-dnssec", "example.com"], _answer(dnssec=ValidationState.INSECURE), capsys)
+        """Nothing was checked, which is not a proof the zone is unsigned."""
+        _, err = self._run(["--no-dnssec", "example.com"], _answer(dnssec=ValidationState.DISABLED), capsys)
         assert err.strip() == "; dnssec validation disabled"
+
+    def test_a_real_resolver_without_validation_reports_disabled(self) -> None:
+        """The state comes from the resolver itself, not from a CLI workaround."""
+        from recursive_resolver import RecursiveResolver
+
+        resolver = RecursiveResolver(dnssec=False, cache_enabled=False)
+        response = make_response(answer=[("example.com.", 300, "A", ["1.2.3.4"])])
+        with patch.object(resolver, "_send_query", return_value=(response, "9.9.9.9")):
+            assert resolver.resolve_answer("example.com", "A").dnssec is ValidationState.DISABLED
+
+    def test_hostile_txt_bytes_are_escaped_not_written_raw(self, capsys: pytest.CaptureFixture) -> None:
+        """TXT data is the zone owner's: no escape sequences reach the terminal, no encoding crash."""
+        answer = _answer('"evil\\027[2J\\255end"', "TXT")
+        out, _ = self._run(["--text", "example.com", "TXT"], answer, capsys)
+        # Presentation-format escapes are decimal: \027 is ESC, \255 is 0xff.
+        assert out.strip() == "evil\\x1b[2J\\xffend"
 
     def test_json_output_has_no_note(self, capsys: pytest.CaptureFixture) -> None:
         out, err = self._run(["--json", "example.com"], _answer(), capsys)
@@ -286,7 +303,7 @@ class TestDNSSECVerdictOnStderr:
 
     def test_json_says_disabled_rather_than_insecure(self, capsys: pytest.CaptureFixture) -> None:
         """The stderr note gets this right; the JSON payload used to claim "insecure"."""
-        out, _ = self._run(["--json", "--no-dnssec", "example.com"], _answer(dnssec=ValidationState.INSECURE), capsys)
+        out, _ = self._run(["--json", "--no-dnssec", "example.com"], _answer(dnssec=ValidationState.DISABLED), capsys)
         assert json.loads(out)["dnssec"] == "disabled"
 
     def test_text_mode_still_reports(self, capsys: pytest.CaptureFixture) -> None:
@@ -307,9 +324,24 @@ class TestDNSSECVerdictOnStderr:
     def test_a_completed_trace_still_says_disabled(self, capsys: pytest.CaptureFixture) -> None:
         step = TraceStep(server="1.2.3.4", qname="example.com.", rdtype="A", response_type="answer")
         with patch("recursive_resolver.cli.RecursiveResolver") as cls:
-            cls.return_value.trace_answer.return_value = (_answer(dnssec=ValidationState.INSECURE), [step])
+            cls.return_value.trace_answer.return_value = (_answer(dnssec=ValidationState.DISABLED), [step])
             main(["--trace", "--json", "--no-dnssec", "example.com"])
         assert json.loads(capsys.readouterr().out)["dnssec"] == "disabled"
+
+    def test_a_failed_trace_names_the_error(self, capsys: pytest.CaptureFixture) -> None:
+        """A BOGUS verdict used to read as "last response: answer"; the exception is what matters."""
+        from recursive_resolver import DNSSECValidationError, Trace
+
+        trace = Trace([TraceStep(server="1.2.3.4", qname="example.com.", rdtype="A", response_type="answer")])
+        trace.error = DNSSECValidationError("example.com.", "A", "RRSIG did not verify")
+        with patch("recursive_resolver.cli.RecursiveResolver") as cls:
+            cls.return_value.trace_answer.return_value = (None, trace)
+            assert main(["--trace", "example.com"]) == 1
+        assert "DNSSECValidationError" in capsys.readouterr().err
+        with patch("recursive_resolver.cli.RecursiveResolver") as cls:
+            cls.return_value.trace_answer.return_value = (None, trace)
+            main(["--trace", "--json", "example.com"])
+        assert json.loads(capsys.readouterr().out)["error"] == "DNSSECValidationError"
 
     def test_trace_mode_reports_before_the_records(self, capsys: pytest.CaptureFixture) -> None:
         answer = _answer()

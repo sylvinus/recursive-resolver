@@ -142,11 +142,11 @@ off rather than DNSSEC off in every config but one.
 
 ## Layer 4: cassette replay with systematic perturbation
 
-Run for this release: 397 cassettes over 23,320 recorded responses, 19,453
-perturbed replays, no failures. Five of the mutations below are caught here
+Run for 0.3.0: 400 cassettes over 21,419 recorded responses, 19,600
+perturbed replays, no failures. Three of the mutations below are caught here
 independently of the unit suite - the retrieval-failure family, which is the
-class this layer exists for. The other forty-five survive it, and are meant to:
-they need input the honest internet does not send.
+class this layer exists for. The rest survive it, and are meant to: they need
+input the honest internet does not send.
 
 ```bash
 python scripts/cassette.py record --csv adversarial.csv -o cassettes.jsonl --types A,MX
@@ -177,7 +177,7 @@ What must hold, checked on every replay along with the Layer 0 invariants:
   and this is where that promise meets 19,000 adversarial replays.
 
 `record` drops any name whose cassette does not reproduce its own baseline
-offline, and says which. Three of 400 did not: zones whose nameservers disagree
+offline, and says which. At 0.2.0 three of 400 did not: zones whose nameservers disagree
 with each other, so replaying with a different one first walks into a branch
 the recording never entered. Keeping them would mean `replay` failing forever
 and `perturb` measuring every scenario against an outcome that was never
@@ -264,7 +264,7 @@ multiplies the traffic; trim it before you raise the worker count.
 ## Running it before a release
 
 ```bash
-make check           # unit suite, lint, types, 100% coverage gate
+make check-all       # lint, types, offline and live suites, 100% coverage gate
 make test-corpus     # build the adversarial corpus          (network)
 make test-verdicts   # verdict differential and flap detection (network)
 make test-record     # record cassettes                       (network)
@@ -389,6 +389,10 @@ No vulnerability. Every resource-exhaustion class is bounded, with numbers:
 | Water torture, 1000 subdomains under an NXDOMAIN parent | 0 upstream queries |
 | Ghost domain | delegation TTL clamped to 86400 s, not extendable |
 
+Since 0.3.0 the water-torture row holds only under an authenticated NXDOMAIN:
+an unproven one no longer covers the names below it (see the 0.3.0 entry in
+CHANGELOG.md), so each of those names costs a query again.
+
 The bulk of those advisories do not apply: C memory-safety bugs and
 DNSCrypt/DoQ/DoT/proxy-protocol paths that do not exist in a pure-Python Do53
 library.
@@ -486,8 +490,9 @@ evidence if something has recently made it go red.
 - **RFC 9156** QNAME minimisation is not implemented. The major implementations
   do it by default. A privacy gap, not a correctness one.
 - **No per-server infrastructure cache.** The references remember round-trip
-  times, EDNS capability and recent failures per address; this resolver
-  re-probes on every resolution. Costs queries against dead servers.
+  times, EDNS capability and recent failures per address across lookups. This
+  resolver remembers them only for the rest of one resolution, and re-probes
+  on the next. Costs queries against dead servers.
 - **No 0x20 query-name case randomisation** (optional under RFC 5452). The
   randomised query ID and source port with strict response matching meet the
   baseline.
@@ -510,7 +515,7 @@ would have missed, plus the opt-out NODATA above, because only real DNS is
 broken in the ways real DNS is broken. A release wants all three, and the
 audit wants repeating whenever this code changes.
 
-The mutation catalogue in `scripts/mutation_check.py` now holds 52 entries: one
+The mutation catalogue in `scripts/mutation_check.py` held 52 entries at 0.2.0: one
 per defect found across all three methods, plus a plausible weakening of each
 control that replaced one. Each reintroduces the bug into a copy of the package
 and confirms the suite still fails. That is the only evidence that the tests
@@ -525,3 +530,46 @@ and the report called it caught. The copy now excludes `__pycache__` and
 `*.pyc`, so every mutant is compiled from the mutated source. Re-run after the
 fix: that mutant executes, and the suite fails on it like the rest. All 52 are
 caught, and all 52 now demonstrably ran.
+
+## The 0.3.0 run
+
+A whole-project review, including the dnspython code paths the resolver relies
+on, found three ways to get forged data accepted from a signed zone, and a
+dozen budget, conformance and API defects; CHANGELOG.md lists them. The three
+forgeries share the shape the 0.2.0 audit warned about: a genuine, public,
+correctly signed record or field used out of place (a wildcard's NSEC under
+another name, a DNAME beside a CNAME it does not imply, an RRSIG signer field
+naming an unrelated zone). No live corpus contains them; each was reproduced
+against the signed-zone fixture with only `_send_query` replaced.
+
+Every fix has a regression test, and each was confirmed to fail with its fix
+reverted. Seventeen of those reversions joined the catalogue.
+
+The full protocol was then run: 3,983 names, 15,916 audited lookups, 400
+cassettes. No flaps, no invariant violations, no failed perturbation, and
+every mutant caught by the unit layer. It found one more defect, present
+since 0.1.0: every name in `root-servers.net` came back "material
+unavailable". The root servers serve that zone but not `net`, and refer to
+the `net` servers when asked for `net`'s keys or for the DS of
+`root-servers.net`. The chain walk only ever asked the servers it started
+with. It now follows that referral, and two entries for it bring the
+catalogue to 71.
+
+The verdict differential reported one disagreement, and a re-run of the 55
+flagged names two more. All three were checked by hand and none is ours:
+
+- **`_dmarc.albertthebackpacker.com`**, SOA and DNSKEY. The zone's only
+  nameserver mostly times out, and `com` proves it has no DS. The "bogus"
+  side is one or two references answering SERVFAIL while the others time out.
+- **`www.gocondominios.pt/DNSKEY`**. Three of the four Azure DNS servers
+  answer a DNSKEY query at a CNAME with the CNAME unsigned; the fourth signs
+  it, and all four sign it for A and DS queries. The references SERVFAIL on
+  the unsigned copy. We ask a sibling, and either get the signed copy and
+  follow it (NODATA at the end of the chain) or report the material
+  unavailable. `www.live.com/DNSKEY` is the same Azure behaviour, with a split
+  panel.
+
+The query cost of a cold lookup was re-measured against live DNS: `www.gov.uk`
+went from 44 queries to 24, and with `ipv4_only=False` on a host without IPv6
+every name in the review's sample now resolves, where five of them used to run
+out of budget.

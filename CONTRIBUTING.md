@@ -64,7 +64,8 @@ the file header and add a row to `THIRD-PARTY.md`.
   bailiwick, AA, class and address rules each exist because a specific attack or
   real-world failure was observed. `CHANGELOG.md` records which.
 - **Keep dnspython exceptions inside the resolver.** Everything raised out of
-  the public API must be a `ResolverError`. Bare `except Exception` is not
+  a resolution must be a `ResolverError`; only invalid constructor arguments
+  raise `ValueError`. Bare `except Exception` is not
   acceptable in the query path: it is what previously turned malformed input
   into phantom network timeouts.
 - Unit tests must not touch the network. Use the builders in `tests/conftest.py`
@@ -149,14 +150,18 @@ because `dig +short` does not validate either.
 The script is interactive and every step is a y/N gate, so you can read what it
 found before continuing. It:
 
-1. checks the tree is clean, the two version strings agree, the changelog has an
-   entry and the tag does not already exist;
+1. checks the two version strings agree, the changelog has an entry and the tag
+   does not already exist, and refuses to go on with uncommitted changes: the
+   artifacts are built from the working tree, and the tag it prints names
+   `HEAD`;
 2. runs `make check-all`;
 3. builds the sdist and wheel **inside Docker**, so the host never needs `pip`,
-   `build` or `twine`, and runs `twine check`;
+   `build` or `twine`, and runs `twine check`. `build`, `twine` and the
+   Hatchling backend are pinned at the top of the script; bump them there
+   deliberately;
 4. inspects the artifacts against what this package promises: `py.typed`
    present, no tests or scripts in the wheel, LICENSE bundled, and the
-   `dnspython` floor at or above the 2.8.0 security floor with the `dnssec` and
+   `dnspython` floor at or above the 2.9.2 security floor with the `dnssec` and
    `idna` extras. It reads these out of the built wheel's `METADATA`, not out
    of `pyproject.toml`, so a build that lost them is caught;
 5. uploads to TestPyPI, then installs from there in a throwaway container and
@@ -200,4 +205,5 @@ a release:
 - Trust anchors: <https://data.iana.org/root-anchors/root-anchors.xml>
 
 Only anchors that are currently valid belong in the file: retired ones (such as
-KSK-2010, tag 19036) must be removed, not kept "just in case".
+KSK-2010, tag 19036) must be removed, not kept "just in case". KSK-2017 (tag
+20326) is scheduled for revocation on 2027-01-11 and is the next to go.

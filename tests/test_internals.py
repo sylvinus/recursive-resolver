@@ -23,8 +23,14 @@ from conftest import make_response, offline_resolver, referral, root_to_com
 from recursive_resolver import (
     AddressFilter,
     CNAMELoopError,
+    DNSSECInsecureError,
+    DNSSECMaterialUnavailableError,
     DNSSECUnavailableError,
+    DNSSECValidationError,
+    InvalidNameError,
     Limits,
+    MaxDepthError,
+    NoAnswerError,
     NXDOMAINError,
     QueryBudgetExceededError,
     RecursiveResolver,
@@ -399,7 +405,7 @@ class TestLoopErrorPaths:
         resolver = offline_resolver(limits=Limits(max_queries=1))
         ctx = resolver._new_context()
         ctx.budget.spend_query("x.", "A")
-        assert resolver._resolve_ns_names([dns.name.from_text("ns.example.com.")], ctx, 1, limit=5) == []
+        assert resolver._resolve_ns_names([dns.name.from_text("ns.example.com.")], ctx, 1) == []
 
     def test_the_aaaa_lookup_is_skipped_once_the_budget_is_gone(self) -> None:
         """The A lookup can spend the last query; asking for AAAA anyway overruns."""
@@ -413,7 +419,7 @@ class TestLoopErrorPaths:
             raise ServfailError(str(ns_name), dns.rdatatype.to_text(rdtype))
 
         with patch.object(resolver, "_resolve_iterative", side_effect=resolve):
-            assert resolver._resolve_ns_names([dns.name.from_text("ns.example.com.")], ctx, 1, limit=5) == []
+            assert resolver._resolve_ns_names([dns.name.from_text("ns.example.com.")], ctx, 1) == []
         assert asked == [dns.rdatatype.A], "AAAA was queried with no budget left"
 
     def test_all_servers_erroring_raises_servfail(self) -> None:
@@ -444,7 +450,7 @@ class TestZoneKeyCache:
 class TestNXDOMAINCaching:
     def test_nxdomain_below_a_cached_nxdomain_is_free(self) -> None:
         resolver = RecursiveResolver(dnssec=False, cache_enabled=True)
-        resolver.cache.put_nxdomain(dns.name.from_text("gone.example.com."), ttl=300)
+        resolver.cache.put_nxdomain(dns.name.from_text("gone.example.com."), ttl=300, secure=True)
         with patch.object(resolver, "_send_query") as send, pytest.raises(NXDOMAINError):
             resolver.resolve("a.b.gone.example.com", "MX")
         send.assert_not_called()
@@ -772,7 +778,7 @@ class TestStaleDelegationFallback:
     def test_the_fallback_never_re_tries_addresses_already_used(self) -> None:
         resolver = offline_resolver()
         ctx = resolver._new_context()
-        with patch.object(resolver, "_resolve_ns_names", return_value=["9.9.9.9", "1.1.1.1"]):
+        with patch.object(resolver, "_ns_addresses", return_value=["9.9.9.9", "1.1.1.1"]):
             fresh = resolver._fallback_nameservers([dns.name.from_text("ns.example.net.")], {"9.9.9.9"}, ctx, 0)
         assert fresh == ["1.1.1.1"]
 
@@ -805,3 +811,273 @@ class TestConstructorRejectsOutOfRangeEDNS:
         resolver = offline_resolver(edns_payload=1232)
         with patch.object(resolver, "_send_query", return_value=(None, "")), pytest.raises(ResolverError):
             resolver.resolve("example.com", "A")
+
+
+class TestConstructorArguments:
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"timeout": 0},
+            {"timeout": -1},
+            {"max_resolution_time": 0},
+            {"max_depth": 0},
+            {"max_retries": -1},
+            {"max_cname_chain": -1},
+            {"clock_skew": -5},
+        ],
+    )
+    def test_out_of_range_values_are_refused(self, kwargs: dict) -> None:
+        """`--timeout -1` used to be accepted and reported every lookup as "all nameservers timed out"."""
+        with pytest.raises(ValueError):
+            RecursiveResolver(dnssec=False, **kwargs)
+
+    def test_arguments_are_keyword_only(self) -> None:
+        with pytest.raises(TypeError):
+            RecursiveResolver(2.0)  # type: ignore[misc]
+
+    @pytest.mark.parametrize("field", ["max_queries", "max_ns_per_referral", "max_nx_targets", "max_referrals"])
+    def test_limits_are_validated(self, field: str) -> None:
+        with pytest.raises(ValueError, match=field):
+            Limits(**{field: 0})
+        with pytest.raises(TypeError):
+            Limits(64)  # type: ignore[misc]
+
+
+class TestExceptionsCrossProcessBoundaries:
+    """Process pools and task queues pickle exceptions; most of ours used to fail to unpickle."""
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            NoAnswerError("x.example.", "TXT"),
+            NXDOMAINError("x.example.", "A"),
+            ServfailError("x.example.", "A", rcode=5, reason="refused"),
+            QueryBudgetExceededError(None, None, "signature validations", 96),
+            ResolutionTimeoutError("x.example.", "A"),
+            MaxDepthError("x.example.", "A", 20),
+            CNAMELoopError("x.example.", ["a.", "b."]),
+            InvalidNameError("bad..name", "empty label"),
+            UnsupportedRdtypeError("NOPE"),
+            DNSSECValidationError("x.example.", "A", "RRSIG did not verify"),
+            DNSSECInsecureError("x.example.", "A"),
+            DNSSECMaterialUnavailableError("x.example.", "DNSKEY"),
+            DNSSECUnavailableError(),
+        ],
+    )
+    def test_every_error_survives_a_pickle_round_trip(self, error: ResolverError) -> None:
+        import pickle
+
+        error.query_name = "caller.example."
+        again = pickle.loads(pickle.dumps(error))
+        assert type(again) is type(error)
+        assert str(again) == str(error)
+        assert again.__dict__ == error.__dict__
+
+    def test_the_callers_query_is_attached(self) -> None:
+        """`qname` is where the failure happened; `query_name` is what was asked."""
+        resolver = offline_resolver()
+
+        def send(qname, rdtype, nameservers, ctx, usable=None):
+            if qname == dns.name.from_text("www.example.com."):
+                return make_response(answer=[("www.example.com.", 300, "CNAME", ["gone.example.net."])]), "9.9.9.9"
+            return make_response(
+                rcode=dns.rcode.NXDOMAIN, authority=[("example.net.", 300, "SOA", [SOA_TEXT])]
+            ), "9.9.9.9"
+
+        with patch.object(resolver, "_send_query", side_effect=send), pytest.raises(NXDOMAINError) as caught:
+            resolver.resolve("www.example.com", "A")
+        assert caught.value.qname == "gone.example.net."
+        assert caught.value.query_name == "www.example.com."
+        assert caught.value.query_type == "A"
+
+    def test_a_budget_error_names_no_fake_query(self) -> None:
+        with pytest.raises(QueryBudgetExceededError) as caught:
+            QueryBudget(max_signature_validations=0).spend_signature_validation()
+        assert caught.value.qname is None
+        assert "<dnssec>" not in str(caught.value)
+
+
+SOA_TEXT = "ns.example.net. admin.example.net. 1 3600 900 604800 300"
+
+
+class TestTraceReportsTheOutcome:
+    def test_the_error_is_kept_with_the_trace(self) -> None:
+        resolver = offline_resolver()
+        with patch.object(resolver, "_send_query", return_value=(make_response(rcode=dns.rcode.REFUSED), "9.9.9.9")):
+            answer, trace = resolver.trace_answer("example.com", "A")
+        assert answer is None
+        assert isinstance(trace.error, ServfailError)
+
+    def test_a_bogus_response_is_marked_bogus_in_its_step(self) -> None:
+        """The step used to show the chain state it was sent under, "secure", for a forged answer."""
+        resolver = RecursiveResolver(cache_enabled=False)
+        response = make_response(answer=[("www.example.com.", 300, "A", ["1.2.3.4"])])
+        start = (dns.name.from_text("example.com."), ["9.9.9.9", "1.1.1.1"], ValidationState.SECURE, None, [])
+        with (
+            patch.object(resolver, "_starting_point", return_value=start),
+            patch.object(resolver, "_send_query", return_value=(response, "9.9.9.9")),
+            patch.object(resolver, "_insecurely_delegated", return_value=False),
+        ):
+            answer, trace = resolver.trace_answer("www.example.com", "A")
+        assert answer is None and isinstance(trace.error, DNSSECValidationError)
+        assert trace[-1].dnssec == "bogus"
+
+
+class TestPerResolutionMemory:
+    """What one resolution learns about servers and names, it does not pay for twice."""
+
+    ZONE = dns.name.from_text("example.com.")
+
+    def _ctx(self, resolver: RecursiveResolver):
+        return resolver._new_context()
+
+    def test_servers_that_refused_the_zone_are_not_asked_again(self) -> None:
+        resolver = offline_resolver()
+        ctx = self._ctx(resolver)
+        ctx.failed_servers.update({(self.ZONE, "9.9.9.9"), (self.ZONE, "1.1.1.1")})
+        start = (self.ZONE, ["9.9.9.9", "1.1.1.1"], ValidationState.INSECURE, None, [])
+        with (
+            patch.object(resolver, "_starting_point", return_value=start),
+            patch.object(resolver, "_send_query") as send,
+            pytest.raises(ServfailError, match="refused"),
+        ):
+            resolver._resolve_iterative(dns.name.from_text("www.example.com."), dns.rdatatype.A, ctx, 0, [])
+        send.assert_not_called()
+
+    def test_their_zone_falls_back_to_its_other_names(self) -> None:
+        resolver = offline_resolver()
+        ctx = self._ctx(resolver)
+        ctx.failed_servers.add((self.ZONE, "9.9.9.9"))
+        start = (self.ZONE, ["9.9.9.9"], ValidationState.INSECURE, None, [dns.name.from_text("ns.example.net.")])
+        good = make_response(answer=[("www.example.com.", 300, "A", ["1.2.3.4"])])
+        with (
+            patch.object(resolver, "_starting_point", return_value=start),
+            patch.object(resolver, "_ns_addresses", return_value=["8.8.8.8"]),
+            patch.object(resolver, "_send_query", return_value=(good, "8.8.8.8")) as send,
+        ):
+            answer = resolver._resolve_iterative(dns.name.from_text("www.example.com."), dns.rdatatype.A, ctx, 0, [])
+        assert answer.records == ["1.2.3.4"]
+        assert send.call_args.args[2] == ["8.8.8.8"]
+
+    def test_no_reachable_server_is_a_server_failure_not_a_timeout(self) -> None:
+        import errno
+
+        from recursive_resolver.resolver import _FatalServerError
+
+        resolver = offline_resolver()
+        start = (self.ZONE, ["9.9.9.9"], ValidationState.INSECURE, None, [])
+        with (
+            patch.object(resolver, "_starting_point", return_value=start),
+            patch.object(resolver, "_query_once", side_effect=_FatalServerError("no", errno=errno.EHOSTUNREACH)),
+            pytest.raises(ServfailError, match="reachable"),
+        ):
+            resolver.resolve("www.example.com", "A")
+
+    def test_a_known_ns_address_is_reused(self) -> None:
+        resolver = offline_resolver()
+        ctx = self._ctx(resolver)
+        name = dns.name.from_text("ns.example.net.")
+        ctx.ns_addresses[(name, int(dns.rdatatype.A))] = ["8.8.8.8"]
+        ctx.ns_addresses[(dns.name.from_text("dead.example.net."), int(dns.rdatatype.A))] = None
+        with patch.object(resolver, "_resolve_iterative") as walk:
+            assert resolver._ns_addresses(name, dns.rdatatype.A, ctx, 1) == ["8.8.8.8"]
+            assert resolver._ns_addresses(dns.name.from_text("dead.example.net."), dns.rdatatype.A, ctx, 1) == []
+        walk.assert_not_called()
+
+    def test_nothing_fresh_means_no_fallback(self) -> None:
+        resolver = offline_resolver()
+        ctx = self._ctx(resolver)
+        with patch.object(resolver, "_ns_addresses", return_value=["9.9.9.9"]):
+            assert resolver._fallback_nameservers([dns.name.from_text("ns.example.net.")], {"9.9.9.9"}, ctx, 0) == []
+
+    def test_an_unreachable_family_is_not_looked_up(self) -> None:
+        resolver = offline_resolver(ipv4_only=False)
+        ctx = self._ctx(resolver)
+        ctx.unreachable_families.add(4)
+        asked: list[int] = []
+
+        def lookup(ns_name, rdtype, ctx_, depth):
+            asked.append(rdtype)
+            return []
+
+        with patch.object(resolver, "_ns_addresses", side_effect=lookup):
+            resolver._resolve_ns_names([dns.name.from_text("ns.example.net.")], ctx, 1)
+        assert asked == [dns.rdatatype.AAAA]
+
+
+class TestDelegationAndKeyLifetimes:
+    def test_an_insecure_delegation_lives_no_longer_than_its_no_ds_proof(self) -> None:
+        from signed_zone import SignedZone, rrset_of
+
+        resolver = RecursiveResolver(dnssec=False, cache_enabled=True)
+        parent = SignedZone.create("com.")
+        nsec = rrset_of("example.com.", "NSEC", "f.com. NS RRSIG NSEC")
+        response = make_response(authority=[("example.com.", 3600, "NS", ["ns1.example.com."])], aa=False)
+        response.authority += [nsec, parent.sign(nsec, expiration=int(time.time()) + 30)]
+        args = (dns.name.from_text("example.com."), [dns.name.from_text("ns1.example.com.")], ["9.9.9.9"])
+        resolver._cache_delegation(*args, response, ValidationState.INSECURE)
+        entry = resolver.cache._cache[("DG", dns.name.from_text("example.com."), 0, 0)]
+        assert entry.expiry - time.monotonic() <= 30
+
+        resolver.cache.clear()
+        response.authority[-1] = parent.sign(nsec, expiration=int(time.time()) - 1)
+        resolver._cache_delegation(*args, response, ValidationState.INSECURE)
+        assert resolver.cache.get_delegation(dns.name.from_text("example.com.")) is None
+
+    def test_without_dnssec_material_the_ns_ttl_stands(self) -> None:
+        resolver = RecursiveResolver(dnssec=False, cache_enabled=True)
+        response = make_response(authority=[("example.com.", 600, "NS", ["ns1.example.com."])], aa=False)
+        zone = dns.name.from_text("example.com.")
+        resolver._cache_delegation(
+            zone, [dns.name.from_text("ns1.example.com.")], ["9.9.9.9"], response, ValidationState.SECURE
+        )
+        entry = resolver.cache._cache[("DG", zone, 0, 0)]
+        assert 590 < entry.expiry - time.monotonic() <= 600
+
+    def test_keys_whose_signature_has_expired_are_not_cached(self) -> None:
+        resolver = RecursiveResolver(dnssec=True)
+        resolver._store_keys(ZoneKeys(dns.name.from_text("example.com."), None, ValidationState.SECURE), 0)
+        assert resolver._cached_keys(dns.name.from_text("example.com.")) is None
+
+
+class TestNegativeAnswersWithoutSOA:
+    def test_they_are_not_cached(self) -> None:
+        """RFC 2308 §5: no SOA, no TTL to cache by. They used to be held for 300 seconds."""
+        resolver = RecursiveResolver(dnssec=False, cache_enabled=True)
+        empty = make_response(aa=True)
+        start = (dns.name.from_text("example.com."), ["9.9.9.9"], ValidationState.INSECURE, None, [])
+        with (
+            patch.object(resolver, "_starting_point", return_value=start),
+            patch.object(resolver, "_send_query", return_value=(empty, "9.9.9.9")),
+            pytest.raises(NoAnswerError),
+        ):
+            resolver.resolve("www.example.com", "MX")
+        assert resolver.cache.get_nodata("www.example.com.", "MX") is None
+
+
+class TestTheDeadlineIsPerCall:
+    def test_a_waiter_that_gives_up_on_the_leader_has_no_time_of_its_own_left(self) -> None:
+        """A caller that waited out its whole allowance must not then start a full resolution."""
+        resolver = offline_resolver(max_resolution_time=0.2)
+        started = threading.Event()
+        release = threading.Event()
+        calls = {"n": 0}
+
+        def slow_send(qname, rdtype, nameservers, ctx, usable=None):
+            calls["n"] += 1
+            started.set()
+            release.wait(2)
+            return None, ""
+
+        with patch.object(resolver, "_send_query", side_effect=slow_send):
+            leader = threading.Thread(target=lambda: pytest.raises(ResolverError, resolver.resolve, "example.com"))
+            leader.start()
+            started.wait(2)
+            begun = time.monotonic()
+            with pytest.raises(ResolutionTimeoutError):
+                resolver.resolve("example.com", "A")
+            elapsed = time.monotonic() - begun
+            release.set()
+            leader.join()
+        assert elapsed < 0.5
+        assert calls["n"] == 1

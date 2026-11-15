@@ -17,7 +17,8 @@ I1  A DNSSEC verdict requires retrieved material. If any fetch of validation
     ``DNSSECError``; it must end in ``DNSSECMaterialUnavailableError``.
 I2  Every query sent while validating carries EDNS0, so it can carry the DO
     bit (RFC 4035 §3.2.1). Without it the answer arrives unsigned and the
-    validator can only read that as forged.
+    validator can only read that as forged. "Validating" means the chain of
+    trust is secure: below an unsigned delegation plain DNS is allowed.
 I3  No zone is judged on one server's word. A fetch of validation material
     that failed must have asked every usable address in the NS set.
 I4  Nothing is accepted from a response the resolver itself classified as
@@ -147,7 +148,8 @@ def audited(resolver: RecursiveResolver):
         return response, server
 
     def query_once(qname, rdtype, server, payload, timeout, ctx):
-        ledger.queries.append((str(qname), dns.rdatatype.to_text(rdtype), server, payload, ctx.dnssec))
+        validating = ctx.dnssec and not ctx.chain_insecure
+        ledger.queries.append((str(qname), dns.rdatatype.to_text(rdtype), server, payload, validating))
         if ledger.fetches:
             ledger.fetches[-1].asked.add(server)
         return real_query(qname, rdtype, server, payload, timeout, ctx)

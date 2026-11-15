@@ -7,8 +7,10 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import dns.flags
 import dns.message
 import dns.name
+import dns.rcode
 import dns.rdata
 import dns.rdataclass
 import dns.rdataset
@@ -21,6 +23,7 @@ from recursive_resolver import (
     DNSSECInsecureError,
     DNSSECMaterialUnavailableError,
     DNSSECValidationError,
+    NXDOMAINError,
     RecursiveResolver,
     ValidationState,
 )
@@ -110,7 +113,7 @@ class TestZoneKeyFetch:
         with (
             patch.object(resolver, "_order_servers", side_effect=lambda s: list(s)),
             patch.object(resolver, "_query_once", side_effect=query_once),
-            patch.object(resolver._validator, "validate_dnskey", return_value=ValidationState.SECURE),
+            patch.object(resolver._validator, "check_dnskey", return_value=(ValidationState.SECURE, None)),
         ):
             keys = resolver._get_zone_keys(EXAMPLE, SENTINEL_DS, ["9.9.9.9", "1.1.1.1"], ctx)
         assert keys.state is ValidationState.SECURE
@@ -229,13 +232,45 @@ class TestDescendChain:
             return make_response(), "9.9.9.9"
 
         with (
-            patch.object(resolver, "_get_zone_keys", side_effect=lambda z, d, n, c: _keys(z)),
+            patch.object(resolver, "_get_zone_keys", side_effect=lambda z, d, n, c, r=None: _keys(z)),
             patch.object(resolver, "_send_query", side_effect=send),
             patch.object(resolver._validator, "validate_ds", return_value=(ValidationState.SECURE, SENTINEL_DS)),
         ):
             zone, _ds, state = resolver._descend_chain(DEEP, COM, SENTINEL_DS, ["9.9.9.9"], ctx)
         assert zone == DEEP and state is ValidationState.SECURE
         assert visited == ["example.com.", "b.example.com.", "a.b.example.com."]
+
+
+def _referral_to(zone: str, glue: bool = True) -> dns.message.Message:
+    return make_response(
+        authority=[(zone, 3600, "NS", [f"ns.{zone}"])],
+        additional=[(f"ns.{zone}", 3600, "A", ["9.9.9.53"])] if glue else None,
+        aa=False,
+    )
+
+
+class TestReferredServers:
+    """Which rejected response, if any, names the servers of the zone the walk needs."""
+
+    def test_the_referral_to_the_zone_gives_its_glue(self) -> None:
+        resolver = _dnssec_resolver()
+        assert resolver._referred_servers([_referral_to("com.")], COM, ROOT) == ["9.9.9.53"]
+
+    def test_an_error_response_is_skipped(self) -> None:
+        resolver = _dnssec_resolver()
+        error = _referral_to("com.")
+        error.set_rcode(dns.rcode.SERVFAIL)
+        assert resolver._referred_servers([error], COM, ROOT) == []
+
+    def test_a_referral_further_down_is_not_the_zone(self) -> None:
+        resolver = _dnssec_resolver()
+        assert resolver._referred_servers([_referral_to("example.com.")], COM, ROOT) == []
+
+    def test_a_referral_without_glue_is_passed_over(self) -> None:
+        resolver = _dnssec_resolver()
+        rejected = [_referral_to("com.", glue=False), _referral_to("com.")]
+        assert resolver._referred_servers(rejected, COM, ROOT) == ["9.9.9.53"]
+        assert resolver._referred_servers(rejected[:1], COM, ROOT) == []
 
 
 def _referral_with_a_denial(child: dns.name.Name = EXAMPLE) -> dns.message.Message:
@@ -390,10 +425,10 @@ class TestAdvanceDNSSEC:
             ],
             aa=False,
         )
-        assert resolver._authority_signer(response) == COM
+        assert resolver._authority_signer(response, EXAMPLE) == COM
 
     def test_authority_signer_absent(self) -> None:
-        assert _dnssec_resolver()._authority_signer(make_response()) is None
+        assert _dnssec_resolver()._authority_signer(make_response(), EXAMPLE) is None
 
     def test_authority_signer_ignores_unrelated_rrsigs(self) -> None:
         resolver = _dnssec_resolver()
@@ -401,7 +436,35 @@ class TestAdvanceDNSSEC:
             authority=[("example.com.", 300, "RRSIG", ["A 8 2 300 20990101000000 20200101000000 1 com. AAAA"])],
             aa=False,
         )
-        assert resolver._authority_signer(response) is None
+        assert resolver._authority_signer(response, EXAMPLE) is None
+
+    def test_authority_signer_must_contain_the_judged_name(self) -> None:
+        """A signer field naming a zone elsewhere in the tree is not followed.
+
+        The field is unverified, and the chain of trust is walked down to it:
+        a signer naming some unsigned delegation would have its missing DS
+        applied to the name being judged. A genuine one later in the RRset
+        still counts.
+        """
+        resolver = _dnssec_resolver()
+        response = make_response(
+            authority=[
+                (
+                    "example.com.",
+                    300,
+                    "RRSIG",
+                    [
+                        "NSEC 8 2 300 20990101000000 20200101000000 1 unsigned.com. AAAA",
+                        "NSEC 8 2 300 20990101000000 20200101000000 2 com. AAAA",
+                    ],
+                )
+            ],
+            aa=False,
+        )
+        assert resolver._authority_signer(response, EXAMPLE) == COM
+        assert resolver._authority_signer(response, dns.name.from_text("x.unsigned.com.")) == dns.name.from_text(
+            "unsigned.com."
+        )
 
 
 class TestAnswerValidation:
@@ -734,6 +797,12 @@ class TestMaterialPredicates:
         resolver = _dnssec_resolver()
         assert resolver._usable_dnskey(EXAMPLE)(_signed_dnskey_response())
 
+    def test_a_signed_dnskey_answer_without_aa_is_not_the_zone_speaking(self) -> None:
+        response = _signed_dnskey_response()
+        response.flags &= ~dns.flags.AA
+        assert not _dnssec_resolver()._usable_dnskey(EXAMPLE)(response)
+        assert _dnssec_resolver(require_authoritative=False)._usable_dnskey(EXAMPLE)(response)
+
     def test_an_error_rcode_is_not_a_ds_answer(self) -> None:
         resolver = _dnssec_resolver()
         assert not resolver._usable_ds(EXAMPLE)(make_response(rcode=dns.rcode.REFUSED, aa=False))
@@ -909,6 +978,28 @@ class TestRequireDNSSECCoversDenials:
                 negative="nxdomain",
             )
         assert state is ValidationState.INSECURE
+
+    def test_a_cached_unproven_nxdomain_is_refused_again(self) -> None:
+        """A denial is cached before the strict check runs, so a hit repeats it."""
+        resolver = _dnssec_resolver(require_dnssec=True, cache_enabled=True)
+        assert resolver.cache is not None
+        resolver.cache.put_nxdomain(EXAMPLE, ttl=300)
+        with pytest.raises(DNSSECInsecureError):
+            resolver.resolve(EXAMPLE, "A")
+
+    def test_a_cached_unproven_nodata_is_refused_again(self) -> None:
+        resolver = _dnssec_resolver(require_dnssec=True, cache_enabled=True)
+        assert resolver.cache is not None
+        resolver.cache.put_nodata(EXAMPLE, dns.rdatatype.A, ttl=300)
+        with pytest.raises(DNSSECInsecureError):
+            resolver.resolve(EXAMPLE, "A")
+
+    def test_a_cached_proven_denial_is_served(self) -> None:
+        resolver = _dnssec_resolver(require_dnssec=True, cache_enabled=True)
+        assert resolver.cache is not None
+        resolver.cache.put_nxdomain(EXAMPLE, ttl=300, secure=True)
+        with pytest.raises(NXDOMAINError):
+            resolver.resolve(EXAMPLE, "A")
 
 
 class TestUnverifiableNSEC3ParametersDowngrade:

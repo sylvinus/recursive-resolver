@@ -19,7 +19,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import Any, Literal, TypedDict
 
 import dns.exception
 import dns.flags
@@ -29,7 +29,9 @@ import dns.query
 import dns.rcode
 import dns.rdata
 import dns.rdataclass
+import dns.rdataset
 import dns.rdatatype
+import dns.rdtypes.ANY.CNAME
 import dns.reversename
 import dns.rrset
 
@@ -39,8 +41,11 @@ from .cache import Delegation, DNSCache
 from .dnssec import (
     CLOCK_SKEW,
     DNSSECValidator,
+    Keyring,
     ValidationState,
     ZoneKeys,
+    _trim_keyring,
+    authenticated_ttl,
     cryptography_available,
     find_rrsig,
 )
@@ -61,7 +66,7 @@ from .exceptions import (
     UnsupportedRdtypeError,
 )
 from .roots import get_root_addresses
-from .singleflight import SingleFlight
+from .singleflight import SingleFlight, clone_error
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +81,31 @@ _RANDOM = secrets.SystemRandom()
 # here": retrying is pointless, so the server is abandoned immediately.
 _FATAL_ERRNOS = frozenset({errno.EHOSTUNREACH, errno.ENETUNREACH, errno.EAFNOSUPPORT, errno.EADDRNOTAVAIL})
 
+# The subset raised by the local stack before anything is sent, and which hold
+# for every address of the family: no route at all, no IPv6 configured. One is
+# enough to stop trying that family for the rest of the resolution.
+_FAMILY_ERRNOS = frozenset({errno.ENETUNREACH, errno.EAFNOSUPPORT, errno.EADDRNOTAVAIL})
+
+# How many NS hostnames of a glueless delegation are resolved before the zone
+# is queried. Resolving every one up front, in both address families, spent
+# most of the query budget before the question was even asked; two keeps a
+# spare server for the DNSSEC key fetches, and the rest are resolved only if
+# those fail.
+_NS_NAMES_AHEAD = 2
+
+# Retries of a sibling after an NXDOMAIN, and after an answer with no
+# signature at all in a signed zone, before the response is believed.
+_NXDOMAIN_RETRIES = 1
+_UNSIGNED_COPY_RETRIES = 1
+
+# The address family each address record type belongs to.
+_FAMILY_OF = {dns.rdatatype.A: 4, dns.rdatatype.AAAA: 6}
+
+
+def _family(address: str) -> int:
+    return 6 if ":" in address else 4
+
+
 # Post-DNS-Flag-Day-2020 consensus UDP payload size. Unbound, PowerDNS and
 # Knot all default to 1232; 4096 invites IP fragmentation, which is both a
 # cache-poisoning vector and a common cause of silent blackholing.
@@ -88,18 +118,47 @@ DEFAULT_EDNS_PAYLOAD = 1232
 MAX_KEY_CACHE_SIZE = 2048
 
 
+ResponseKind = Literal["answer", "cname", "referral", "nxdomain", "nodata", "error"]
+
+
 @dataclass
 class TraceStep:
-    """A single step in the resolution trace."""
+    """A single step in the resolution trace.
+
+    ``dnssec`` is the state of the chain of trust when the query was sent, then
+    replaced by the verdict on the response once one is reached: a response
+    that fails validation shows ``bogus`` here.
+    """
 
     server: str
     qname: str
     rdtype: str
-    response_type: str  # "answer", "referral", "cname", "nxdomain", "nodata", "error"
+    response_type: str  # one of ResponseKind
     detail: str = ""
     rcode: int = 0
     zone: str = ""
     dnssec: str = ""
+
+
+class Trace(list[TraceStep]):
+    """The steps of a traced resolution, and the error it ended with, if any."""
+
+    error: ResolverError | None = None
+
+
+class _Classification(TypedDict, total=False):
+    """What a response is, as decided by `_classify_response`."""
+
+    type: ResponseKind
+    detail: str
+    rcode: int
+    ttl: int
+    rrset: dns.rrset.RRset
+    target: dns.name.Name
+    cname_rrset: dns.rrset.RRset
+    dname_rrset: dns.rrset.RRset | None
+    zone: dns.name.Name
+    ns_names: list[dns.name.Name]
 
 
 @dataclass
@@ -109,6 +168,9 @@ class Answer:
     ``records`` gives presentation-format strings for convenience, but anything
     that must round-trip exactly should use :attr:`rrset` or
     :meth:`text_values`.
+
+    ``cname_chain`` lists the names that were redirected, in order: for
+    ``a -> b -> c`` it is ``[a, b]`` and ``canonical_name`` is ``c``.
     """
 
     qname: dns.name.Name
@@ -116,7 +178,7 @@ class Answer:
     rdtype: dns.rdatatype.RdataType
     rrset: dns.rrset.RRset
     ttl: int
-    dnssec: ValidationState = ValidationState.INSECURE
+    dnssec: ValidationState
     cname_chain: list[dns.name.Name] = field(default_factory=list)
 
     @property
@@ -159,6 +221,28 @@ class _Context:
     budget: QueryBudget
     trace: list[TraceStep] | None = None
     dnssec: bool = True
+    # Addresses found for each (NS hostname, address type), or None when the
+    # lookup failed, so neither is paid for twice.
+    ns_addresses: dict[tuple[dns.name.Name, int], list[str] | None] = field(default_factory=dict)
+    # Address families the local stack cannot send to at all.
+    unreachable_families: set[int] = field(default_factory=set)
+    # (zone, server) pairs that answered that zone with an error rcode.
+    failed_servers: set[tuple[dns.name.Name, str]] = field(default_factory=set)
+    # DS lookups made while walking a chain of trust, by (zone, child).
+    chain_steps: dict[tuple[dns.name.Name, dns.name.Name], tuple[ValidationState, Any, bool]] = field(
+        default_factory=dict
+    )
+    # Set by `_send_query` when it gave up without a single server being
+    # reachable, as opposed to servers that did not answer in time.
+    unreachable: bool = False
+    # Set by `_send_query`: the servers that answered its last query with an
+    # error rcode it held back rather than returned.
+    answered_with_error: set[str] = field(default_factory=set)
+    # Servers that showed they cannot do EDNS; see `_send_query`.
+    no_edns: set[str] = field(default_factory=set)
+    # True while the walk queries a zone whose chain of trust is not secure,
+    # where nothing will be validated and plain DNS is an acceptable fallback.
+    chain_insecure: bool = False
 
 
 class RecursiveResolver:
@@ -194,10 +278,11 @@ class RecursiveResolver:
             defaults are the values production resolvers ship.
         edns_payload: Advertised EDNS0 UDP payload size.
         dnssec: Validate DNSSEC. Bogus data raises DNSSECValidationError;
-            legitimately unsigned zones resolve normally.
+            legitimately unsigned zones resolve normally. With validation off,
+            answers report :attr:`ValidationState.DISABLED`.
         require_dnssec: Additionally reject unsigned (insecure) answers.
-        require_authoritative: Only accept answers and negative responses that
-            have the AA bit set.
+        require_authoritative: Only accept answers, CNAME and DNAME
+            redirections, and negative responses that have the AA bit set.
         allow_private_addresses: Permit private/loopback nameserver addresses.
             Leave False unless you run split-horizon DNS you fully trust.
         extra_blocked_networks: Further CIDRs to refuse, added to the built-in
@@ -208,6 +293,8 @@ class RecursiveResolver:
             ``None`` uses the IANA anchors. Override only to validate against a
             private root, or in tests. An empty tuple is rejected rather than
             treated as ``None``.
+
+    Every argument is keyword-only. Out-of-range values raise ``ValueError``.
 
     Most arguments are readable as an attribute of the same name. The cache and
     address settings are not: they are applied to :attr:`cache` and
@@ -222,6 +309,7 @@ class RecursiveResolver:
 
     def __init__(
         self,
+        *,
         timeout: float = 2.0,
         max_depth: int = 20,
         max_cname_chain: int = 10,
@@ -244,6 +332,14 @@ class RecursiveResolver:
         trust_anchors: tuple[str, ...] | None = None,
         clock_skew: int = CLOCK_SKEW,
     ) -> None:
+        if not timeout > 0:
+            raise ValueError(f"timeout must be positive, got {timeout}")
+        if not max_resolution_time > 0:
+            raise ValueError(f"max_resolution_time must be positive, got {max_resolution_time}")
+        if max_depth < 1:
+            raise ValueError(f"max_depth must be at least 1, got {max_depth}")
+        if max_cname_chain < 0 or max_retries < 0 or clock_skew < 0:
+            raise ValueError("max_cname_chain, max_retries and clock_skew must not be negative")
         self.timeout = timeout
         self.max_depth = max_depth
         self.max_cname_chain = max_cname_chain
@@ -290,16 +386,16 @@ class RecursiveResolver:
         self._singleflight: SingleFlight[Answer] = SingleFlight()
 
     @staticmethod
-    def _default_idna_codec() -> Any:
+    def _default_idna_codec() -> dns.name.IDNACodec:
         """IDNA 2008 if available, else IDNA 2003 with a warning.
 
         IDNA 2003 maps German ``ß`` to ``ss``, so ``straße.de`` would be
         resolved as the entirely different domain ``strasse.de``. Browsers and
-        mail systems use IDNA 2008/UTS-46, so we must too.
+        mail systems use IDNA 2008/UTS-46, so we must too. It needs the `idna`
+        package, which the `idna` extra of dnspython pulls in.
         """
-        codec = getattr(dns.name, "IDNA_2008_Practical", None)
-        if codec is not None and getattr(dns.name, "have_idna_2008", False):
-            return codec
+        if dns.name.have_idna_2008:
+            return dns.name.IDNA_2008_Practical
         logger.warning(
             "IDNA 2008 unavailable (install the 'idna' package); falling back to IDNA 2003, "
             "which resolves some internationalised names to different domains."
@@ -308,12 +404,14 @@ class RecursiveResolver:
 
     # ── public API ──────────────────────────────────────────────────────
 
-    def resolve(self, qname: str, rdtype: str = "A") -> list[str]:
+    def resolve(self, qname: str | dns.name.Name, rdtype: str | int = "A") -> list[str]:
         """Resolve a DNS query iteratively from root servers.
 
         Args:
-            qname: The domain name to query (or an IP address for PTR lookups).
-            rdtype: The record type (e.g. "A", "AAAA", "MX", "TXT").
+            qname: The domain name to query (or an IP address for PTR lookups),
+                as text or as a :class:`dns.name.Name`.
+            rdtype: The record type, as text ("A", "MX", "TXT") or as a
+                :class:`dns.rdatatype.RdataType`.
 
         Returns:
             Presentation-format strings for the answer records. For TXT-like
@@ -325,52 +423,66 @@ class RecursiveResolver:
         """
         return self.resolve_answer(qname, rdtype).records
 
-    def resolve_rrset(self, qname: str, rdtype: str = "A") -> dns.rrset.RRset:
+    def resolve_rrset(self, qname: str | dns.name.Name, rdtype: str | int = "A") -> dns.rrset.RRset:
         """Resolve and return the raw dnspython RRset, preserving rdata structure."""
         return self.resolve_answer(qname, rdtype).rrset
 
-    def resolve_answer(self, qname: str, rdtype: str = "A") -> Answer:
+    def resolve_answer(self, qname: str | dns.name.Name, rdtype: str | int = "A") -> Answer:
         """Resolve and return the full :class:`Answer`, including DNSSEC status.
 
         The :class:`Answer` is the caller's own: concurrent callers collapsed
         into one upstream resolution each get a separate copy, so nothing they
         do to it can be seen by another thread or by the cache.
         """
-        name = self._normalize_qname(qname, rdtype)
         rdtype_int = self._parse_rdtype(rdtype)
+        name = self._normalize_qname(qname, rdtype_int)
         key = (name, rdtype_int)
+        # The deadline starts now, not when the work starts: a caller left
+        # waiting on a slow identical call and then running its own would
+        # otherwise get two full allowances.
+        deadline = time.monotonic() + self.max_resolution_time
 
         def work() -> Answer:
-            ctx = self._new_context()
-            return self._resolve_entry(name, rdtype_int, ctx)
+            return self._resolve_entry(name, rdtype_int, self._new_context(deadline=deadline))
 
         answer = self._singleflight.do(key, work, wait_timeout=self.max_resolution_time)
         return replace(answer, rrset=answer.rrset.copy(), cname_chain=list(answer.cname_chain))
 
-    def trace_answer(self, qname: str, rdtype: str = "A") -> tuple[Answer | None, list[TraceStep]]:
+    def trace_answer(self, qname: str | dns.name.Name, rdtype: str | int = "A") -> tuple[Answer | None, Trace]:
         """Resolve, returning both the answer and the trace.
 
         The answer is ``None`` if resolution failed; the trace is still
-        returned so the failure can be diagnosed.
+        returned so the failure can be diagnosed, and its ``error`` attribute
+        holds the exception.
         """
-        name = self._normalize_qname(qname, rdtype)
         rdtype_int = self._parse_rdtype(rdtype)
-        trace: list[TraceStep] = []
+        name = self._normalize_qname(qname, rdtype_int)
+        trace = Trace()
         ctx = self._new_context(trace=trace)
         try:
             answer = self._resolve_entry(name, rdtype_int, ctx)
-        except ResolverError:
+        except ResolverError as exc:
+            trace.error = exc
             return None, trace
         return answer, trace
 
     # ── input handling ──────────────────────────────────────────────────
 
-    def _new_context(self, trace: list[TraceStep] | None = None) -> _Context:
-        budget = self.limits.budget(deadline=time.monotonic() + self.max_resolution_time)
-        return _Context(budget=budget, trace=trace, dnssec=self.dnssec)
+    def _new_context(self, trace: list[TraceStep] | None = None, deadline: float | None = None) -> _Context:
+        if deadline is None:
+            deadline = time.monotonic() + self.max_resolution_time
+        return _Context(budget=self.limits.budget(deadline=deadline), trace=trace, dnssec=self.dnssec)
 
-    def _parse_rdtype(self, rdtype: str) -> dns.rdatatype.RdataType:
+    def _parse_rdtype(self, rdtype: str | int) -> dns.rdatatype.RdataType:
         """Validate and convert a record type, raising UnsupportedRdtypeError."""
+        if isinstance(rdtype, int) and not isinstance(rdtype, bool):
+            try:
+                value = dns.rdatatype.RdataType.make(rdtype)
+            except ValueError as exc:
+                raise UnsupportedRdtypeError(str(rdtype), "record type out of range") from exc
+            return self._check_queryable(value, str(rdtype))
+        if not isinstance(rdtype, str):
+            raise UnsupportedRdtypeError(repr(rdtype), "record type must be a string or an RdataType")
         text = rdtype.strip().upper()
         if not text:
             raise UnsupportedRdtypeError(rdtype, "empty record type")
@@ -383,6 +495,9 @@ class RecursiveResolver:
             # separately, so a number above 65535 raises a plain ValueError
             # rather than UnknownRdatatype. Nothing from dnspython may escape.
             raise UnsupportedRdtypeError(rdtype, "record type out of range") from exc
+        return self._check_queryable(value, rdtype)
+
+    def _check_queryable(self, value: dns.rdatatype.RdataType, rdtype: str) -> dns.rdatatype.RdataType:
         if value == dns.rdatatype.ANY:
             # An ANY response carries several RRsets at once, and an `Answer`
             # holds exactly one, so there is nothing this API could return.
@@ -394,16 +509,27 @@ class RecursiveResolver:
             raise UnsupportedRdtypeError(rdtype, "ANY cannot be queried; ask for specific types")
         if dns.rdatatype.is_metatype(value):
             raise UnsupportedRdtypeError(rdtype, "meta record types cannot be queried")
+        if value == dns.rdatatype.RRSIG and self.dnssec:
+            # An RRSIG RRset has no RRSIG of its own to validate it with, so in
+            # a signed zone every answer would come back BOGUS.
+            raise UnsupportedRdtypeError(rdtype, "RRSIG cannot be validated; query the covered type instead")
         return value
 
-    def _normalize_qname(self, qname: str, rdtype: str) -> dns.name.Name:
+    def _normalize_qname(self, qname: str | dns.name.Name, rdtype: int) -> dns.name.Name:
         """Validate the query name, IDNA-encoding it and handling PTR reversal."""
+        if isinstance(qname, dns.name.Name):
+            return qname if qname.is_absolute() else qname.concatenate(dns.name.root)
         if not isinstance(qname, str) or not qname.strip():
             raise InvalidNameError(str(qname), "empty name")
+        qname = qname.strip()
+        if qname == "@":
+            # Zone-file shorthand for the origin, which dnspython reads as the
+            # root. Nobody passing it means the root.
+            raise InvalidNameError(qname, "'@' is zone-file shorthand, not a domain name")
 
-        if rdtype.strip().upper() == "PTR":
+        if rdtype == dns.rdatatype.PTR:
             try:
-                addr = ipaddress.ip_address(qname.strip())
+                addr = ipaddress.ip_address(qname)
             except ValueError:
                 pass
             else:
@@ -429,10 +555,36 @@ class RecursiveResolver:
     # ── resolution ──────────────────────────────────────────────────────
 
     def _resolve_entry(self, qname: dns.name.Name, rdtype: dns.rdatatype.RdataType, ctx: _Context) -> Answer:
-        answer = self._resolve_iterative(qname, rdtype, ctx, depth=0, cname_chain=[])
-        if self.require_dnssec and answer.dnssec is not ValidationState.SECURE:
-            raise DNSSECInsecureError(str(qname), dns.rdatatype.to_text(rdtype))
+        try:
+            answer = self._resolve_iterative(qname, rdtype, ctx, depth=0, cname_chain=[])
+            if self.require_dnssec and answer.dnssec is not ValidationState.SECURE:
+                raise DNSSECInsecureError(str(qname), dns.rdatatype.to_text(rdtype))
+        except ResolverError as exc:
+            exc.query_name = str(qname)
+            exc.query_type = dns.rdatatype.to_text(rdtype)
+            raise
+        if not ctx.dnssec:
+            return replace(answer, dnssec=ValidationState.DISABLED)
         return answer
+
+    # Failures worth remembering for a few seconds (RFC 9520): the servers did
+    # answer, or provably could not, and asking again at once would get the
+    # same. Running out of time or budget says nothing about the name.
+    _CACHEABLE_FAILURES = (ServfailError, DNSSECValidationError, DNSSECMaterialUnavailableError)
+
+    def _cached_failure(self, qname: dns.name.Name, rdtype: dns.rdatatype.RdataType) -> None:
+        if self.cache is None:
+            return
+        error = self.cache.get_failure(qname, rdtype)
+        if error is not None:
+            logger.debug("Recent failure for %s/%s is cached: %s", qname, dns.rdatatype.to_text(rdtype), error)
+            raise clone_error(error)
+
+    def _remember_failure(self, qname: dns.name.Name, rdtype: dns.rdatatype.RdataType, error: ResolverError) -> None:
+        if self.cache is not None and isinstance(error, self._CACHEABLE_FAILURES):
+            # A copy: the original carries on up the stack and is annotated
+            # on the way.
+            self.cache.put_failure(qname, rdtype, clone_error(error))
 
     def _require_proven_denial(self, state: ValidationState, qname: dns.name.Name, rdtype_text: str) -> None:
         """Hold a denial to the same standard as an answer under ``require_dnssec``.
@@ -526,6 +678,18 @@ class RecursiveResolver:
                     return delegation.zone, addresses, state, delegation.ds, names
         return dns.name.root, list(self._root_addresses), ValidationState.SECURE, None, []
 
+    def _cached_cname(
+        self, qname: dns.name.Name, rdtype: dns.rdatatype.RdataType
+    ) -> tuple[dns.name.Name, int, ValidationState] | None:
+        """A cached CNAME at ``qname``, as (target, remaining TTL, state)."""
+        if self.cache is None or not self.cache_answers or rdtype == dns.rdatatype.CNAME:
+            return None
+        entry = self.cache.get_answer(qname, dns.rdatatype.CNAME, record_stats=False)
+        if entry is None or entry.rrset is None:
+            return None
+        state = ValidationState.SECURE if entry.secure else ValidationState.INSECURE
+        return entry.rrset[0].target, max(0, int(entry.expiry - time.monotonic())), state
+
     def _resolve_iterative(
         self,
         qname: dns.name.Name,
@@ -534,7 +698,7 @@ class RecursiveResolver:
         depth: int,
         cname_chain: list[dns.name.Name],
     ) -> Answer:
-        """Core iterative resolution loop."""
+        """Resolve one name: from the cache if possible, else by walking down to it."""
         rdtype_text = dns.rdatatype.to_text(rdtype)
         if depth > self.max_depth:
             raise MaxDepthError(str(qname), rdtype_text, self.max_depth)
@@ -544,7 +708,29 @@ class RecursiveResolver:
         cached = self._check_cache(qname, rdtype)
         if cached is not None:
             return cached
+        self._cached_failure(qname, rdtype)
+        cname = self._cached_cname(qname, rdtype)
+        if cname is not None:
+            target, ttl, state = cname
+            logger.debug("Following cached CNAME %s -> %s for %s", qname, target, rdtype_text)
+            return self._follow_cname(qname, target, rdtype, ctx, depth, cname_chain, state, ttl)
 
+        try:
+            return self._walk(qname, rdtype, ctx, depth, cname_chain)
+        except ResolverError as exc:
+            self._remember_failure(qname, rdtype, exc)
+            raise
+
+    def _walk(
+        self,
+        qname: dns.name.Name,
+        rdtype: dns.rdatatype.RdataType,
+        ctx: _Context,
+        depth: int,
+        cname_chain: list[dns.name.Name],
+    ) -> Answer:
+        """Core iterative resolution loop."""
+        rdtype_text = dns.rdatatype.to_text(rdtype)
         current_zone, current_nameservers, chain_state, current_ds, cached_ns_names = self._starting_point(
             qname, rdtype
         )
@@ -554,33 +740,69 @@ class RecursiveResolver:
         # empty list and we report a DNSSEC failure of our own making.
         zone_nameservers = list(current_nameservers)
         # Seeded from the cached delegation so a dead address set still has its
-        # hostnames to fall back on.
-        pending_ns_names: list[dns.name.Name] = cached_ns_names
+        # hostnames to fall back on. Names inside the zone they serve are left
+        # out here and below: they can only be reached through glue, and
+        # resolving one sends the walk back through the very delegation that
+        # is failing, again and again until the budget runs out.
+        pending_ns_names = [n for n in cached_ns_names if not n.is_subdomain(current_zone)]
         tried_addresses: set[str] = set()
-        nxdomain_retries_left = 2
+        nxdomain_retries_left = _NXDOMAIN_RETRIES
+        unsigned_retries_left = _UNSIGNED_COPY_RETRIES
+        referrals = 0
 
-        for _ in range(self.max_depth):
+        # Every pass sends at least one query or ends the walk, so the query
+        # budget bounds this loop; this bound is only a backstop.
+        for _ in range(self.max_depth + self.limits.max_queries):
             if ctx.budget.expired():
                 raise ResolutionTimeoutError(str(qname), rdtype_text)
 
+            # A server that already refused this zone will refuse it again.
+            live = [ns for ns in current_nameservers if (current_zone, ns) not in ctx.failed_servers]
+            if current_nameservers and not live:
+                fallback = self._fallback_nameservers(pending_ns_names, tried_addresses, ctx, depth)
+                if fallback:
+                    current_nameservers = fallback
+                    zone_nameservers.extend(a for a in fallback if a not in zone_nameservers)
+                    continue
+                raise ServfailError(
+                    str(qname), rdtype_text, reason=f"every nameserver for {current_zone} refused the query"
+                )
+            current_nameservers = live
+
             tried_addresses.update(current_nameservers)
-            response, server = self._send_query(qname, rdtype, current_nameservers, ctx)
+            # Plain DNS is a usable last rung only where nothing is validated.
+            ctx.chain_insecure = chain_state is not ValidationState.SECURE
+            try:
+                response, server = self._send_query(qname, rdtype, current_nameservers, ctx)
+            finally:
+                ctx.chain_insecure = False
             if response is None:
                 fallback = self._fallback_nameservers(pending_ns_names, tried_addresses, ctx, depth)
                 if fallback:
                     current_nameservers = fallback
+                    zone_nameservers.extend(a for a in fallback if a not in zone_nameservers)
                     continue
+                if ctx.unreachable and not ctx.budget.expired():
+                    raise ServfailError(
+                        str(qname), rdtype_text, reason=f"no nameserver for {current_zone} is reachable from here"
+                    )
                 raise ResolutionTimeoutError(str(qname), rdtype_text)
 
             classification = self._classify_response(response, qname, rdtype, current_zone)
             kind = classification["type"]
-            self._record_trace(ctx, server, qname, rdtype_text, classification, response, current_zone, chain_state)
+            step = self._record_trace(
+                ctx, server, qname, rdtype_text, classification, response, current_zone, chain_state
+            )
 
-            if self._serves_an_unsigned_copy(response, kind, chain_state, ctx):
+            if unsigned_retries_left > 0 and self._serves_an_unsigned_copy(response, kind, chain_state, ctx):
                 siblings = [ns for ns in current_nameservers if ns != server]
                 if siblings:
+                    # One sibling is asked, not all of them: if it answers
+                    # unsigned too, this is the zone and not one stale copy of
+                    # it, and the response is judged on what it holds.
+                    unsigned_retries_left -= 1
                     logger.debug(
-                        "Unsigned %s for %s/%s from %s in signed zone %s, trying siblings",
+                        "Unsigned %s for %s/%s from %s in signed zone %s, trying a sibling",
                         kind,
                         qname,
                         rdtype_text,
@@ -589,39 +811,11 @@ class RecursiveResolver:
                     )
                     current_nameservers = siblings
                     continue
-                # Every server answers unsigned, so this is the zone and not
-                # one stale copy of it. Fall through and judge what we have.
-
-            if kind == "answer":
-                return self._handle_answer(
-                    response,
-                    classification,
-                    qname,
-                    rdtype,
-                    ctx,
-                    current_zone,
-                    zone_nameservers,
-                    chain_state,
-                    current_ds,
-                    cname_chain,
-                )
-
-            if kind == "cname":
-                return self._handle_cname(
-                    response,
-                    classification,
-                    qname,
-                    rdtype,
-                    ctx,
-                    depth,
-                    cname_chain,
-                    current_zone,
-                    zone_nameservers,
-                    chain_state,
-                    current_ds,
-                )
 
             if kind == "referral":
+                referrals += 1
+                if referrals > self.max_depth:
+                    raise MaxDepthError(str(qname), rdtype_text, self.max_depth)
                 ctx.budget.note_referral(str(qname), rdtype_text)
                 child_zone: dns.name.Name = classification["zone"]
                 chain_state, current_ds = self._advance_dnssec(
@@ -634,80 +828,44 @@ class RecursiveResolver:
                     ctx,
                 )
                 ns_names: list[dns.name.Name] = classification["ns_names"]
-                # An NS name inside the zone it serves can only be reached via
-                # glue: resolving it independently needs the very servers we are
-                # trying to find. Prefer the out-of-zone names for both the
-                # glueless path and any later fallback.
-                resolvable = [n for n in ns_names if not n.is_subdomain(child_zone)] or ns_names
-                pending_ns_names = resolvable
+                pending_ns_names = [n for n in ns_names if not n.is_subdomain(child_zone)]
                 glue = self._select_glue(response, ns_names, current_zone, child_zone)
                 if not glue:
-                    glue = self._resolve_ns_names(resolvable, ctx, depth + 1, limit=self.limits.max_ns_per_referral)
+                    glue = self._resolve_ns_names(pending_ns_names, ctx, depth + 1)
                 if not glue:
                     # Resolving the NS names returns nothing both when they do
                     # not resolve and when the budget ran out underneath. Only
                     # the first is a server failure.
                     if ctx.budget.expired():
                         raise ResolutionTimeoutError(str(qname), rdtype_text)
-                    raise ServfailError(str(qname), rdtype_text)
+                    raise ServfailError(
+                        str(qname), rdtype_text, reason=f"no usable address for any nameserver of {child_zone}"
+                    )
                 self._cache_delegation(child_zone, ns_names, glue, response, chain_state, current_ds)
                 current_zone = child_zone
                 current_nameservers = glue
                 zone_nameservers = list(glue)
-                nxdomain_retries_left = 2
+                nxdomain_retries_left = _NXDOMAIN_RETRIES
+                unsigned_retries_left = _UNSIGNED_COPY_RETRIES
                 continue
 
             if kind == "nxdomain":
-                current_nameservers = [ns for ns in current_nameservers if ns != server]
-                if current_nameservers and nxdomain_retries_left > 0:
+                siblings = [ns for ns in current_nameservers if ns != server]
+                if siblings and nxdomain_retries_left > 0:
                     nxdomain_retries_left -= 1
-                    logger.debug("NXDOMAIN from %s for %s/%s, trying siblings", server, qname, rdtype_text)
+                    logger.debug("NXDOMAIN from %s for %s/%s, asking a sibling", server, qname, rdtype_text)
+                    current_nameservers = siblings
                     continue
-                denial, proof_ttl = self._verify_denial(
-                    response,
-                    qname,
-                    rdtype,
-                    ctx,
-                    current_zone,
-                    zone_nameservers,
-                    chain_state,
-                    current_ds,
-                    negative="nxdomain",
-                )
-                if self.cache is not None:
-                    self.cache.put_nxdomain(
-                        qname,
-                        self._cacheable_negative_ttl(response, qname, current_zone, denial, proof_ttl),
-                        secure=denial is ValidationState.SECURE,
-                    )
-                self._require_proven_denial(denial, qname, rdtype_text)
-                raise NXDOMAINError(str(qname), rdtype_text)
 
-            if kind == "nodata":
-                denial, proof_ttl = self._verify_denial(
-                    response,
-                    qname,
-                    rdtype,
-                    ctx,
-                    current_zone,
-                    zone_nameservers,
-                    chain_state,
-                    current_ds,
-                    negative="nodata",
-                )
-                if self.cache is not None:
-                    self.cache.put_nodata(
-                        qname,
-                        rdtype,
-                        self._cacheable_negative_ttl(response, qname, current_zone, denial, proof_ttl),
-                        secure=denial is ValidationState.SECURE,
-                    )
-                self._require_proven_denial(denial, qname, rdtype_text)
-                raise NoAnswerError(str(qname), rdtype_text)
-
-            # "error" / "lame": drop this server and try another.
-            current_nameservers = [ns for ns in current_nameservers if ns != server]
-            if not current_nameservers:
+            if kind == "error":
+                # Drop this server, and any other that answered this query with
+                # an error on the way: the sweep has already asked them.
+                failed = {server, *ctx.answered_with_error}
+                if response.rcode() in (dns.rcode.REFUSED, dns.rcode.NOTAUTH):
+                    ctx.failed_servers.update((current_zone, ns) for ns in failed)
+                current_nameservers = [ns for ns in current_nameservers if ns not in failed]
+                if current_nameservers:
+                    continue
                 # Every address we have refuses or errors. A stale delegation
                 # naming a provider that no longer serves the zone looks exactly
                 # like this, so resolve the referral's other NS names before
@@ -715,10 +873,80 @@ class RecursiveResolver:
                 fallback = self._fallback_nameservers(pending_ns_names, tried_addresses, ctx, depth)
                 if fallback:
                     current_nameservers = fallback
+                    zone_nameservers.extend(a for a in fallback if a not in zone_nameservers)
                     continue
-                raise ServfailError(str(qname), rdtype_text, rcode=response.rcode())
+                raise ServfailError(
+                    str(qname),
+                    rdtype_text,
+                    rcode=response.rcode(),
+                    reason=f"every nameserver for {current_zone} failed ({classification.get('detail', 'error')})",
+                )
 
-        raise MaxDepthError(str(qname), rdtype_text, self.max_depth)
+            try:
+                return self._conclude(
+                    response,
+                    classification,
+                    qname,
+                    rdtype,
+                    ctx,
+                    depth,
+                    cname_chain,
+                    current_zone,
+                    zone_nameservers,
+                    chain_state,
+                    current_ds,
+                    step,
+                )
+            except DNSSECValidationError:
+                self._mark_step(step, ValidationState.BOGUS)
+                raise
+
+        raise ServfailError(str(qname), rdtype_text, reason="resolution made no progress")  # pragma: no cover
+
+    def _conclude(
+        self,
+        response: dns.message.Message,
+        classification: _Classification,
+        qname: dns.name.Name,
+        rdtype: dns.rdatatype.RdataType,
+        ctx: _Context,
+        depth: int,
+        cname_chain: list[dns.name.Name],
+        zone: dns.name.Name,
+        nameservers: list[str],
+        state: ValidationState,
+        ds: dns.rdataset.Rdataset | None,
+        step: TraceStep | None,
+    ) -> Answer:
+        """Turn a final response into an answer, or into the denial it is."""
+        rdtype_text = dns.rdatatype.to_text(rdtype)
+        kind = classification["type"]
+        if kind == "answer":
+            answer = self._handle_answer(response, classification, qname, rdtype, ctx, zone, nameservers, state, ds)
+            self._mark_step(step, answer.dnssec)
+            return answer
+        if kind == "cname":
+            return self._handle_cname(
+                response, classification, qname, rdtype, ctx, depth, cname_chain, zone, nameservers, state, ds
+            )
+
+        negative: Literal["nxdomain", "nodata"] = "nxdomain" if kind == "nxdomain" else "nodata"
+        denial, proof_ttl = self._verify_denial(
+            response, qname, rdtype, ctx, zone, nameservers, state, ds, negative=negative
+        )
+        self._mark_step(step, denial)
+        ttl = self._cacheable_negative_ttl(response, qname, zone, denial, proof_ttl)
+        # RFC 2308 §5: a negative answer with no SOA carries no TTL to cache it
+        # for, and SHOULD NOT be cached.
+        if self.cache is not None and ttl is not None:
+            if negative == "nxdomain":
+                self.cache.put_nxdomain(qname, ttl, secure=denial is ValidationState.SECURE)
+            else:
+                self.cache.put_nodata(qname, rdtype, ttl, secure=denial is ValidationState.SECURE)
+        self._require_proven_denial(denial, qname, rdtype_text)
+        if negative == "nxdomain":
+            raise NXDOMAINError(str(qname), rdtype_text)
+        raise NoAnswerError(str(qname), rdtype_text)
 
     def _record_trace(
         self,
@@ -726,41 +954,48 @@ class RecursiveResolver:
         server: str,
         qname: dns.name.Name,
         rdtype_text: str,
-        classification: dict[str, Any],
+        classification: _Classification,
         response: dns.message.Message,
         zone: dns.name.Name,
         state: ValidationState,
-    ) -> None:
+    ) -> TraceStep | None:
         if ctx.trace is None:
-            return
-        ctx.trace.append(
-            TraceStep(
-                server=server,
-                qname=str(qname),
-                rdtype=rdtype_text,
-                response_type=classification["type"],
-                detail=classification.get("detail", ""),
-                rcode=response.rcode(),
-                zone=str(zone),
-                dnssec=state.value,
-            )
+            return None
+        step = TraceStep(
+            server=server,
+            qname=str(qname),
+            rdtype=rdtype_text,
+            response_type=classification["type"],
+            detail=classification.get("detail", ""),
+            rcode=response.rcode(),
+            zone=str(zone),
+            dnssec=state.value if ctx.dnssec else ValidationState.DISABLED.value,
         )
+        ctx.trace.append(step)
+        return step
+
+    @staticmethod
+    def _mark_step(step: TraceStep | None, state: ValidationState) -> None:
+        """Record on a trace step the verdict its response ended up with."""
+        if step is not None and step.dnssec != ValidationState.DISABLED.value:
+            step.dnssec = state.value
 
     def _handle_answer(
         self,
         response: dns.message.Message,
-        classification: dict[str, Any],
+        classification: _Classification,
         qname: dns.name.Name,
         rdtype: dns.rdatatype.RdataType,
         ctx: _Context,
         zone: dns.name.Name,
         nameservers: list[str],
         state: ValidationState,
-        ds: Any,
-        cname_chain: list[dns.name.Name],
+        ds: dns.rdataset.Rdataset | None,
     ) -> Answer:
         rrset: dns.rrset.RRset = classification["rrset"]
-        validated, ttl = self._validate_answer(response, rrset, qname, rdtype, ctx, zone, nameservers, state, ds)
+        validated, ttl = self._validate_answer(
+            response, rrset, qname, rdtype, ctx, zone, nameservers, state, ds, classification.get("dname_rrset")
+        )
         if self.cache is not None and self.cache_answers:
             self.cache.put_answer(qname, rdtype, rrset, ttl, secure=validated is ValidationState.SECURE)
         return Answer(
@@ -770,13 +1005,42 @@ class RecursiveResolver:
             rrset=rrset,
             ttl=ttl,
             dnssec=validated,
-            cname_chain=list(cname_chain),
+        )
+
+    def _check_cname_chain(self, qname: dns.name.Name, target: dns.name.Name, cname_chain: list[dns.name.Name]) -> None:
+        if target in cname_chain or target == qname or len(cname_chain) >= self.max_cname_chain:
+            raise CNAMELoopError(str(qname), [str(n) for n in cname_chain + [target]])
+
+    def _follow_cname(
+        self,
+        qname: dns.name.Name,
+        target: dns.name.Name,
+        rdtype: dns.rdatatype.RdataType,
+        ctx: _Context,
+        depth: int,
+        cname_chain: list[dns.name.Name],
+        cname_state: ValidationState,
+        cname_ttl: int,
+    ) -> Answer:
+        """Resolve a CNAME's target and present the result as the answer for ``qname``."""
+        self._check_cname_chain(qname, target, cname_chain)
+        answer = self._resolve_iterative(target, rdtype, ctx, depth + 1, [*cname_chain, qname])
+        return Answer(
+            qname=qname,
+            canonical_name=answer.canonical_name,
+            rdtype=rdtype,
+            rrset=answer.rrset,
+            # The chain is only good for as long as its shortest-lived link,
+            # exactly as its DNSSEC state is that of its weakest one.
+            ttl=min(cname_ttl, answer.ttl),
+            dnssec=self._weakest(cname_state, answer.dnssec),
+            cname_chain=[qname, *answer.cname_chain],
         )
 
     def _handle_cname(
         self,
         response: dns.message.Message,
-        classification: dict[str, Any],
+        classification: _Classification,
         qname: dns.name.Name,
         rdtype: dns.rdatatype.RdataType,
         ctx: _Context,
@@ -785,16 +1049,12 @@ class RecursiveResolver:
         zone: dns.name.Name,
         nameservers: list[str],
         state: ValidationState,
-        ds: Any,
+        ds: dns.rdataset.Rdataset | None,
     ) -> Answer:
         rdtype_text = dns.rdatatype.to_text(rdtype)
         target: dns.name.Name = classification["target"]
         cname_rrset: dns.rrset.RRset = classification["cname_rrset"]
-
-        if target in cname_chain or target == qname:
-            raise CNAMELoopError(str(qname), [str(n) for n in cname_chain + [target]])
-        if len(cname_chain) >= self.max_cname_chain:
-            raise CNAMELoopError(str(qname), [str(n) for n in cname_chain + [target]])
+        self._check_cname_chain(qname, target, cname_chain)
 
         dname_rrset: dns.rrset.RRset | None = classification.get("dname_rrset")
         cname_state, cname_ttl = self._validate_answer(
@@ -834,22 +1094,11 @@ class RecursiveResolver:
                 rrset=inline,
                 ttl=min(cname_ttl, inline_ttl),
                 dnssec=self._weakest(cname_state, inline_state),
-                cname_chain=[*cname_chain, qname],
+                cname_chain=[qname],
             )
 
         logger.debug("Following CNAME %s -> %s for %s", qname, target, rdtype_text)
-        answer = self._resolve_iterative(target, rdtype, ctx, depth + 1, [*cname_chain, qname])
-        return Answer(
-            qname=qname,
-            canonical_name=answer.canonical_name,
-            rdtype=rdtype,
-            rrset=answer.rrset,
-            # The chain is only good for as long as its shortest-lived link,
-            # exactly as its DNSSEC state is that of its weakest one.
-            ttl=min(cname_ttl, answer.ttl),
-            dnssec=self._weakest(cname_state, answer.dnssec),
-            cname_chain=[*cname_chain, qname, *answer.cname_chain],
-        )
+        return self._follow_cname(qname, target, rdtype, ctx, depth, cname_chain, cname_state, cname_ttl)
 
     @staticmethod
     def _weakest(a: ValidationState, b: ValidationState) -> ValidationState:
@@ -872,13 +1121,40 @@ class RecursiveResolver:
         qname: dns.name.Name,
         rdtype: dns.rdatatype.RdataType,
         current_zone: dns.name.Name,
-    ) -> dict[str, Any]:
+    ) -> _Classification:
         """Classify a response into answer, cname, referral, nxdomain, nodata or error."""
         rcode = response.rcode()
         authoritative = bool(response.flags & dns.flags.AA)
 
         if rcode not in (dns.rcode.NOERROR, dns.rcode.NXDOMAIN):
             return {"type": "error", "rcode": rcode, "detail": dns.rcode.to_text(rcode)}
+
+        # A DNAME rewrites everything below its owner, and nothing can exist
+        # below it (RFC 6672 §2.3), so it decides the response before anything
+        # else does. The CNAME it implies is synthesised here from the DNAME
+        # itself (§3.4: "Recursive caching name servers MUST perform CNAME
+        # synthesis on behalf of clients"), and whatever CNAME the server sent
+        # alongside is ignored. It is unsigned by design, so taking its target
+        # instead would let anyone add an unsigned CNAME pointing anywhere next
+        # to a genuine signed DNAME and have the redirection validate.
+        dname_rrset = self._find_dname(response, qname, current_zone)
+        if dname_rrset is not None:
+            if self.require_authoritative and not authoritative:
+                return {"type": "error", "rcode": rcode, "detail": "DNAME without AA bit"}
+            target = self._dname_target(qname, dname_rrset)
+            if target is None:
+                return {"type": "error", "rcode": rcode, "detail": "DNAME substitution is longer than a name can be"}
+            synthesized = self._synthesize_cname(qname, target, dname_rrset)
+            if rdtype == dns.rdatatype.CNAME:
+                return {"type": "answer", "rrset": synthesized, "ttl": synthesized.ttl, "dname_rrset": dname_rrset}
+            return {
+                "type": "cname",
+                "target": target,
+                "cname_rrset": synthesized,
+                "dname_rrset": dname_rrset,
+                "ttl": dname_rrset.ttl,
+                "detail": f"DNAME {dname_rrset.name} -> {target}",
+            }
 
         # A direct answer of the requested type, in the IN class.
         answer_rrset = self._find_answer_rrset(response, qname, rdtype)
@@ -905,31 +1181,15 @@ class RecursiveResolver:
         if rdtype != dns.rdatatype.CNAME:
             cname_rrset = self._find_answer_rrset(response, qname, dns.rdatatype.CNAME)
             if cname_rrset is not None:
+                if self.require_authoritative and not authoritative:
+                    return {"type": "error", "rcode": rcode, "detail": "CNAME without AA bit"}
                 return {
                     "type": "cname",
                     "target": cname_rrset[0].target,
                     "cname_rrset": cname_rrset,
-                    "dname_rrset": self._find_dname(response, qname, current_zone),
+                    "dname_rrset": None,
                     "ttl": cname_rrset.ttl,
                     "detail": f"-> {cname_rrset[0].target}",
-                }
-
-        # A DNAME rewrites everything below its owner. The server should have
-        # sent a synthesized CNAME with it, and the branch above would have
-        # taken that; when it did not, RFC 6672 §3.4 makes the synthesis our
-        # job: "Recursive caching name servers MUST perform CNAME synthesis on
-        # behalf of clients."
-        dname_rrset = self._find_dname(response, qname, current_zone)
-        if dname_rrset is not None:
-            target = self._dname_target(qname, dname_rrset)
-            if target is not None:
-                return {
-                    "type": "cname",
-                    "target": target,
-                    "cname_rrset": self._synthesize_cname(qname, target, dname_rrset),
-                    "dname_rrset": dname_rrset,
-                    "ttl": dname_rrset.ttl,
-                    "detail": f"DNAME {dname_rrset.name} -> {target}",
                 }
 
         if rcode == dns.rcode.NXDOMAIN:
@@ -1014,7 +1274,7 @@ class RecursiveResolver:
     def _synthesize_cname(qname: dns.name.Name, target: dns.name.Name, dname_rrset: dns.rrset.RRset) -> dns.rrset.RRset:
         """The CNAME the DNAME implies, with the DNAME's TTL (RFC 6672 §3.1)."""
         rrset = dns.rrset.RRset(qname, dns.rdataclass.IN, dns.rdatatype.CNAME)
-        rrset.add(dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.CNAME, target.to_text()))
+        rrset.add(dns.rdtypes.ANY.CNAME.CNAME(dns.rdataclass.IN, dns.rdatatype.CNAME, target))
         rrset.ttl = dname_rrset.ttl
         return rrset
 
@@ -1052,7 +1312,7 @@ class RecursiveResolver:
         qname: dns.name.Name,
         current_zone: dns.name.Name,
         rdtype: dns.rdatatype.RdataType = dns.rdatatype.A,
-    ) -> dict[str, Any] | None:
+    ) -> _Classification | None:
         """Locate a valid downward referral, enforcing strict progress.
 
         The delegated zone must be a *proper* subdomain of the zone we asked
@@ -1128,8 +1388,10 @@ class RecursiveResolver:
 
         allowed = self.address_filter.filter(addresses)
         if len(allowed) != len(addresses):
+            # DEBUG, not WARNING: the zone chooses its glue, so a hostile one
+            # could otherwise write a log line per referral.
             rejected = set(addresses) - set(allowed)
-            logger.warning("Rejected non-public glue addresses for zone %s: %s", child_zone, sorted(rejected))
+            logger.debug("Rejected non-public glue addresses for zone %s: %s", child_zone, sorted(rejected))
         return allowed
 
     def _cache_delegation(
@@ -1139,7 +1401,7 @@ class RecursiveResolver:
         addresses: list[str],
         response: dns.message.Message,
         state: ValidationState,
-        ds: Any = None,
+        ds: dns.rdataset.Rdataset | None = None,
     ) -> None:
         if self.cache is None or not addresses:
             return
@@ -1162,6 +1424,17 @@ class RecursiveResolver:
         ]
         if glue_ttls:
             ttl = min(ttl, *glue_ttls)
+        # The DNSSEC verdict cached with the cut must not outlive what proved
+        # it: the DS's signature for a signed child, the denial's for an
+        # unsigned one (RFC 4035 §5.3.3).
+        if ds is not None:
+            ttl = min(ttl, int(ds.ttl))
+        elif state is ValidationState.INSECURE:
+            proof_ttl = self._denial_ttl_cap(list(response.authority))
+            if proof_ttl is not None:
+                ttl = min(ttl, proof_ttl)
+        if ttl <= 0:
+            return
         self.cache.put_delegation(
             Delegation(
                 zone=zone,
@@ -1191,42 +1464,76 @@ class RecursiveResolver:
         """
         if not ns_names:
             return []
-        resolved = self._resolve_ns_names(ns_names, ctx, depth + 1, limit=self.limits.max_ns_per_referral)
-        fresh = [address for address in resolved if address not in tried]
+        fresh = self._resolve_ns_names(ns_names, ctx, depth + 1, tried=tried)
         if fresh:
             logger.debug("Falling back to %d freshly resolved nameserver address(es)", len(fresh))
         return fresh
 
-    def _resolve_ns_names(self, ns_names: list[dns.name.Name], ctx: _Context, depth: int, limit: int) -> list[str]:
-        """Resolve NS hostnames that had no usable glue.
+    def _resolve_ns_names(
+        self, ns_names: list[dns.name.Name], ctx: _Context, depth: int, tried: set[str] | None = None
+    ) -> list[str]:
+        """Resolve NS hostnames that had no usable glue, a few at a time.
 
-        Bounded by ``limit`` names and by the shared NX-target budget: an
-        attacker's NS names deliberately fail to resolve, and absorbing an
-        unbounded number of those failures is the NXNSAttack amplification
-        primitive.
+        Names are taken in random order until `_NS_NAMES_AHEAD` of them have
+        produced addresses not in ``tried``. The others are left for
+        `_fallback_nameservers`, should those fail, and every lookup is
+        remembered for the rest of the resolution, so a name is never paid for
+        twice. AAAA is asked for only when IPv6 is enabled and the name had no
+        usable A record.
+
+        Bounded by ``max_ns_per_referral`` names and by the shared NX-target
+        budget: an attacker's NS names deliberately fail to resolve, and
+        absorbing an unbounded number of those failures is the NXNSAttack
+        amplification primitive.
         """
-        # Both families, unless the caller asked for v4 only. A nameserver set
-        # reachable only over IPv6 is otherwise unreachable however the
-        # resolver is configured, because the hostname would only ever be
-        # looked up for an A record.
+        seen = set(tried or ())
         wanted = [dns.rdatatype.A] if self.ipv4_only else [dns.rdatatype.A, dns.rdatatype.AAAA]
-        resolved: list[str] = []
-        for ns_name in ns_names[:limit]:
-            if ctx.budget.expired() or ctx.budget.remaining_queries() <= 0:
-                break
+        candidates = list(ns_names[: self.limits.max_ns_per_referral])
+        _RANDOM.shuffle(candidates)
+        fresh: list[str] = []
+        productive = 0
+        for ns_name in candidates:
+            found = False
             for rdtype in wanted:
-                if ctx.budget.expired() or ctx.budget.remaining_queries() <= 0:
-                    break
-                try:
-                    answer = self._resolve_iterative(ns_name, rdtype, ctx, depth, [])
-                except QueryBudgetExceededError:
-                    raise
-                except ResolverError as exc:
-                    logger.debug("Failed to resolve glueless NS %s/%s: %s", ns_name, dns.rdatatype.to_text(rdtype), exc)
-                    ctx.budget.note_nx_target(str(ns_name), dns.rdatatype.to_text(rdtype))
+                if _FAMILY_OF[rdtype] in ctx.unreachable_families:
                     continue
-                resolved.extend(str(rr.address) for rr in answer.rrset)
-        return self.address_filter.filter(resolved)
+                if ctx.budget.expired() or ctx.budget.remaining_queries() <= 0:
+                    return fresh
+                new = [a for a in self._ns_addresses(ns_name, rdtype, ctx, depth) if a not in seen]
+                if new:
+                    seen.update(new)
+                    fresh.extend(new)
+                    found = True
+                    break
+            if found:
+                productive += 1
+                if productive >= _NS_NAMES_AHEAD:
+                    break
+        return fresh
+
+    def _ns_addresses(
+        self, ns_name: dns.name.Name, rdtype: dns.rdatatype.RdataType, ctx: _Context, depth: int
+    ) -> list[str]:
+        """The usable addresses of one NS hostname, looked up at most once per resolution."""
+        key = (ns_name, int(rdtype))
+        if key in ctx.ns_addresses:
+            return ctx.ns_addresses[key] or []
+        rdtype_text = dns.rdatatype.to_text(rdtype)
+        try:
+            answer = self._resolve_iterative(ns_name, rdtype, ctx, depth, [])
+        except QueryBudgetExceededError:
+            raise
+        except ResolverError as exc:
+            logger.debug("Failed to resolve glueless NS %s/%s: %s", ns_name, rdtype_text, exc)
+            ctx.ns_addresses[key] = None
+            # A name with no AAAA is not a failed target: most nameservers
+            # have none, and counting them would end the resolution after five.
+            if not (rdtype == dns.rdatatype.AAAA and isinstance(exc, NoAnswerError)):
+                ctx.budget.note_nx_target(str(ns_name), rdtype_text)
+            return []
+        addresses = self.address_filter.filter([str(rr.address) for rr in answer.rrset])
+        ctx.ns_addresses[key] = addresses
+        return addresses
 
     # ── DNSSEC ──────────────────────────────────────────────────────────
 
@@ -1242,7 +1549,10 @@ class RecursiveResolver:
             return keys
 
     def _store_keys(self, keys: ZoneKeys, ttl: int) -> None:
-        keys.expiry = time.monotonic() + max(60, min(ttl, 86400))
+        """Cache validated keys for ``ttl`` seconds, which must already be capped by their signature."""
+        if ttl <= 0:
+            return
+        keys.expiry = time.monotonic() + min(ttl, 86400)
         with self._key_lock:
             # Bounded LRU: a long-running verifier sees a effectively unlimited
             # number of signed zones, and a DNSKEY RRset is not small.
@@ -1320,8 +1630,33 @@ class RecursiveResolver:
 
         return check
 
-    def _get_zone_keys(self, zone: dns.name.Name, ds: Any, nameservers: list[str], ctx: _Context) -> ZoneKeys:
+    @staticmethod
+    def _noting_rejects(
+        usable: Callable[[dns.message.Message], bool], rejected: list[dns.message.Message] | None
+    ) -> Callable[[dns.message.Message], bool]:
+        """``usable``, also collecting the responses it turns down into ``rejected``."""
+        if rejected is None:
+            return usable
+
+        def check(response: dns.message.Message) -> bool:
+            if usable(response):
+                return True
+            rejected.append(response)
+            return False
+
+        return check
+
+    def _get_zone_keys(
+        self,
+        zone: dns.name.Name,
+        ds: dns.rdataset.Rdataset | None,
+        nameservers: list[str],
+        ctx: _Context,
+        rejected: list[dns.message.Message] | None = None,
+    ) -> ZoneKeys:
         """Fetch and validate a zone's DNSKEY RRset.
+
+        Responses that do not carry it are appended to ``rejected``, if given.
 
         Raises:
             DNSSECMaterialUnavailableError: if no nameserver supplied the
@@ -1336,7 +1671,11 @@ class RecursiveResolver:
             return cached
 
         response, _server = self._send_query(
-            zone, dns.rdatatype.DNSKEY, nameservers, ctx, usable=self._usable_dnskey(zone)
+            zone,
+            dns.rdatatype.DNSKEY,
+            nameservers,
+            ctx,
+            usable=self._noting_rejects(self._usable_dnskey(zone), rejected),
         )
         if response is None:
             raise DNSSECMaterialUnavailableError(str(zone), "DNSKEY")
@@ -1346,30 +1685,37 @@ class RecursiveResolver:
             raise DNSSECMaterialUnavailableError(str(zone), "DNSKEY")
         rrsig = find_rrsig(list(response.answer), zone, dns.rdatatype.DNSKEY)
 
+        signature = None
         if zone == dns.name.root:
-            root_ok = self._validator.validate_root_dnskey(dnskey_rrset, rrsig, budget=ctx.budget)
-            state = ValidationState.SECURE if root_ok else ValidationState.BOGUS
+            state, signature = self._validator.check_root_dnskey(dnskey_rrset, rrsig, budget=ctx.budget)
         elif ds is None:
             state = ValidationState.BOGUS
         else:
             # May be INSECURE: a zone signed only with algorithms this build
             # cannot verify is unverifiable rather than forged.
-            state = self._validator.validate_dnskey(zone, dnskey_rrset, rrsig, ds, budget=ctx.budget)
+            state, signature = self._validator.check_dnskey(zone, dnskey_rrset, rrsig, ds, budget=ctx.budget)
 
-        secure = state is ValidationState.SECURE
-        keys = ZoneKeys(zone, dnskey_rrset if secure else None, state)
-        if secure:
-            self._store_keys(keys, dnskey_rrset.ttl)
+        if state is not ValidationState.SECURE:
+            return ZoneKeys(zone, None, state)
+        # Kept trimmed (revoked keys out, colliding tags capped), which is what
+        # every validation against them would compute anyway.
+        keys = ZoneKeys(zone, _trim_keyring({zone: dnskey_rrset})[zone], state)
+        # Like any authenticated data, the keys are good for no longer than
+        # the signature over them (RFC 4035 §5.3.3). Holding them for the wire
+        # TTL instead would ignore a rollover or an emergency revocation for
+        # up to a day.
+        if rrsig is not None and signature is not None:
+            self._store_keys(keys, authenticated_ttl(dnskey_rrset, rrsig, signature))
         return keys
 
     def _descend_chain(
         self,
         target: dns.name.Name,
         zone: dns.name.Name,
-        ds: Any,
+        ds: dns.rdataset.Rdataset | None,
         nameservers: list[str],
         ctx: _Context,
-    ) -> tuple[dns.name.Name, Any, ValidationState]:
+    ) -> tuple[dns.name.Name, dns.rdataset.Rdataset | None, ValidationState]:
         """Extend the chain of trust from ``zone`` down to ``target``.
 
         A nameserver that is authoritative for both a parent and a child zone
@@ -1387,6 +1733,14 @@ class RecursiveResolver:
         answers with a denial that matches no delegation, and reading that as
         a broken chain condemns every name underneath. Such a label is skipped
         instead: the zone in force does not change at a name that is not a cut.
+
+        The servers may also serve the target and not the zones in between: the
+        root servers serve ``root-servers.net`` but not ``net``. Asked about
+        ``net`` they refer us to its servers, and that referral is followed:
+        from then on the walk asks them.
+
+        Each DS lookup is remembered for the rest of the resolution, so a walk
+        that several answers need is paid for once.
         """
         assert self._validator is not None
         if target == zone or not target.is_subdomain(zone):
@@ -1395,26 +1749,40 @@ class RecursiveResolver:
         remaining = [
             dns.name.Name(target.labels[index:]) for index in range(len(target.labels) - len(zone.labels) - 1, -1, -1)
         ]
+        servers = nameservers
+        # The zone `servers` are known to serve, which their glue is judged by.
+        bailiwick = zone
         for next_zone in remaining:
-            keys = self._get_zone_keys(zone, ds, nameservers, ctx)
+            rejected: list[dns.message.Message] = []
+            try:
+                keys = self._get_zone_keys(zone, ds, servers, ctx, rejected)
+            except DNSSECMaterialUnavailableError:
+                servers = self._referred_servers(rejected, zone, bailiwick)
+                if not servers:
+                    raise
+                bailiwick = zone
+                keys = self._get_zone_keys(zone, ds, servers, ctx)
             if keys.state is ValidationState.INSECURE:
                 return zone, None, ValidationState.INSECURE
             if keys.state is not ValidationState.SECURE or keys.dnskey_rrset is None:
                 return zone, None, ValidationState.BOGUS
 
-            response, _server = self._send_query(
-                next_zone, dns.rdatatype.DS, nameservers, ctx, usable=self._usable_ds(next_zone)
-            )
-            if response is None:
-                # Could not retrieve the DS: indeterminate, not tampered with.
-                raise DNSSECMaterialUnavailableError(str(next_zone), "DS")
-
-            records = list(response.answer) + list(response.authority)
-            keyring = keys.as_keyring()
-            state, next_ds = self._validator.validate_ds(next_zone, records, keyring, budget=ctx.budget)
-            if state is ValidationState.BOGUS and self._validator.prove_no_delegation(
-                next_zone, records, keyring, budget=ctx.budget
-            ):
+            step = ctx.chain_steps.get((zone, next_zone))
+            if step is None:
+                rejected = []
+                try:
+                    step = self._chain_step(next_zone, keys, servers, ctx, rejected)
+                except DNSSECMaterialUnavailableError:
+                    # The keys came from the cache, so the servers were never
+                    # asked about `zone` itself until now.
+                    servers = self._referred_servers(rejected, zone, bailiwick)
+                    if not servers:
+                        raise
+                    bailiwick = zone
+                    step = self._chain_step(next_zone, keys, servers, ctx)
+                ctx.chain_steps[(zone, next_zone)] = step
+            state, next_ds, is_cut = step
+            if not is_cut:
                 # Not a cut: an empty non-terminal, or a name with records but
                 # no NS. The zone in force is unchanged, so carry on down.
                 continue
@@ -1424,15 +1792,72 @@ class RecursiveResolver:
 
         return zone, ds, ValidationState.SECURE
 
+    def _chain_step(
+        self,
+        next_zone: dns.name.Name,
+        keys: ZoneKeys,
+        nameservers: list[str],
+        ctx: _Context,
+        rejected: list[dns.message.Message] | None = None,
+    ) -> tuple[ValidationState, dns.rdataset.Rdataset | None, bool]:
+        """Ask for the DS of ``next_zone``: (state, DS, whether it is a zone cut at all).
+
+        Responses that do not settle it are appended to ``rejected``, if given.
+        """
+        assert self._validator is not None
+        response, _server = self._send_query(
+            next_zone,
+            dns.rdatatype.DS,
+            nameservers,
+            ctx,
+            usable=self._noting_rejects(self._usable_ds(next_zone), rejected),
+        )
+        if response is None:
+            # Could not retrieve the DS: indeterminate, not tampered with.
+            raise DNSSECMaterialUnavailableError(str(next_zone), "DS")
+
+        records = list(response.answer) + list(response.authority)
+        keyring = keys.as_keyring()
+        state, next_ds = self._validator.validate_ds(next_zone, records, keyring, budget=ctx.budget)
+        if state is ValidationState.BOGUS and self._validator.prove_no_delegation(
+            next_zone, records, keyring, budget=ctx.budget
+        ):
+            return state, None, False
+        return state, next_ds, True
+
+    def _referred_servers(
+        self, rejected: list[dns.message.Message], zone: dns.name.Name, bailiwick: dns.name.Name
+    ) -> list[str]:
+        """The glue of the first referral to ``zone`` among ``rejected``, from servers for ``bailiwick``.
+
+        Glue only, so a validation never sets off a lookup of NS names. What
+        those servers send is still checked against the keys above them.
+        """
+        for response in rejected:
+            if response.rcode() != dns.rcode.NOERROR:
+                continue
+            referral = self._find_referral(response, zone, bailiwick, dns.rdatatype.DNSKEY)
+            if referral is None or referral["zone"] != zone:
+                continue
+            glue = self._select_glue(response, referral["ns_names"], bailiwick, zone)
+            if glue:
+                logger.debug("Following the referral to %s for its DNSSEC material", zone)
+                return glue
+        return []
+
     def _align_zone(
         self,
         signer: dns.name.Name | None,
         zone: dns.name.Name,
-        ds: Any,
+        ds: dns.rdataset.Rdataset | None,
         nameservers: list[str],
         ctx: _Context,
-    ) -> tuple[dns.name.Name, Any, ValidationState]:
-        """Move the chain forward to whichever zone actually signed the data."""
+    ) -> tuple[dns.name.Name, dns.rdataset.Rdataset | None, ValidationState]:
+        """Move the chain forward to whichever zone actually signed the data.
+
+        ``signer`` must contain the name being judged; `_authority_signer`
+        only returns one that does.
+        """
         if signer is None or signer == zone or not signer.is_subdomain(zone):
             return zone, ds, ValidationState.SECURE
         return self._descend_chain(signer, zone, ds, nameservers, ctx)
@@ -1441,7 +1866,7 @@ class RecursiveResolver:
         self,
         name: dns.name.Name,
         zone: dns.name.Name,
-        ds: Any,
+        ds: dns.rdataset.Rdataset | None,
         nameservers: list[str],
         ctx: _Context,
     ) -> bool:
@@ -1465,14 +1890,24 @@ class RecursiveResolver:
         return state is ValidationState.INSECURE
 
     @staticmethod
-    def _authority_signer(response: dns.message.Message) -> dns.name.Name | None:
-        """The signer of the DS/NSEC/NSEC3 records in the authority section."""
+    def _authority_signer(response: dns.message.Message, name: dns.name.Name) -> dns.name.Name | None:
+        """The signer of the DS/NSEC/NSEC3 records in the authority section.
+
+        Only a signer containing ``name``, the name the records are judged
+        for, counts. The field comes off the wire unverified and the chain of
+        trust is walked down to it, so a signer outside ``name`` would let an
+        attacker point the walk at any unsigned delegation in the zone and
+        have the proof of *that* zone's missing DS applied to ``name``: a
+        signed zone downgraded to insecure with one spoofed packet.
+        """
         for rrset in response.authority:
             if rrset.rdtype != dns.rdatatype.RRSIG:
                 continue
             for rr in rrset:
-                if rr.type_covered in (dns.rdatatype.DS, dns.rdatatype.NSEC, dns.rdatatype.NSEC3):
-                    signer: dns.name.Name = rr.signer
+                if rr.type_covered not in (dns.rdatatype.DS, dns.rdatatype.NSEC, dns.rdatatype.NSEC3):
+                    continue
+                signer: dns.name.Name = rr.signer
+                if name.is_subdomain(signer):
                     return signer
         return None
 
@@ -1483,9 +1918,9 @@ class RecursiveResolver:
         parent_zone: dns.name.Name,
         nameservers: list[str],
         state: ValidationState,
-        parent_ds: Any,
+        parent_ds: dns.rdataset.Rdataset | None,
         ctx: _Context,
-    ) -> tuple[ValidationState, Any]:
+    ) -> tuple[ValidationState, dns.rdataset.Rdataset | None]:
         """Establish the DNSSEC state of a child zone from its parent's referral."""
         if not ctx.dnssec or self._validator is None or state is not ValidationState.SECURE:
             return ValidationState.INSECURE, None
@@ -1516,7 +1951,7 @@ class RecursiveResolver:
 
         # The referral may have been answered from a zone below the one we
         # believe we are querying; catch up before validating the DS.
-        signer = self._authority_signer(response)
+        signer = self._authority_signer(response, child_zone)
         parent_zone, parent_ds, aligned = self._align_zone(signer, parent_zone, parent_ds, nameservers, ctx)
         if aligned is ValidationState.INSECURE:
             return ValidationState.INSECURE, None
@@ -1551,7 +1986,7 @@ class RecursiveResolver:
         zone: dns.name.Name,
         nameservers: list[str],
         state: ValidationState,
-        ds: Any,
+        ds: dns.rdataset.Rdataset | None,
         dname_rrset: dns.rrset.RRset | None = None,
     ) -> tuple[ValidationState, int]:
         """Validate an answer RRset, returning its DNSSEC state and cache TTL.
@@ -1566,16 +2001,22 @@ class RecursiveResolver:
         if not ctx.dnssec or self._validator is None or state is not ValidationState.SECURE:
             return ValidationState.INSECURE, rrset.ttl
 
-        rrsig = find_rrsig(list(response.answer), rrset.name, rdtype)
-        if rrsig is None:
+        if rdtype == dns.rdatatype.CNAME and dname_rrset is not None:
             # A CNAME synthesized from a DNAME carries no signature of its own,
             # and must not (RFC 6672 §3.3): the DNAME's signature is what
-            # authenticates the redirection, and the CNAME follows from it by
-            # construction. So validate the DNAME and inherit its verdict.
-            if rdtype == dns.rdatatype.CNAME and dname_rrset is not None:
-                return self._validate_answer(
-                    response, dname_rrset, qname, dns.rdatatype.DNAME, ctx, zone, nameservers, state, ds
-                )
+            # authenticates the redirection, and the CNAME was built from it
+            # by `_classify_response`. So validate the DNAME and inherit its
+            # verdict.
+            return self._validate_answer(
+                response, dname_rrset, qname, dns.rdatatype.DNAME, ctx, zone, nameservers, state, ds
+            )
+
+        rrsig = find_rrsig(list(response.answer), rrset.name, rdtype)
+        if rrsig is None and rdtype == dns.rdatatype.DS:
+            # A parent answering in referral form carries the DS, and the
+            # RRSIG over it, in AUTHORITY.
+            rrsig = find_rrsig(list(response.authority), rrset.name, rdtype)
+        if rrsig is None:
             if self._insecurely_delegated(rrset.name, zone, ds, nameservers, ctx):
                 return ValidationState.INSECURE, rrset.ttl
             raise DNSSECValidationError(
@@ -1592,11 +2033,12 @@ class RecursiveResolver:
         # down to it and fetch its keys - work they can provoke with a single
         # spoofed packet, for a signature that cannot verify anyway.
         #
-        # This is only a hint about which zone to go and fetch keys for. It is
-        # never a security decision: whatever zone it picks, `validated_rrsig`
-        # still requires a signature naming that zone as its signer and that
-        # zone to contain the owner name, so a wrong hint costs a wasted fetch
-        # and a BOGUS verdict, never a false SECURE.
+        # This is only a hint about which zone to go and fetch keys for. A
+        # wrong one cannot produce a false SECURE: `validated_rrsig` still
+        # requires a signature naming that zone as its signer and that zone to
+        # contain the owner name. Nor a false INSECURE: the walk only ever
+        # covers delegations between the zone in force and the owner name, so
+        # an unsigned cut it finds really is above the data.
         signer: dns.name.Name = rrsig[0].signer
         if rrset.name.is_subdomain(signer):
             zone, ds, aligned = self._align_zone(signer, zone, ds, nameservers, ctx)
@@ -1619,12 +2061,7 @@ class RecursiveResolver:
         signature = self._validator.validated_rrsig(rrset, rrsig, keyring, budget=ctx.budget)
         if signature is None:
             raise DNSSECValidationError(str(qname), dns.rdatatype.to_text(rdtype), "RRSIG did not verify")
-        ttl = min(
-            rrset.ttl,
-            rrsig.ttl,
-            int(signature.original_ttl),
-            max(0, int(signature.expiration) - int(time.time())),
-        )
+        ttl = authenticated_ttl(rrset, rrsig, signature)
 
         # A signature covering fewer labels than the owner name has means the
         # answer was synthesised from a wildcard. That signature verifies for
@@ -1672,8 +2109,8 @@ class RecursiveResolver:
         zone: dns.name.Name,
         nameservers: list[str],
         state: ValidationState,
-        ds: Any,
-        negative: str,
+        ds: dns.rdataset.Rdataset | None,
+        negative: Literal["nxdomain", "nodata"],
     ) -> tuple[ValidationState, int | None]:
         """Validate the denial-of-existence proof for a negative answer.
 
@@ -1689,7 +2126,7 @@ class RecursiveResolver:
         if not ctx.dnssec or self._validator is None or state is not ValidationState.SECURE:
             return ValidationState.INSECURE, None
 
-        signer = self._authority_signer(response)
+        signer = self._authority_signer(response, qname)
         zone, ds, aligned = self._align_zone(signer, zone, ds, nameservers, ctx)
         if aligned is ValidationState.INSECURE:
             return ValidationState.INSECURE, None
@@ -1764,9 +2201,9 @@ class RecursiveResolver:
         qname: dns.name.Name,
         rdtype: dns.rdatatype.RdataType,
         authority: list[dns.rrset.RRset],
-        keyring: dict[dns.name.Name, Any],
+        keyring: Keyring,
         ctx: _Context,
-        negative: str,
+        negative: Literal["nxdomain", "nodata"],
     ) -> ValidationState:
         """How well this authority section proves the denial.
 
@@ -1784,9 +2221,9 @@ class RecursiveResolver:
         self,
         qname: dns.name.Name,
         rdtype: dns.rdatatype.RdataType,
-        keyring: dict[dns.name.Name, Any],
+        keyring: Keyring,
         ctx: _Context,
-        negative: str,
+        negative: Literal["nxdomain", "nodata"],
     ) -> Callable[[dns.message.Message], bool]:
         """Did this server send a denial that proves anything?
 
@@ -1832,8 +2269,8 @@ class RecursiveResolver:
         a signature, so a response with none at all is evidence about the
         server rather than about the data. Nothing is relaxed - the sibling's
         answer is validated exactly as this one would have been, and a zone
-        whose every server answers unsigned still ends BOGUS, because the
-        caller runs out of servers and judges the last response it holds.
+        whose servers answer unsigned still ends BOGUS: the caller asks one
+        sibling, then judges the response it holds.
 
         Referrals are excluded: the delegation NS RRset is unsigned by design
         (RFC 4035 §2.2), and :meth:`_advance_dnssec` fetches the DS from the
@@ -1871,12 +2308,13 @@ class RecursiveResolver:
 
         A proven denial must not outlive the signatures that proved it, or it
         goes on being served as authenticated after nothing vouches for it
-        (RFC 4035 §5.3.3).
+        (RFC 4035 §5.3.3). None when the response has no SOA, and so nothing
+        to cache it for.
         """
         ttl = self._negative_ttl(response, qname, current_zone)
-        if denial is not ValidationState.SECURE or proof_ttl is None:
+        if ttl is None or denial is not ValidationState.SECURE or proof_ttl is None:
             return ttl
-        return proof_ttl if ttl is None else min(ttl, proof_ttl)
+        return min(ttl, proof_ttl)
 
     # ── transport ───────────────────────────────────────────────────────
 
@@ -1907,7 +2345,11 @@ class RecursiveResolver:
         Each successive sweep also degrades EDNS: full payload, then 512 bytes,
         then no EDNS at all - except while validating, where the last rung stays
         at 512 with DO set, because an answer with no OPT has no DO and is worth
-        nothing to us. Without the payload step a path with a broken PMTU
+        nothing to us. "Validating" means a zone whose chain of trust is
+        secure: below an unsigned delegation nothing is checked, and a server
+        that cannot do EDNS is still worth asking in plain DNS.
+
+        Without the payload step a path with a broken PMTU
         blackholes every large response identically and no amount of retrying
         recovers: the classic silent failure for large TXT answers. TCP
         fallback does not help there, because nothing arrives to carry the TC
@@ -1924,25 +2366,42 @@ class RecursiveResolver:
                 server cannot masquerade as missing DNSSEC material.
         """
         rdtype_text = dns.rdatatype.to_text(rdtype)
+        validating = ctx.dnssec and not ctx.chain_insecure
         servers = self._order_servers(nameservers)
         abandoned: set[str] = set()
-        # Servers that answered in a way meaning "I do not speak EDNS".
-        no_edns: set[str] = set()
+        # Servers that could not be reached at all, as opposed to ones that
+        # answered badly or not in time.
+        unreachable: set[str] = set()
+        # Servers that answered in a way meaning "I do not speak EDNS". Kept for
+        # the whole resolution: rediscovering it on every query cost each such
+        # server two queries per pass, quadratic over a zone whose servers all
+        # fail. Never used while validating, where plain DNS is no answer.
+        no_edns = ctx.no_edns
         # Servers that answered, but not with what was asked for.
         unusable: set[str] = set()
         # An error response held back in case nothing better turns up.
         last_resort: tuple[dns.message.Message, str] | None = None
+        ctx.answered_with_error = set()
+        ctx.unreachable = False
 
         for attempt in range(self.max_retries + 1):
             for server in servers:
                 if server in abandoned or server in unusable:
                     continue
+                if _family(server) in ctx.unreachable_families:
+                    abandoned.add(server)
+                    unreachable.add(server)
+                    continue
 
                 timeout = self._effective_timeout(ctx)
                 if timeout <= 0:
                     return None, ""
-                payload = None if server in no_edns else self._payload_for_attempt(attempt, ctx.dnssec)
+                if server in no_edns and not validating:
+                    payload = None
+                else:
+                    payload = self._payload_for_attempt(attempt, validating)
 
+                logger.debug("Querying %s for %s/%s (EDNS payload %s)", server, qname, rdtype_text, payload)
                 ctx.budget.spend_query(str(qname), rdtype_text)
                 try:
                     response = self._query_once(qname, rdtype, server, payload, timeout, ctx)
@@ -1954,11 +2413,20 @@ class RecursiveResolver:
                 except _FatalServerError as exc:
                     logger.debug("Abandoning %s for %s/%s: %s", server, qname, rdtype_text, exc)
                     abandoned.add(server)
+                    if exc.errno in _FATAL_ERRNOS:
+                        unreachable.add(server)
+                    if exc.errno in _FAMILY_ERRNOS:
+                        # Nothing was sent, so nothing is charged, and no other
+                        # address of this family is tried for the rest of the
+                        # resolution: on a host without IPv6 every AAAA-derived
+                        # server would otherwise cost a query each.
+                        ctx.budget.refund_query()
+                        ctx.unreachable_families.add(_family(server))
                     continue
                 except _MalformedResponseError as exc:
                     # A mangled response often means the server dislikes EDNS.
                     logger.debug("Malformed response from %s for %s/%s: %s", server, qname, rdtype_text, exc)
-                    if payload is not None and not ctx.dnssec:
+                    if payload is not None and not validating:
                         no_edns.add(server)
                     else:
                         # While validating there is no point retrying without
@@ -1976,8 +2444,9 @@ class RecursiveResolver:
                     # nothing to us: keep the response instead, so a genuine
                     # SERVFAIL still reaches the caller as one.
                     logger.debug("rcode %s from %s, dropping EDNS for it", dns.rcode.to_text(rcode), server)
-                    if ctx.dnssec:
+                    if validating:
                         abandoned.add(server)
+                        ctx.answered_with_error.add(server)
                         if last_resort is None:
                             last_resort = (response, server)
                     else:
@@ -1992,6 +2461,7 @@ class RecursiveResolver:
             if len(abandoned) + len(unusable) == len(servers):
                 break
 
+        ctx.unreachable = len(unreachable) == len(servers)
         # Only for callers with no predicate: one that asked for specific
         # validation material wants "could not retrieve", not an error response.
         if usable is None and last_resort is not None:
@@ -2031,22 +2501,41 @@ class RecursiveResolver:
         except dns.exception.DNSException as exc:  # pragma: no cover - name is pre-validated
             raise _FatalServerError(f"cannot build query: {exc}") from exc
 
-        # ignore_errors keeps listening when a datagram arrives that is not an
-        # answer to this query, instead of giving up on the first one. The
-        # acceptance test is unchanged - dnspython still requires the reply to
-        # match the query - so nothing forged is let through; what changes is
-        # that an off-path spoofer cannot retire a healthy nameserver by
-        # racing in a single wrong-ID packet, which is the whole point of the
-        # randomised ID and source port (RFC 5452 §9).
+        # ignore_errors and ignore_unexpected keep listening when a datagram
+        # arrives that is not an answer to this query - a wrong ID, a mangled
+        # packet, or one from an address we did not send to - instead of
+        # giving up on the first one. The acceptance test is unchanged:
+        # dnspython still requires the reply to come from the server and match
+        # the query, so nothing forged is let through. What changes is that
+        # nobody can retire a healthy nameserver by racing in a single junk
+        # packet, which takes no spoofing at all when it comes from a third
+        # address and needs only our ephemeral port. Randomised IDs and ports
+        # exist to make that race unwinnable (RFC 5452 §9).
         try:
-            if self.use_tcp_fallback:
-                response, _used_tcp = dns.query.udp_with_fallback(query, server, timeout=timeout, ignore_errors=True)
-            else:
+            try:
                 # raise_on_truncation is essential: without it a truncated
                 # response is silently returned with a partial answer section.
-                response = dns.query.udp(query, server, timeout=timeout, raise_on_truncation=True, ignore_errors=True)
-        except dns.message.Truncated as exc:
-            raise _RetryableError("truncated response and TCP fallback is disabled") from exc
+                response = dns.query.udp(
+                    query,
+                    server,
+                    timeout=timeout,
+                    raise_on_truncation=True,
+                    ignore_errors=True,
+                    ignore_unexpected=True,
+                )
+            except dns.message.Truncated as exc:
+                if not self.use_tcp_fallback:
+                    raise _RetryableError("truncated response and TCP fallback is disabled") from exc
+                # What is left of the whole call's deadline, not a fresh
+                # allowance as udp_with_fallback would give.
+                remaining = self._effective_timeout(ctx)
+                if remaining <= 0:
+                    raise _RetryableError("no time left to retry over TCP") from exc
+                response = dns.query.tcp(query, server, timeout=remaining)
+                if response.flags & dns.flags.TC:
+                    # TCP has no size limit to truncate at, so this is a broken
+                    # server, and the partial answer must not be used.
+                    raise _FatalServerError("truncated response over TCP") from exc
         except dns.exception.Timeout as exc:
             raise _RetryableError(str(exc)) from exc
         except EOFError as exc:
@@ -2054,12 +2543,8 @@ class RecursiveResolver:
             raise _RetryableError(f"connection closed: {exc}") from exc
         except OSError as exc:
             if exc.errno in _FATAL_ERRNOS:
-                raise _FatalServerError(str(exc)) from exc
+                raise _FatalServerError(str(exc), errno=exc.errno) from exc
             raise _RetryableError(str(exc)) from exc
-        except dns.query.UnexpectedSource as exc:
-            # A stray or spoofed packet. Do not let it downgrade our EDNS or
-            # permanently retire an otherwise healthy nameserver.
-            raise _RetryableError(f"unexpected response source: {exc}") from exc
         except dns.exception.FormError as exc:
             raise _MalformedResponseError(str(exc)) from exc
         except dns.exception.DNSException as exc:
@@ -2074,6 +2559,10 @@ class _RetryableError(Exception):
 
 class _FatalServerError(Exception):
     """Internal: this server is unusable; move on immediately."""
+
+    def __init__(self, message: str, errno: int | None = None) -> None:
+        super().__init__(message)
+        self.errno = errno
 
 
 class _MalformedResponseError(Exception):

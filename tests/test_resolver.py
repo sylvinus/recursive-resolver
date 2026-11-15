@@ -14,6 +14,7 @@ import pytest
 from conftest import make_response, referral, root_to_com, sequence
 
 from recursive_resolver import (
+    Answer,
     CNAMELoopError,
     InvalidNameError,
     MaxDepthError,
@@ -81,14 +82,35 @@ class TestBasicResolution:
 
     def test_max_depth(self) -> None:
         resolver = _resolver(max_depth=3)
+        qname = dns.name.from_text("a.b.c.d.e.f.example.com.")
+        state = {"labels": 2}
 
-        def send(qname, rdtype, nameservers, ctx):
-            # Always descend one more label, never answer.
-            zone = dns.name.from_text("sub." + str(qname))
-            return referral(str(zone), ["ns1.example.com."], {"ns1.example.com.": "1.2.3.4"}), "1.2.3.4"
+        def send(qname_, rdtype, nameservers, ctx):
+            # Always descend one more label toward the qname, never answer.
+            state["labels"] += 1
+            zone = dns.name.Name(qname.labels[-state["labels"] :])
+            return referral(str(zone), [f"ns1.{zone}"], {f"ns1.{zone}": "1.2.3.4"}), nameservers[0]
 
         with patch.object(resolver, "_send_query", side_effect=send), pytest.raises(MaxDepthError):
-            resolver.resolve("example.com", "A")
+            resolver.resolve(qname, "A")
+        assert state["labels"] == 2 + 4, "the bound is on referrals followed"
+
+    def test_sibling_retries_do_not_count_towards_the_depth(self) -> None:
+        """Asking another server of the same zone is not a level of delegation.
+
+        Each retry used to consume one turn of a loop bounded by `max_depth`,
+        so a zone with enough failing servers reported MaxDepthError instead
+        of what actually happened.
+        """
+        resolver = _resolver(max_depth=2)
+
+        def send(qname, rdtype, nameservers, ctx):
+            if len(nameservers) > 2:
+                return make_response(rcode=dns.rcode.SERVFAIL, aa=False), nameservers[0]
+            return make_response(answer=[("example.com.", 300, "A", ["1.2.3.4"])]), nameservers[0]
+
+        with patch.object(resolver, "_send_query", side_effect=send):
+            assert resolver.resolve("example.com", "A") == ["1.2.3.4"]
 
 
 class TestCNAME:
@@ -258,15 +280,47 @@ class TestInputValidation:
 
     def test_ptr_auto_reverse(self) -> None:
         resolver = _resolver()
-        assert str(resolver._normalize_qname("8.8.8.8", "PTR")) == "8.8.8.8.in-addr.arpa."
+        assert str(resolver._normalize_qname("8.8.8.8", dns.rdatatype.PTR)) == "8.8.8.8.in-addr.arpa."
 
     def test_ptr_ipv6_auto_reverse(self) -> None:
         resolver = _resolver()
-        assert str(resolver._normalize_qname("2001:4860:4860::8888", "PTR")).endswith("ip6.arpa.")
+        assert str(resolver._normalize_qname("2001:4860:4860::8888", dns.rdatatype.PTR)).endswith("ip6.arpa.")
 
     def test_ptr_passthrough_for_arpa_names(self) -> None:
         resolver = _resolver()
-        assert str(resolver._normalize_qname("8.8.8.8.in-addr.arpa", "PTR")) == "8.8.8.8.in-addr.arpa."
+        assert str(resolver._normalize_qname("8.8.8.8.in-addr.arpa", dns.rdatatype.PTR)) == "8.8.8.8.in-addr.arpa."
+
+    def test_surrounding_whitespace_is_stripped(self) -> None:
+        """A pasted name used to keep its trailing space, as a `\\032` in the last label."""
+        resolver = _resolver()
+        assert resolver._normalize_qname(" example.com \n", dns.rdatatype.A) == dns.name.from_text("example.com.")
+
+    def test_the_zone_file_origin_shorthand_is_refused(self) -> None:
+        """dnspython reads "@" as the root, which is never what a caller passing it means."""
+        with pytest.raises(InvalidNameError, match="zone-file"):
+            _resolver().resolve("@", "A")
+
+    def test_a_dnspython_name_is_accepted(self) -> None:
+        resolver = _resolver()
+        name = dns.name.from_text("example.com", origin=None)
+        assert resolver._normalize_qname(name, dns.rdatatype.A) == dns.name.from_text("example.com.")
+
+    def test_a_dnspython_rdatatype_is_accepted(self) -> None:
+        resolver = _resolver()
+        assert resolver._parse_rdtype(dns.rdatatype.TXT) is dns.rdatatype.TXT
+        assert resolver._parse_rdtype(16) == dns.rdatatype.TXT
+        with pytest.raises(UnsupportedRdtypeError, match="out of range"):
+            resolver._parse_rdtype(70000)
+        with pytest.raises(UnsupportedRdtypeError, match="ANY"):
+            resolver._parse_rdtype(dns.rdatatype.ANY)
+        with pytest.raises(UnsupportedRdtypeError, match="string or an RdataType"):
+            resolver._parse_rdtype(None)  # type: ignore[arg-type]
+
+    def test_rrsig_cannot_be_queried_while_validating(self) -> None:
+        """It has no signature of its own, so every answer in a signed zone would be BOGUS."""
+        with pytest.raises(UnsupportedRdtypeError, match="RRSIG"):
+            RecursiveResolver(dnssec=True)._parse_rdtype("RRSIG")
+        assert _resolver()._parse_rdtype("RRSIG") == dns.rdatatype.RRSIG
 
 
 class TestAnswerAPI:
@@ -305,7 +359,9 @@ class TestAnswerAPI:
         response = make_response(answer=[("example.com.", 300, "A", ["1.2.3.4"])])
         with patch.object(resolver, "_send_query", side_effect=sequence(_chain(response))):
             answer = resolver.resolve_answer("example.com", "A")
-        assert answer.dnssec is ValidationState.INSECURE
+        # Validation is off in these tests: nothing was checked, which is not
+        # the same as a zone proven unsigned.
+        assert answer.dnssec is ValidationState.DISABLED
         assert answer.secure is False
         assert answer.ttl == 300
 
@@ -664,8 +720,80 @@ class TestGluelessNSUsesBothFamilies:
             raise NoAnswerError(str(name), dns.rdatatype.to_text(rdtype))
 
         with patch.object(resolver, "_resolve_iterative", side_effect=resolve_iterative):
-            resolver._resolve_ns_names([dns.name.from_text("ns1.example.com.")], ctx, 1, limit=5)
+            resolver._resolve_ns_names([dns.name.from_text("ns1.example.com.")], ctx, 1)
         assert asked == ["A", "AAAA"]
+        # NODATA for AAAA is what most nameservers return; it is not a failed
+        # target, or five of them would end the resolution.
+        assert ctx.budget.nx_targets == 1
+
+    def test_aaaa_is_not_asked_when_a_already_gave_an_address(self) -> None:
+        resolver = _resolver(ipv4_only=False)
+        ctx = resolver._new_context()
+        asked: list[str] = []
+
+        def resolve_iterative(name, rdtype, ctx_, depth, chain):
+            asked.append(dns.rdatatype.to_text(rdtype))
+            rrset = dns.rrset.from_text(name, 300, "IN", "A", "9.9.9.1")
+            return Answer(name, name, rdtype, rrset, 300, ValidationState.INSECURE)
+
+        with patch.object(resolver, "_resolve_iterative", side_effect=resolve_iterative):
+            assert resolver._resolve_ns_names([dns.name.from_text("ns1.example.com.")], ctx, 1) == ["9.9.9.1"]
+        assert asked == ["A"]
+
+    def test_names_are_resolved_lazily(self) -> None:
+        """Two names with addresses are enough to query the zone; the rest wait.
+
+        Resolving all thirteen of a glueless delegation's names, in both
+        families, before asking anything spent most of the query budget on
+        ordinary names such as www.gov.uk.
+        """
+        resolver = _resolver()
+        ctx = resolver._new_context()
+        names = [dns.name.from_text(f"ns{i}.example.net.") for i in range(6)]
+        asked: list[dns.name.Name] = []
+
+        def resolve_iterative(name, rdtype, ctx_, depth, chain):
+            asked.append(name)
+            rrset = dns.rrset.from_text(name, 300, "IN", "A", f"9.9.9.{len(asked)}")
+            return Answer(name, name, rdtype, rrset, 300, ValidationState.INSECURE)
+
+        with patch.object(resolver, "_resolve_iterative", side_effect=resolve_iterative):
+            first = resolver._resolve_ns_names(names, ctx, 1)
+            assert len(first) == 2 and len(asked) == 2
+            # The fallback goes on to the others, without paying again for
+            # the two already looked up.
+            more = resolver._fallback_nameservers(names, set(first), ctx, 0)
+        assert len(more) == 2 and len(asked) == 4 and not set(first) & set(more)
+
+    def test_an_unreachable_family_is_given_up_for_the_resolution(self) -> None:
+        """On a host without IPv6, one failure is enough to stop sending to v6 addresses.
+
+        The failed send is not charged either: nothing left the host.
+        """
+        import errno
+
+        from recursive_resolver.resolver import _FatalServerError
+
+        resolver = _resolver(ipv4_only=False)
+        ctx = resolver._new_context()
+        tried: list[str] = []
+
+        def query_once(qname, rdtype, server, payload, timeout, ctx_):
+            tried.append(server)
+            if ":" in server:
+                raise _FatalServerError("no route", errno=errno.ENETUNREACH)
+            return make_response(answer=[("example.com.", 300, "A", ["1.2.3.4"])])
+
+        servers = ["2001:db8::1", "2001:db8::2", "192.0.2.1"]
+        with (
+            patch.object(resolver, "_order_servers", side_effect=lambda s: list(s)),
+            patch.object(resolver, "_query_once", side_effect=query_once),
+        ):
+            response, server = resolver._send_query(dns.name.from_text("example.com."), dns.rdatatype.A, servers, ctx)
+        assert server == "192.0.2.1"
+        assert tried == ["2001:db8::1", "192.0.2.1"]
+        assert ctx.unreachable_families == {6}
+        assert ctx.budget.queries_sent == 1
 
     def test_only_a_is_queried_by_default(self) -> None:
         resolver = _resolver()
@@ -677,7 +805,7 @@ class TestGluelessNSUsesBothFamilies:
             raise NoAnswerError(str(name), dns.rdatatype.to_text(rdtype))
 
         with patch.object(resolver, "_resolve_iterative", side_effect=resolve_iterative):
-            resolver._resolve_ns_names([dns.name.from_text("ns1.example.com.")], ctx, 1, limit=5)
+            resolver._resolve_ns_names([dns.name.from_text("ns1.example.com.")], ctx, 1)
         assert asked == ["A"]
 
 
@@ -685,7 +813,11 @@ class TestClassificationEdges:
     """The branches the happy paths never reach."""
 
     def test_a_dname_whose_substitution_overflows_is_not_a_redirect(self) -> None:
-        """Found, but unusable: fall through rather than redirect nowhere."""
+        """Found, but unusable: RFC 6672 §2.2 makes it YXDOMAIN, which is an error here.
+
+        Nothing can exist below a DNAME, so reading the response as NODATA
+        would cache a denial for a name the zone has redirected.
+        """
         resolver = _resolver()
         long_target = ".".join("x" * 60 for _ in range(4)) + ".test."
         deep = ".".join("y" * 60 for _ in range(3)) + ".sub.example.com."
@@ -697,7 +829,7 @@ class TestClassificationEdges:
         classification = resolver._classify_response(
             response, dns.name.from_text(deep), dns.rdatatype.A, dns.name.from_text("example.com.")
         )
-        assert classification["type"] == "nodata"
+        assert classification["type"] == "error"
 
     def test_an_empty_authoritative_response_is_nodata(self) -> None:
         """No answer, no CNAME, no DNAME, no SOA, no NS set."""

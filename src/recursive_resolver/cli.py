@@ -19,38 +19,43 @@ _DNSSEC_NOTES = {
     ValidationState.SECURE: "; fully validated",
     ValidationState.INSECURE: "; unsigned answer",
     ValidationState.BOGUS: "; validation failed",
+    ValidationState.DISABLED: "; dnssec validation disabled",
 }
 
 
-def _json_dnssec(answer: Answer | None, args: argparse.Namespace) -> str | None:
-    """The DNSSEC state for a JSON payload.
-
-    ``--no-dnssec`` leaves the default INSECURE on the Answer, which in JSON
-    reads as "we looked and the zone is unsigned". Nothing was looked at, so
-    say so.
-
-    No answer still means no verdict. A trace that failed has nothing to report
-    a state for, and "disabled" there would describe the configuration where
-    the caller is reading a result.
-    """
+def _json_dnssec(answer: Answer | None) -> str | None:
+    """The DNSSEC state for a JSON payload; no answer means no verdict."""
     if answer is None:
         return None
-    if args.no_dnssec:
-        return "disabled"
     return answer.dnssec.value
 
 
-def _note_dnssec(answer: Answer, args: argparse.Namespace) -> None:
+def _note_dnssec(answer: Answer) -> None:
     """Report the DNSSEC verdict on stderr, so plain output is not silently unvalidated.
 
     Only for the plain output paths; the JSON payload carries the state itself.
     """
-    if args.no_dnssec:
-        # Without this the default Answer state would render as "unsigned
-        # answer", which claims a proof we never went looking for.
-        print("; dnssec validation disabled", file=sys.stderr)
-        return
     print(_DNSSEC_NOTES[answer.dnssec], file=sys.stderr)
+
+
+def _printable(value: str) -> str:
+    """``value`` with anything a terminal would act on escaped.
+
+    TXT data is whatever the zone owner put there: raw control bytes and
+    escape sequences would otherwise reach the terminal, and bytes that are
+    not UTF-8 (carried as surrogates by ``text_values``) would make printing
+    raise under a strict output encoding.
+    """
+    out = []
+    for char in value:
+        code = ord(char)
+        if 0xDC80 <= code <= 0xDCFF:
+            out.append(f"\\x{code - 0xDC00:02x}")
+        elif not char.isprintable():
+            out.append(char.encode("unicode_escape").decode("ascii"))
+        else:
+            out.append(char)
+    return "".join(out)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -199,15 +204,15 @@ def _run_query(resolver: RecursiveResolver, args: argparse.Namespace) -> int:
                     "canonical_name": str(answer.canonical_name),
                     "records": values,
                     "ttl": answer.ttl,
-                    "dnssec": _json_dnssec(answer, args),
+                    "dnssec": _json_dnssec(answer),
                 },
                 indent=2,
             )
         )
     else:
-        _note_dnssec(answer, args)
+        _note_dnssec(answer)
         for value in values:
-            print(value)
+            print(_printable(value))
     return 0
 
 
@@ -219,9 +224,15 @@ def _run_trace(resolver: RecursiveResolver, args: argparse.Namespace) -> int:
         if values is None:
             return 2
     failure = None
+    error_name = "ResolutionIncomplete"
     if answer is None:
-        last = trace[-1].response_type if trace else "no response"
-        failure = f"Resolution failed after {len(trace)} step(s); last response: {last}"
+        error = getattr(trace, "error", None)
+        if error is not None:
+            error_name = type(error).__name__
+            failure = f"{error_name}: {error} (after {len(trace)} step(s))"
+        else:
+            last = trace[-1].response_type if trace else "no response"
+            failure = f"Resolution failed after {len(trace)} step(s); last response: {last}"
 
     if args.json_output:
         payload = {
@@ -239,22 +250,22 @@ def _run_trace(resolver: RecursiveResolver, args: argparse.Namespace) -> int:
                 for step in trace
             ],
             "records": values,
-            "dnssec": _json_dnssec(answer, args),
+            "dnssec": _json_dnssec(answer),
         }
         if failure is not None:
             # Otherwise the payload is success-shaped with two nulls, and the
             # only statement that anything went wrong is English on stderr.
             # Same key names as the error object main() emits.
-            payload["error"] = "ResolutionIncomplete"
+            payload["error"] = error_name
             payload["message"] = failure
         print(json.dumps(payload, indent=2))
     else:
         for step in trace:
             print(f"{step.server:20s} {step.qname:30s} {step.response_type:10s} {step.dnssec:9s} {step.detail}")
         if answer is not None:
-            _note_dnssec(answer, args)
+            _note_dnssec(answer)
             for record in values or []:
-                print(record)
+                print(_printable(record))
     if failure is not None:
         print(failure, file=sys.stderr)
         return 1

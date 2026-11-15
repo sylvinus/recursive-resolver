@@ -42,6 +42,15 @@ PYTHON_IMAGE="python:3.13-slim"
 PKG_NAME="recursive-resolver"
 PKG_MODULE="recursive_resolver"
 
+# The release tooling is pinned: the upload container holds the PyPI token, so
+# whatever pip resolves there runs with it. Bump these deliberately, after
+# checking the new versions build and check this package. Hatchling is pinned
+# through a pip constraint rather than in pyproject.toml, so the sdist still
+# builds with any Hatchling from the floor up.
+BUILD_PIN="build==1.6.1"
+TWINE_PIN="twine==7.0.0"
+HATCHLING_PIN="hatchling==1.33.0"
+
 BOLD=$'\033[1m'
 GREEN=$'\033[1;32m'
 BLUE=$'\033[1;34m'
@@ -143,10 +152,12 @@ if git -C "${REPO_DIR}" ls-remote --exit-code --tags origin "refs/tags/${TAG}" >
     die "tag ${TAG} already exists on origin: bump the version first"
 fi
 
+# The artifacts are built from the working tree but the tag printed at the end
+# names HEAD, so anything uncommitted would be published under a tag that does
+# not contain it. There is no override: commit first.
 if [[ -n "$(git -C "${REPO_DIR}" status --porcelain)" ]]; then
-    warn "working tree is dirty:"
     git -C "${REPO_DIR}" status --short
-    confirm "Release anyway?"
+    die "working tree is dirty: commit or discard the changes above, so the tag matches what is published"
 fi
 
 printf '\n%s════════════════════════════════════════════════════════════%s\n' "${BLUE}" "${RESET}"
@@ -161,7 +172,7 @@ say "Flow:     checks → build → inspect → TestPyPI → smoke → PyPI → 
 echo
 confirm "Proceed?"
 
-# ── 1. checks ─────────────────────────────────────────────────────────────
+# ── 2. checks ─────────────────────────────────────────────────────────────
 if [[ "${SKIP_GATES:-0}" == "1" ]]; then
     warn "skipping lint/typecheck/tests (SKIP_GATES=1)"
 else
@@ -171,7 +182,10 @@ else
     ok "Checks passed"
 fi
 
-# ── 2. build ──────────────────────────────────────────────────────────────
+# ── 3. build ──────────────────────────────────────────────────────────────
+# `make check-all` writes only ignored files, but check again: the tag has to
+# name exactly what gets built.
+[[ -z "$(git -C "${REPO_DIR}" status --porcelain)" ]] || die "working tree changed during the checks"
 BUILD_SHA="$(git -C "${REPO_DIR}" rev-parse HEAD)"
 say "→ Building from ${BUILD_SHA}"
 
@@ -179,11 +193,15 @@ say "→ Cleaning previous artifacts"
 rm -rf "${REPO_DIR}/dist" "${REPO_DIR}/build"
 
 say "→ Building sdist + wheel inside ${PYTHON_IMAGE}"
-in_container "${PYTHON_IMAGE}" bash -c '
+in_container -e BUILD_PIN="${BUILD_PIN}" -e TWINE_PIN="${TWINE_PIN}" -e HATCHLING_PIN="${HATCHLING_PIN}" \
+    "${PYTHON_IMAGE}" bash -c '
     set -euo pipefail
-    pip install --quiet --no-cache-dir --root-user-action=ignore --target /tmp/pip build twine
+    pip install --quiet --no-cache-dir --root-user-action=ignore --target /tmp/pip "${BUILD_PIN}" "${TWINE_PIN}"
     export PYTHONPATH=/tmp/pip
-    python -m build --outdir dist
+    # build installs the build backend into an isolated environment with pip,
+    # which honours PIP_CONSTRAINT.
+    echo "${HATCHLING_PIN}" > /tmp/constraints.txt
+    PIP_CONSTRAINT=/tmp/constraints.txt python -m build --outdir dist
     python -m twine check dist/*
 '
 echo
@@ -191,7 +209,7 @@ ls -lh "${REPO_DIR}/dist/"
 echo
 ok "Build + twine check passed"
 
-# ── 3. inspect artifacts ──────────────────────────────────────────────────
+# ── 4. inspect artifacts ──────────────────────────────────────────────────
 say "→ Inspecting wheel and sdist contents against what this package promises"
 docker run --rm -i -v "${REPO_DIR}/dist:/dist:ro" "${PYTHON_IMAGE}" \
     python - "${VERSION}" <<'PYEOF'
@@ -267,8 +285,8 @@ if meta("Version") != VERSION:
     errors.append(f"METADATA Version: expected {VERSION!r}, got {meta('Version')!r}")
 
 rp = meta("Requires-Python")
-if not rp or "3.10" not in rp:
-    errors.append(f"METADATA Requires-Python missing or not >=3.10: {rp!r}")
+if rp != ">=3.11":
+    errors.append(f"METADATA Requires-Python is not '>=3.11': {rp!r}")
 
 if not (meta("License-Expression") or meta("License")):
     errors.append("METADATA has no License or License-Expression")
@@ -278,10 +296,8 @@ if not dct or "markdown" not in dct.lower():
     errors.append(f"METADATA Description-Content-Type isn't markdown: {dct!r}")
 
 # The dependency floor is a security floor, and there is exactly one canonical
-# value for it: pyproject.toml, SECURITY.md, CONTRIBUTING.md and this check all
-# say 2.8.0. Below 2.6.1 dnspython is affected by CVE-2023-29483, 2.6.0 broke
-# UDP->TCP failover, and 2.7.0 is the first release with the EDNS and DNSSEC
-# behaviour this package relies on.
+# value for it: pyproject.toml, README.md, SECURITY.md, CONTRIBUTING.md and this check all
+# say 2.9.2. SECURITY.md lists the advisories behind it.
 deps = re.findall(r"^Requires-Dist: (.+)$", metadata, re.MULTILINE)
 dnspython = [d for d in deps if d.startswith("dnspython")]
 if not dnspython:
@@ -291,8 +307,8 @@ else:
     if "dnssec" not in spec or "idna" not in spec:
         errors.append(f"dnspython requirement is missing the dnssec/idna extras: {spec!r}")
     m = re.search(r">=(\d+)\.(\d+)\.(\d+)", spec)
-    if not m or tuple(int(x) for x in m.groups()) < (2, 8, 0):
-        errors.append(f"dnspython floor is below the 2.8.0 security floor: {spec!r}")
+    if not m or tuple(int(x) for x in m.groups()) < (2, 9, 2):
+        errors.append(f"dnspython floor is below the 2.9.2 security floor: {spec!r}")
 
 if "Typing :: Typed" not in metadata:
     errors.append("METADATA missing the 'Typing :: Typed' classifier")
@@ -320,6 +336,10 @@ expected_sdist = {
     "CHANGELOG.md",
     "SECURITY.md",
     "CONTRIBUTING.md",
+    "TESTING.md",
+    "THIRD-PARTY.md",
+    "Makefile",
+    "Dockerfile",
     "PKG-INFO",
     "src/recursive_resolver/__init__.py",
     "src/recursive_resolver/resolver.py",
@@ -370,7 +390,7 @@ PYEOF
 echo
 confirm "Artifacts look right?"
 
-# ── 4. TestPyPI + smoke install ───────────────────────────────────────────
+# ── 5. TestPyPI + smoke install ───────────────────────────────────────────
 if [[ "${SKIP_TESTPYPI:-0}" != "1" ]]; then
     say "→ TestPyPI upload"
     echo "Get a token at https://test.pypi.org/manage/account/token/"
@@ -383,9 +403,10 @@ if [[ "${SKIP_TESTPYPI:-0}" != "1" ]]; then
     in_container \
         -e TWINE_USERNAME=__token__ \
         -e TWINE_PASSWORD \
+        -e TWINE_PIN="${TWINE_PIN}" \
         "${PYTHON_IMAGE}" bash -c '
             set -euo pipefail
-            pip install --quiet --no-cache-dir --root-user-action=ignore --target /tmp/pip twine
+            pip install --quiet --no-cache-dir --root-user-action=ignore --target /tmp/pip "${TWINE_PIN}"
             export PYTHONPATH=/tmp/pip
             python -m twine upload --skip-existing --repository-url https://test.pypi.org/legacy/ dist/*
         '
@@ -436,7 +457,7 @@ SMOKE
     ok "Smoke install passed"
 fi
 
-# ── 5. PyPI ───────────────────────────────────────────────────────────────
+# ── 6. PyPI ───────────────────────────────────────────────────────────────
 echo
 warn "The next step is irreversible: PyPI version numbers can never be reused."
 confirm "Publish ${PKG_NAME} ${VERSION} to real PyPI?"
@@ -449,9 +470,10 @@ export TWINE_PASSWORD="${PYPI_TOKEN}"
 in_container \
     -e TWINE_USERNAME=__token__ \
     -e TWINE_PASSWORD \
+    -e TWINE_PIN="${TWINE_PIN}" \
     "${PYTHON_IMAGE}" bash -c '
         set -euo pipefail
-        pip install --quiet --no-cache-dir --root-user-action=ignore --target /tmp/pip twine
+        pip install --quiet --no-cache-dir --root-user-action=ignore --target /tmp/pip "${TWINE_PIN}"
         export PYTHONPATH=/tmp/pip
         # No --skip-existing here (unlike TestPyPI, where it makes retries
         # painless): on PyPI it would turn "this version is already published"
@@ -463,7 +485,7 @@ echo
 ok "${PKG_NAME} ${VERSION} released to PyPI"
 echo "  https://pypi.org/project/${PKG_NAME}/${VERSION}/"
 
-# ── 6. Tag and GitHub release: printed, not executed ──────────────────────
+# ── 7. Tag and GitHub release: printed, not executed ──────────────────────
 #
 # The script stops short of touching git. Tagging rewrites local history and
 # pushes to a shared remote, and cutting a release is a public act; neither

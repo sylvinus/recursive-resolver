@@ -40,7 +40,11 @@ MUTATIONS: list[tuple[str, str, list[tuple[str, str]]]] = [
         [
             (
                 """        response, _server = self._send_query(
-            zone, dns.rdatatype.DNSKEY, nameservers, ctx, usable=self._usable_dnskey(zone)
+            zone,
+            dns.rdatatype.DNSKEY,
+            nameservers,
+            ctx,
+            usable=self._noting_rejects(self._usable_dnskey(zone), rejected),
         )
         if response is None:
             raise DNSSECMaterialUnavailableError(str(zone), "DNSKEY")
@@ -68,13 +72,42 @@ MUTATIONS: list[tuple[str, str, list[tuple[str, str]]]] = [
         "0.1.0: an EDNS-incapable server is re-queried without DO while validating",
         [
             (
-                """                    if ctx.dnssec:
+                """                    if validating:
                         abandoned.add(server)
+                        ctx.answered_with_error.add(server)
                         if last_resort is None:
                             last_resort = (response, server)
                     else:
                         no_edns.add(server)""",
                 "                    no_edns.add(server)",
+            ),
+            (
+                "                if server in no_edns and not validating:",
+                "                if server in no_edns:",
+            ),
+        ],
+    ),
+    (
+        "mangled-response-retried-without-do",
+        "weakening: a server whose response does not parse is re-queried without DO while validating",
+        [
+            (
+                "                    if payload is not None and not validating:",
+                "                    if payload is not None:",
+            ),
+            (
+                "                if server in no_edns and not validating:",
+                "                if server in no_edns:",
+            ),
+        ],
+    ),
+    (
+        "edns-incapable-carried-into-a-signed-zone",
+        "weakening: a server found EDNS-incapable below an unsigned cut is asked without DO in a signed zone",
+        [
+            (
+                "                if server in no_edns and not validating:",
+                "                if server in no_edns:",
             )
         ],
     ),
@@ -83,10 +116,14 @@ MUTATIONS: list[tuple[str, str, list[tuple[str, str]]]] = [
         "0.1.0: the DS fetch believes the first server that answers",
         [
             (
-                """            response, _server = self._send_query(
-                next_zone, dns.rdatatype.DS, nameservers, ctx, usable=self._usable_ds(next_zone)
-            )""",
-                "            response, _server = self._send_query(next_zone, dns.rdatatype.DS, nameservers, ctx)",
+                """        response, _server = self._send_query(
+            next_zone,
+            dns.rdatatype.DS,
+            nameservers,
+            ctx,
+            usable=self._noting_rejects(self._usable_ds(next_zone), rejected),
+        )""",
+                "        response, _server = self._send_query(next_zone, dns.rdatatype.DS, nameservers, ctx)",
             )
         ],
     ),
@@ -195,13 +232,13 @@ MUTATIONS: list[tuple[str, str, list[tuple[str, str]]]] = [
         "spec audit: cached authenticated data outlives its signature (RFC 4035 5.3.3)",
         [
             (
-                """        ttl = min(
-            rrset.ttl,
-            rrsig.ttl,
-            int(signature.original_ttl),
-            max(0, int(signature.expiration) - int(time.time())),
-        )""",
-                "        ttl = rrset.ttl",
+                """    return min(
+        int(rrset.ttl),
+        int(rrsig_rrset.ttl),
+        int(signature.original_ttl),
+        max(0, int(signature.expiration) - int(time.time())),
+    )""",
+                "    return int(rrset.ttl)",
             )
         ],
     ),
@@ -210,8 +247,8 @@ MUTATIONS: list[tuple[str, str, list[tuple[str, str]]]] = [
         "hardening: one wrong-ID datagram abandons a healthy nameserver (RFC 5452 9)",
         [
             (
-                "dns.query.udp_with_fallback(query, server, timeout=timeout, ignore_errors=True)",
-                "dns.query.udp_with_fallback(query, server, timeout=timeout)",
+                "                    ignore_errors=True,\n",
+                "",
             )
         ],
     ),
@@ -295,10 +332,10 @@ MUTATIONS: list[tuple[str, str, list[tuple[str, str]]]] = [
             (
                 """        dname_rrset = self._find_dname(response, qname, current_zone)
         if dname_rrset is not None:
-            target = self._dname_target(qname, dname_rrset)""",
+            if self.require_authoritative and not authoritative:""",
                 """        dname_rrset = None
         if dname_rrset is not None:
-            target = self._dname_target(qname, dname_rrset)""",
+            if self.require_authoritative and not authoritative:""",
             )
         ],
     ),
@@ -307,12 +344,11 @@ MUTATIONS: list[tuple[str, str, list[tuple[str, str]]]] = [
         "reference gap: the unsigned CNAME a DNAME implies is read as a stripped signature",
         [
             (
-                """            if rdtype == dns.rdatatype.CNAME and dname_rrset is not None:
-                return self._validate_answer(
-                    response, dname_rrset, qname, dns.rdatatype.DNAME, ctx, zone, nameservers, state, ds
-                )
+                """            return self._validate_answer(
+                response, dname_rrset, qname, dns.rdatatype.DNAME, ctx, zone, nameservers, state, ds
+            )
 """,
-                "",
+                "            pass\n",
             )
         ],
     ),
@@ -424,7 +460,7 @@ MUTATIONS: list[tuple[str, str, list[tuple[str, str]]]] = [
         "reference gap: a dead cached delegation is not re-resolved from its NS names",
         [
             (
-                "        pending_ns_names: list[dns.name.Name] = cached_ns_names",
+                "        pending_ns_names = [n for n in cached_ns_names if not n.is_subdomain(current_zone)]",
                 "        pending_ns_names: list[dns.name.Name] = []",
             )
         ],
@@ -435,9 +471,10 @@ MUTATIONS: list[tuple[str, str, list[tuple[str, str]]]] = [
         [
             (
                 """            wildcard = dns.name.Name((b"*",) + self._closest_encloser_nsec(qname, covering).labels)
-            for nsec in deniers:""",
-                """            wildcard = dns.name.Name((b"*",) + qname.labels[1:])
-            for nsec in deniers:""",
+            for nsec in deniers:
+                if nsec.name != wildcard:""",
+                """            for nsec in deniers:
+                if not (nsec.name.is_wild() and qname.is_subdomain(nsec.name.parent())):""",
             )
         ],
     ),
@@ -528,8 +565,8 @@ MUTATIONS: list[tuple[str, str, list[tuple[str, str]]]] = [
         "spec audit: the DNSKEY RRset is checked against every published key, not the DS-matched one",
         [
             (
-                "        if self.validate_rrset(dnskey_rrset, rrsig_rrset, {zone: entry_points}, budget=budget):",
-                "        if self.validate_rrset(dnskey_rrset, rrsig_rrset, {zone: dnskey_rrset}, budget=budget):",
+                "self.validated_rrsig(dnskey_rrset, rrsig_rrset, {zone: entry_points}, budget=budget)",
+                "self.validated_rrsig(dnskey_rrset, rrsig_rrset, {zone: dnskey_rrset}, budget=budget)",
             )
         ],
     ),
@@ -589,12 +626,10 @@ MUTATIONS: list[tuple[str, str, list[tuple[str, str]]]] = [
         "0.2.0-rc: an intermediate label that is not a cut breaks the chain walk",
         [
             (
-                """            if state is ValidationState.BOGUS and self._validator.prove_no_delegation(
-                next_zone, records, keyring, budget=ctx.budget
-            ):
-                # Not a cut: an empty non-terminal, or a name with records but
-                # no NS. The zone in force is unchanged, so carry on down.
-                continue
+                """        if state is ValidationState.BOGUS and self._validator.prove_no_delegation(
+            next_zone, records, keyring, budget=ctx.budget
+        ):
+            return state, None, False
 """,
                 "",
             )
@@ -702,6 +737,184 @@ MUTATIONS: list[tuple[str, str, list[tuple[str, str]]]] = [
         "the same control over-firing: a delegation NS RRset is unsigned by design",
         [('        if kind not in ("answer", "cname", "nodata", "nxdomain"):', "        if False:")],
     ),
+    (
+        "dname-target-from-the-wire",
+        "0.2.0 review: an unsigned CNAME beside a signed DNAME picks the target, and validates",
+        [
+            (
+                """        if dname_rrset is not None:
+            if self.require_authoritative and not authoritative:
+                return {"type": "error", "rcode": rcode, "detail": "DNAME without AA bit"}""",
+                "        wire_cname = self._find_answer_rrset(response, qname, dns.rdatatype.CNAME)\n"
+                """        if dname_rrset is not None and wire_cname is None:
+            if self.require_authoritative and not authoritative:
+                return {"type": "error", "rcode": rcode, "detail": "DNAME without AA bit"}""",
+            ),
+            (
+                """                    "dname_rrset": None,
+                    "ttl": cname_rrset.ttl,""",
+                """                    "dname_rrset": self._find_dname(response, qname, current_zone),
+                    "ttl": cname_rrset.ttl,""",
+            ),
+        ],
+    ),
+    (
+        "renamed-wildcard-nsec-denies",
+        "0.2.0 review: a wildcard's NSEC replayed under another owner proves NODATA and NXDOMAIN",
+        [
+            (
+                "self.validate_rrset(rrset, rrsig, keys, budget=budget, exact_owner=True)",
+                "self.validate_rrset(rrset, rrsig, keys, budget=budget)",
+            )
+        ],
+    ),
+    (
+        "signer-field-followed-sideways",
+        "0.2.0 review: an RRSIG naming an unsigned sibling zone downgrades a signed zone",
+        [
+            (
+                "                if name.is_subdomain(signer):\n                    return signer",
+                "                return signer",
+            )
+        ],
+    ),
+    (
+        "unverifiable-judged-from-the-keys",
+        "0.2.0 review: a forged DNSKEY RRset keeping only the unsupported key reads as unsigned",
+        [
+            (
+                "ds for ds in candidate_ds if _digest_supported(ds.digest_type) and algorithm_supported(ds.algorithm)",
+                "ds for ds in candidate_ds if _digest_supported(ds.digest_type)",
+            ),
+            (
+                """            return ValidationState.BOGUS, None
+
+        # The DNSKEY RRset must be signed by a key the DS matched""",
+                """            return ValidationState.BOGUS, None
+        if not any(algorithm_supported(key.algorithm) for key in matched):
+            return ValidationState.INSECURE, None
+
+        # The DNSKEY RRset must be signed by a key the DS matched""",
+            ),
+        ],
+    ),
+    (
+        "sha1-ds-beside-sha256",
+        "0.2.0 review: a SHA-1 DS is accepted where a SHA-256 one exists (RFC 4509 3)",
+        [
+            (
+                "            usable_ds = [ds for ds in usable_ds if ds.digest_type != dns.dnssec.DSDigest.SHA1]",
+                "            pass",
+            )
+        ],
+    ),
+    (
+        "keys-cached-for-the-wire-ttl",
+        "0.2.0 review: DNSKEYs outlive their signature by up to a day",
+        [
+            (
+                "self._store_keys(keys, authenticated_ttl(dnskey_rrset, rrsig, signature))",
+                "self._store_keys(keys, dnskey_rrset.ttl)",
+            )
+        ],
+    ),
+    (
+        "ds-cached-for-the-wire-ttl",
+        "0.2.0 review: a validated DS outlives its signature",
+        [("                rdataset.add(rr, ttl=ttl)", "                rdataset.add(rr, ttl=ds_rrset.ttl)")],
+    ),
+    (
+        "in-zone-ns-names-re-resolved",
+        "0.2.0 review: a lame zone's in-zone NS names are resolved through the same lame servers",
+        [
+            (
+                "pending_ns_names = [n for n in ns_names if not n.is_subdomain(child_zone)]\n",
+                "pending_ns_names = [n for n in ns_names if not n.is_subdomain(child_zone)] or ns_names\n",
+            ),
+            (
+                "                    glue = self._resolve_ns_names(pending_ns_names, ctx, depth + 1)",
+                "                    glue = self._resolve_ns_names(pending_ns_names or ns_names, ctx, depth + 1)",
+            ),
+        ],
+    ),
+    (
+        "servfail-sweep-quadratic",
+        "0.2.0 review: servers held back with SERVFAIL are dropped one per pass",
+        [("                failed = {server, *ctx.answered_with_error}", "                failed = {server}")],
+    ),
+    (
+        "every-ns-name-resolved-up-front",
+        "0.2.0 review: all thirteen NS names, in both families, are resolved before the first query",
+        [("_NS_NAMES_AHEAD = 2", "_NS_NAMES_AHEAD = 99")],
+    ),
+    (
+        "unreachable-family-retried",
+        "0.2.0 review: on a v4-only host every IPv6 server costs a query",
+        [("                        ctx.unreachable_families.add(_family(server))\n", "")],
+    ),
+    (
+        "plain-dns-never-below-an-unsigned-cut",
+        "0.2.0 review: with validation on, an EDNS-incapable server is unreachable even for unsigned zones",
+        [("        validating = ctx.dnssec and not ctx.chain_insecure", "        validating = ctx.dnssec")],
+    ),
+    (
+        "cname-without-aa",
+        "0.2.0 review: a CNAME is followed without the AA bit",
+        [
+            (
+                "                if self.require_authoritative and not authoritative:\n"
+                '                    return {"type": "error", "rcode": rcode, "detail": "CNAME without AA bit"}\n',
+                "",
+            )
+        ],
+    ),
+    (
+        "third-party-packet-aborts-the-query",
+        "0.2.0 review: a datagram from any other address ends the query",
+        [("                    ignore_unexpected=True,", "                    ignore_unexpected=False,")],
+    ),
+    (
+        "truncated-tcp-accepted",
+        "0.2.0 review: a TCP response with TC set is used as complete",
+        [("                if response.flags & dns.flags.TC:", "                if False:")],
+    ),
+    (
+        "nsec3-child-apex-denies-ds",
+        "0.2.0 review: the child apex's own NSEC3 proves its parent has no DS",
+        [
+            (
+                """                # The child apex's own record, as in the NSEC branch above.
+                if dns.rdatatype.SOA in types and child != dns.name.root:
+                    continue
+""",
+                "",
+            )
+        ],
+    ),
+    (
+        "algorithms-dnspython-refuses-are-supported",
+        "0.2.0 review: a DSA-only zone is BOGUS instead of unverifiable (RFC 8624)",
+        [("    if not dns.dnssec.default_policy.ok_to_validate(probe):\n        return False\n", "")],
+    ),
+    (
+        "grandparent-servers-asked-for-the-parent",
+        "0.3.0 protocol run: every name in root-servers.net is material-unavailable",
+        [("        for response in rejected:\n", "        for response in []:\n")],
+    ),
+    (
+        "grandparent-servers-asked-for-the-ds",
+        "0.3.0 protocol run: with the parent's keys cached, root-servers.net is unavailable",
+        [
+            (
+                "                    servers = self._referred_servers(rejected, zone, bailiwick)\n"
+                "                    if not servers:\n"
+                "                        raise\n"
+                "                    bailiwick = zone\n"
+                "                    step",
+                "                    raise\n                    step",
+            )
+        ],
+    ),
 ]
 
 
@@ -742,15 +955,52 @@ def apply_mutation(target: Path, edits: list[tuple[str, str]]) -> None:
 
 
 # pytest exits 0 when everything passed and 1 when a test failed. Anything else
-# is the harness itself going wrong - a collection error, a usage mistake, an
-# interpreter that will not start - and reading it as "the mutant was caught"
-# turns a broken run into a clean report.
+# is the harness itself going wrong - a usage mistake, an interpreter that will
+# not start - and reading it as "the mutant was caught" turns a broken run into
+# a clean report. A collection error is not told apart this way: under -x it
+# exits 1. The unmutated run in `main` is what catches that.
 PYTEST_EXIT_CODES = frozenset({0, 1})
 
 # The same rule for the cassette harness: 0 reproduced, 1 did not. It exits 2
 # for anything else, so a truncated cassette file or a JSONDecodeError is a
 # loud failure here instead of one more mutant reported as caught.
 CASSETTE_EXIT_CODES = frozenset({0, 1})
+
+
+def copy_package(target: Path) -> None:
+    """Copy the package and its tests, and nothing else of the repository."""
+    # Leave __pycache__ behind. A mutation that happens to preserve the file's
+    # byte length can otherwise land within the same mtime granularity as the
+    # copied .pyc, and Python reuses the stale bytecode: the mutant silently
+    # never runs.
+    ignore = shutil.ignore_patterns("__pycache__", "*.pyc")
+    shutil.copytree(REPO / "src" / "recursive_resolver", target / "recursive_resolver", ignore=ignore)
+    shutil.copytree(REPO / "tests", target / "tests", ignore=ignore)
+
+
+def unit_command(python: str, target: Path) -> list[str]:
+    """The unit suite, as run against a copy made by :func:`copy_package`."""
+    return [
+        python,
+        "-m",
+        "pytest",
+        str(target / "tests"),
+        "-q",
+        "-x",
+        "--tb=no",
+        "-p",
+        "no:cacheprovider",
+        # Live DNS fails for reasons no mutant caused.
+        "-m",
+        "not integration",
+        # These two test the repository around the package, which is not
+        # copied. With -x a module that cannot be imported exits 1, the same
+        # as a failed test.
+        "--ignore",
+        str(target / "tests/test_check_authors.py"),
+        "--ignore",
+        str(target / "tests/test_protocol_harness.py"),
+    ]
 
 
 def run(cmd: list[str], env_src: Path, cwd: Path, expected: frozenset[int] | None = None) -> bool:
@@ -793,47 +1043,30 @@ def main() -> int:
         # this was invoked from would not resolve there.
         cassettes = str(path.resolve())
 
+    cassette_cmd = [args.python, str(REPO / "scripts/cassette.py"), "perturb", "--cassettes", cassettes]
+
+    # A layer that fails on the package as it stands fails on every mutant
+    # too, and each of them reads as caught.
+    with tempfile.TemporaryDirectory() as tmp:
+        target = Path(tmp)
+        copy_package(target)
+        if not run(unit_command(args.python, target), target, target, expected=PYTEST_EXIT_CODES):
+            raise SystemExit("the unit suite fails on an unmutated copy of the package")
+        if args.cassettes and not run(cassette_cmd, target, REPO, expected=CASSETTE_EXIT_CODES):
+            raise SystemExit("the cassettes fail on an unmutated copy of the package")
+
     survivors: list[str] = []
     print(f"{'mutation':<44}{'unit suite':<14}{'cassettes':<14}caught by")
     for label, description, edits in mutations:
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp)
-            # Leave __pycache__ behind. A mutation that happens to preserve
-            # the file's byte length can otherwise land within the same
-            # mtime granularity as the copied .pyc, and Python reuses the
-            # stale bytecode: the mutant silently never runs, and the check
-            # reports it as caught.
-            ignore = shutil.ignore_patterns("__pycache__", "*.pyc")
-            shutil.copytree(REPO / "src" / "recursive_resolver", target / "recursive_resolver", ignore=ignore)
-            shutil.copytree(REPO / "tests", target / "tests", ignore=ignore)
+            copy_package(target)
             apply_mutation(target, edits)
 
-            unit_ok = run(
-                [
-                    args.python,
-                    "-m",
-                    "pytest",
-                    str(target / "tests"),
-                    "-q",
-                    "-x",
-                    "--tb=no",
-                    "-p",
-                    "no:cacheprovider",
-                    "--ignore",
-                    str(target / "tests/test_check_authors.py"),
-                ],
-                target,
-                target,
-                expected=PYTEST_EXIT_CODES,
-            )
+            unit_ok = run(unit_command(args.python, target), target, target, expected=PYTEST_EXIT_CODES)
             cassette_ok = True
             if args.cassettes:
-                cassette_ok = run(
-                    [args.python, str(REPO / "scripts/cassette.py"), "perturb", "--cassettes", cassettes],
-                    target,
-                    REPO,
-                    expected=CASSETTE_EXIT_CODES,
-                )
+                cassette_ok = run(cassette_cmd, target, REPO, expected=CASSETTE_EXIT_CODES)
 
             caught = [name for name, ok in (("unit", unit_ok), ("cassettes", cassette_ok)) if not ok]
             if not caught:
