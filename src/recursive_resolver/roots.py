@@ -26,7 +26,9 @@ ROOT_SERVERS: dict[str, tuple[str, str]] = {
 # DS records for the root zone, in presentation format.
 #
 # Only currently-valid anchors are listed: KSK-2017 (tag 20326, valid from
-# 2017-02-02) and KSK-2024 (tag 38696, valid from 2024-07-18).
+# 2017-02-02) and KSK-2024 (tag 38696, valid from 2024-07-18). KSK-2024 has
+# signed the root DNSKEY RRset since 2026-10-11, and KSK-2017 is scheduled for
+# revocation on 2027-01-11; remove it here once IANA retires it.
 #
 # Format: keytag algorithm digest_type digest
 ROOT_TRUST_ANCHORS: tuple[str, ...] = (

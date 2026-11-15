@@ -3,19 +3,50 @@
 Every error raised out of :meth:`RecursiveResolver.resolve` is a
 :class:`ResolverError`.  Nothing from dnspython is allowed to escape: input
 validation errors, malformed-response errors and DNSSEC failures are all
-translated into the classes below.
+translated into the classes below. Invalid constructor arguments are the one
+exception: they raise :class:`ValueError`, before any resolution starts.
 """
 
 from __future__ import annotations
 
+from typing import Any
+
+import dns.rcode
+
+
+def _restore(cls: type[ResolverError], args: tuple[Any, ...], state: dict[str, Any]) -> ResolverError:
+    """Rebuild a pickled :class:`ResolverError` without re-running ``__init__``."""
+    error = cls.__new__(cls)
+    error.args = args
+    error.__dict__.update(state)
+    return error
+
 
 class ResolverError(Exception):
-    """Base exception for all resolver errors."""
+    """Base exception for all resolver errors.
+
+    Attributes:
+        qname: The name being resolved when the error occurred. This can be a
+            CNAME target or a nameserver hostname rather than the name the
+            caller asked for; that one is in ``query_name``.
+        rdtype: The record type being resolved, likewise.
+        query_name: The name passed to ``resolve()``, once the error has left it.
+        query_type: The record type passed to ``resolve()``, likewise.
+    """
 
     def __init__(self, message: str, qname: str | None = None, rdtype: str | None = None) -> None:
         self.qname = qname
         self.rdtype = rdtype
+        self.query_name: str | None = None
+        self.query_type: str | None = None
         super().__init__(message)
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        # The subclasses build their message from several arguments while
+        # `args` holds only the finished string, so the default reduction
+        # calls `__init__` with the wrong arity. That breaks pickling, and
+        # with it process pools and task queues.
+        return (_restore, (type(self), self.args, self.__dict__))
 
 
 class NXDOMAINError(ResolverError):
@@ -63,13 +94,20 @@ class CNAMELoopError(ResolverError):
 
 
 class ServfailError(ResolverError):
-    """All nameservers returned SERVFAIL or other error responses."""
+    """No nameserver could answer: error responses, lame servers, or none reachable.
 
-    def __init__(self, qname: str, rdtype: str, rcode: int | None = None) -> None:
+    The name follows the SERVFAIL a stub resolver would be handed. ``rcode`` is
+    the last error rcode received, if any, and ``reason`` says what went wrong.
+    """
+
+    def __init__(self, qname: str, rdtype: str, rcode: int | None = None, reason: str | None = None) -> None:
         self.rcode = rcode
-        msg = f"SERVFAIL resolving {qname}/{rdtype}"
+        if reason is None:
+            reason = "error response from every nameserver"
+        self.reason = reason
+        msg = f"Server failure resolving {qname}/{rdtype}: {reason}"
         if rcode is not None:
-            msg += f" (rcode={rcode})"
+            msg += f" (last rcode {dns.rcode.to_text(dns.rcode.Rcode.make(rcode))})"
         super().__init__(msg, qname=qname, rdtype=rdtype)
 
 
@@ -100,11 +138,12 @@ class QueryBudgetExceededError(ResolverError):
     Delegation) where a hostile zone provokes unbounded query fan-out.
     """
 
-    def __init__(self, qname: str, rdtype: str, resource: str, limit: int) -> None:
+    def __init__(self, qname: str | None, rdtype: str | None, resource: str, limit: int) -> None:
         self.resource = resource
         self.limit = limit
+        where = f" resolving {qname}/{rdtype}" if qname is not None else ""
         super().__init__(
-            f"Query budget exceeded resolving {qname}/{rdtype}: {resource} limit of {limit} reached",
+            f"Query budget exceeded{where}: {resource} limit of {limit} reached",
             qname=qname,
             rdtype=rdtype,
         )
@@ -160,11 +199,14 @@ class DNSSECInsecureError(DNSSECError):
 
 
 class DNSSECUnavailableError(ResolverError):
-    """DNSSEC validation was requested but the `cryptography` package is missing."""
+    """DNSSEC validation was requested but dnspython's DNSSEC support is off.
+
+    dnspython enables it only with `cryptography` installed and recent enough.
+    """
 
     def __init__(self) -> None:
         super().__init__(
-            "DNSSEC validation requires the 'cryptography' package. "
+            "DNSSEC validation requires the 'cryptography' package, version 50 or later. "
             "Install it with: pip install 'recursive-resolver[dnssec]' "
             "(or construct the resolver with dnssec=False)."
         )

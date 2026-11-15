@@ -16,7 +16,7 @@ from typing import Any, Generic, TypeVar
 T = TypeVar("T")
 
 
-def _per_waiter(error: BaseException) -> BaseException:
+def clone_error(error: BaseException) -> BaseException:
     """A distinct instance of ``error``, so no two threads share one object.
 
     ``raise`` writes ``__traceback__`` onto the exception it is handed, so
@@ -24,13 +24,12 @@ def _per_waiter(error: BaseException) -> BaseException:
     one traceback at once, and a caller ends up reading frames from threads it
     never ran.
 
-    ``copy.copy`` cannot do this. These exceptions build their message in
-    ``__init__`` out of several arguments while ``args`` holds only the
-    finished string, so copy re-invokes ``__init__`` with the wrong arity: it
-    raises ``TypeError`` for most of them and silently double-wraps the message
-    for the rest. Bypassing ``__init__`` and carrying ``args``, ``__dict__``
-    and ``__cause__`` across reproduces every :class:`ResolverError` exactly,
-    which is all this class is ever asked to transport.
+    ``copy.copy`` is not enough for an arbitrary exception: one that builds its
+    message in ``__init__`` out of several arguments, while ``args`` holds only
+    the finished string, gets ``__init__`` re-invoked with the wrong arity.
+    Bypassing ``__init__`` and carrying ``args``, ``__dict__`` and
+    ``__cause__`` across reproduces every :class:`ResolverError` exactly, and
+    most other exceptions too.
 
     ``OSError`` keeps ``errno`` and ``strerror`` in C-level state that is
     populated at construction and would not survive, so it is passed through
@@ -85,7 +84,8 @@ class SingleFlight(Generic[T]):
 
         if leader:
             try:
-                call.value = fn()
+                value = fn()
+                call.value = value
             except BaseException as exc:  # noqa: BLE001 - re-raised below and to waiters
                 call.error = exc
                 raise
@@ -93,14 +93,15 @@ class SingleFlight(Generic[T]):
                 with self._lock:
                     self._calls.pop(key, None)
                 call.event.set()
-            return call.value  # type: ignore[return-value]
+            return value
 
         if not call.event.wait(timeout=wait_timeout):
             # The leader is taking too long; do the work ourselves rather than
-            # blocking indefinitely on it.
+            # blocking indefinitely on it. The caller's own deadline still
+            # applies to that work.
             return fn()
         if call.error is not None:
-            raise _per_waiter(call.error)
+            raise clone_error(call.error)
         return call.value  # type: ignore[return-value]
 
     def in_flight(self) -> int:

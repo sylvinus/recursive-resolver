@@ -71,6 +71,12 @@ _ANSWER = "A"
 _NODATA = "ND"
 _NXDOMAIN = "NX"
 _DELEGATION = "DG"
+_FAILURE = "SF"
+
+# How long a resolution failure is remembered. RFC 9520 §3.2 asks for at least
+# one second and no more than five minutes; a few seconds absorbs a burst of
+# retries without keeping a name down once its servers recover.
+FAILURE_TTL = 5
 
 CacheKey = tuple[str, dns.name.Name, int, int]
 
@@ -79,7 +85,9 @@ CacheKey = tuple[str, dns.name.Name, int, int]
 class CacheEntry:
     """A single cached DNS response."""
 
-    rrset: Any  # dns.rrset.RRset, Delegation, or None for NXDOMAIN
+    # An RRset for an answer, a Delegation for a zone cut, the error for a
+    # cached failure, None for a negative entry.
+    rrset: Any
     expiry: float  # time.monotonic() value when this entry expires
     is_negative: bool = False
     secure: bool = False  # DNSSEC-authenticated
@@ -92,6 +100,11 @@ class Delegation:
     ``ds`` carries the validated DS rdataset for the zone so a resumed
     resolution can rebuild the chain of trust without depending on a separate
     DNSKEY cache still being warm.
+
+    ``unsigned_until`` is when the proof that the zone, or one above it, is
+    unsigned stops holding, on the monotonic clock. A resolution resumed here
+    caches no delegation below the cut for longer. ``None`` where nothing
+    proved it.
     """
 
     zone: dns.name.Name
@@ -99,6 +112,7 @@ class Delegation:
     ns_names: list[str] = field(default_factory=list)
     secure: bool = False
     ds: Any = None
+    unsigned_until: float | None = None
 
 
 @dataclass
@@ -151,6 +165,7 @@ class DNSCache:
 
     def __init__(
         self,
+        *,
         max_size: int = 10000,
         min_ttl: int = 0,
         max_ttl: int = 86400,
@@ -258,20 +273,28 @@ class DNSCache:
         return rrset
 
     def get_answer(
-        self, qname: dns.name.Name | str, rdtype: int | str, rdclass: int = dns.rdataclass.IN
+        self,
+        qname: dns.name.Name | str,
+        rdtype: int | str,
+        rdclass: int = dns.rdataclass.IN,
+        record_stats: bool = True,
     ) -> CacheEntry | None:
         """Look up a positive answer. Returns None on miss or expiry.
 
         The returned entry carries a private copy of the RRset; mutating it
-        cannot affect the cache or any other caller.
+        cannot affect the cache or any other caller. ``record_stats=False``
+        leaves :attr:`stats` alone, for lookups that are not the caller's
+        question.
         """
         key: CacheKey = (_ANSWER, self._name(qname), self._rdtype(rdtype), rdclass)
         with self._lock:
             entry = self._get(key)
             if entry is None:
-                self.stats.misses += 1
+                if record_stats:
+                    self.stats.misses += 1
                 return None
-            self.stats.hits += 1
+            if record_stats:
+                self.stats.hits += 1
             return replace(entry, rrset=self._isolate(entry.rrset))
 
     def put_answer(
@@ -301,29 +324,33 @@ class DNSCache:
             return None if entry is None else replace(entry)
 
     def get_nxdomain_ancestor(self, qname: dns.name.Name | str) -> CacheEntry | None:
-        """Return the cached NXDOMAIN entry for an ancestor of ``qname``, if any.
+        """Return the cached NXDOMAIN for ``qname``, or for an ancestor of it.
 
         Implements RFC 8020 / ``harden-below-nxdomain``: if ``foo.example.com``
-        does not exist, nothing below it can exist either. This is the primary
-        defence against random-subdomain (water torture) floods.
+        does not exist, nothing below it can exist either.
 
-        The entry rather than the name, so the caller can see whether that
-        denial was proven: a name below an authenticated "does not exist" is
-        itself authenticated as absent, and one below an unproven denial is not.
+        Only an authenticated NXDOMAIN cuts off the names below it, as in
+        Unbound. Servers that answer NXDOMAIN for an empty non-terminal exist,
+        and so does a single spoofed packet: taking either at its word for the
+        whole subtree hides, say, every DKIM selector under
+        ``_domainkey.example.`` for as long as the entry lives. An unproven
+        NXDOMAIN still answers for its own name.
         """
         name = self._name(qname)
         with self._lock:
+            entry = self._get((_NXDOMAIN, name, 0, 0))
+            if entry is not None:
+                return replace(entry)
             current = name
-            while True:
-                entry = self._get((_NXDOMAIN, current, 0, 0))
-                if entry is not None:
-                    return replace(entry)
-                if current == dns.name.root:
-                    return None
+            while current != dns.name.root:
                 try:
                     current = current.parent()
                 except dns.name.NoParent:  # pragma: no cover - guarded by the root check
                     return None
+                entry = self._get((_NXDOMAIN, current, 0, 0))
+                if entry is not None and entry.secure:
+                    return replace(entry)
+            return None
 
     def put_nxdomain(self, qname: dns.name.Name | str, ttl: int | None = None, secure: bool = False) -> None:
         """Store an NXDOMAIN, keyed by name only (RFC 2308 §5).
@@ -365,10 +392,39 @@ class DNSCache:
         with self._lock:
             self._put(key, entry)
 
+    # ── resolution failures ─────────────────────────────────────────────
+
+    def put_failure(
+        self, qname: dns.name.Name | str, rdtype: int | str, error: BaseException, ttl: int = FAILURE_TTL
+    ) -> None:
+        """Remember that resolving this name and type failed (RFC 9520).
+
+        Without this, every caller retrying a broken name sends the full set of
+        queries again at once, which is the load RFC 9520 §3 asks resolvers
+        not to generate.
+        """
+        key: CacheKey = (_FAILURE, self._name(qname), self._rdtype(rdtype), dns.rdataclass.IN)
+        entry = CacheEntry(rrset=error, expiry=time.monotonic() + max(1, ttl), is_negative=True)
+        with self._lock:
+            self._put(key, entry)
+
+    def get_failure(self, qname: dns.name.Name | str, rdtype: int | str) -> BaseException | None:
+        """The error a recent attempt at this name and type failed with, if any."""
+        key: CacheKey = (_FAILURE, self._name(qname), self._rdtype(rdtype), dns.rdataclass.IN)
+        with self._lock:
+            entry = self._get(key)
+            if entry is None or not isinstance(entry.rrset, BaseException):
+                return None
+            return entry.rrset
+
     # ── delegations ─────────────────────────────────────────────────────
 
-    def put_delegation(self, delegation: Delegation, ttl: int) -> None:
-        """Cache the nameservers for a zone cut, subject to the depth limit."""
+    def put_delegation(self, delegation: Delegation, ttl: int, floor: bool = True) -> None:
+        """Cache the nameservers for a zone cut, subject to the depth limit.
+
+        ``floor=False`` for an unsigned cut whose TTL the proof that it is
+        unsigned has capped: ``min_ttl`` must not lift it back up.
+        """
         depth = len(delegation.zone) - 1  # dns.name length includes the root label
         if self.max_delegation_depth is not None and depth > self.max_delegation_depth:
             return
@@ -377,7 +433,7 @@ class DNSCache:
         # to the same rule as an authenticated answer: no floor (see _clamp).
         entry = CacheEntry(
             rrset=self._isolate(delegation),
-            expiry=time.monotonic() + self._clamp(ttl, secure=delegation.secure),
+            expiry=time.monotonic() + self._clamp(ttl, secure=delegation.secure or not floor),
             secure=delegation.secure,
         )
         with self._lock:

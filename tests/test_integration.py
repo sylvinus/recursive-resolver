@@ -105,7 +105,7 @@ class TestRealDNSSEC:
 
     def test_dnssec_can_be_disabled(self) -> None:
         plain = RecursiveResolver(dnssec=False, max_resolution_time=20.0)
-        assert plain.resolve_answer("dnssec-failed.org", "A").dnssec is ValidationState.INSECURE
+        assert plain.resolve_answer("dnssec-failed.org", "A").dnssec is ValidationState.DISABLED
 
 
 class TestRealDKIM:

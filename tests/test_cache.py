@@ -116,13 +116,26 @@ class TestNegativeCache:
     def test_harden_below_nxdomain(self) -> None:
         """RFC 8020: nothing can exist below a non-existent name."""
         cache = DNSCache()
-        cache.put_nxdomain(dns.name.from_text("gone.example.com."), ttl=300)
+        cache.put_nxdomain(dns.name.from_text("gone.example.com."), ttl=300, secure=True)
         found = cache.get_nxdomain_ancestor(dns.name.from_text("deep.under.gone.example.com."))
         assert found is not None and found.is_negative
 
+    def test_an_unproven_nxdomain_does_not_cut_off_the_names_below_it(self) -> None:
+        """Only an authenticated NXDOMAIN covers its subtree, as in Unbound.
+
+        Servers that answer NXDOMAIN for an empty non-terminal exist, and a
+        single spoofed packet for `_domainkey.example.` would otherwise hide
+        every DKIM selector below it for the life of the entry.
+        """
+        cache = DNSCache()
+        cache.put_nxdomain(dns.name.from_text("_domainkey.example.com."), ttl=300)
+        assert cache.get_nxdomain_ancestor(dns.name.from_text("sel._domainkey.example.com.")) is None
+        exact = cache.get_nxdomain_ancestor(dns.name.from_text("_domainkey.example.com."))
+        assert exact is not None and exact.secure is False
+
     def test_unrelated_names_are_not_covered(self) -> None:
         cache = DNSCache()
-        cache.put_nxdomain(dns.name.from_text("gone.example.com."), ttl=300)
+        cache.put_nxdomain(dns.name.from_text("gone.example.com."), ttl=300, secure=True)
         assert cache.get_nxdomain_ancestor(dns.name.from_text("live.example.com.")) is None
 
     def test_the_denial_state_is_recorded_and_returned(self) -> None:
@@ -131,7 +144,7 @@ class TestNegativeCache:
         cache.put_nxdomain(dns.name.from_text("proven.example.com."), ttl=300, secure=True)
         cache.put_nxdomain(dns.name.from_text("unproven.example.com."), ttl=300)
         proven = cache.get_nxdomain_ancestor(dns.name.from_text("a.proven.example.com."))
-        unproven = cache.get_nxdomain_ancestor(dns.name.from_text("a.unproven.example.com."))
+        unproven = cache.get_nxdomain_ancestor(dns.name.from_text("unproven.example.com."))
         assert proven is not None and proven.secure is True
         assert unproven is not None and unproven.secure is False
 
@@ -321,7 +334,7 @@ class TestResolverCacheIntegration:
 
     def test_nxdomain_below_cached_nxdomain_costs_nothing(self) -> None:
         resolver = RecursiveResolver(dnssec=False, cache_enabled=True)
-        resolver.cache.put_nxdomain(dns.name.from_text("gone.example.com."), ttl=300)
+        resolver.cache.put_nxdomain(dns.name.from_text("gone.example.com."), ttl=300, secure=True)
         with patch.object(resolver, "_send_query") as send, pytest.raises(NXDOMAINError):
             resolver.resolve("host.gone.example.com", "A")
         send.assert_not_called()

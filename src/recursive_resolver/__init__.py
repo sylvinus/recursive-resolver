@@ -21,13 +21,14 @@ from .exceptions import (
     ServfailError,
     UnsupportedRdtypeError,
 )
-from .resolver import Answer, RecursiveResolver, TraceStep
+from .resolver import Answer, RecursiveResolver, Trace, TraceStep
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "RecursiveResolver",
     "Answer",
+    "Trace",
     "TraceStep",
     "ValidationState",
     "Limits",

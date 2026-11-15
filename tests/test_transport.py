@@ -40,13 +40,13 @@ class TestExceptionTranslation:
 
     def test_timeout_is_retryable(self) -> None:
         resolver = _resolver()
-        with patch("dns.query.udp_with_fallback", side_effect=dns.exception.Timeout), pytest.raises(_RetryableError):
+        with patch("dns.query.udp", side_effect=dns.exception.Timeout), pytest.raises(_RetryableError):
             _query_once(resolver)
 
     def test_eof_is_retryable(self) -> None:
         """dnspython raises EOFError when a TCP peer closes mid-response."""
         resolver = _resolver()
-        with patch("dns.query.udp_with_fallback", side_effect=EOFError("EOF")), pytest.raises(_RetryableError):
+        with patch("dns.query.udp", side_effect=EOFError("EOF")), pytest.raises(_RetryableError):
             _query_once(resolver)
 
     @pytest.mark.parametrize("code", [errno.EHOSTUNREACH, errno.ENETUNREACH, errno.EAFNOSUPPORT, errno.EADDRNOTAVAIL])
@@ -54,7 +54,7 @@ class TestExceptionTranslation:
         """No address family here means retrying is pointless."""
         resolver = _resolver()
         with (
-            patch("dns.query.udp_with_fallback", side_effect=OSError(code, "unreachable")),
+            patch("dns.query.udp", side_effect=OSError(code, "unreachable")),
             pytest.raises(_FatalServerError),
         ):
             _query_once(resolver)
@@ -62,24 +62,101 @@ class TestExceptionTranslation:
     def test_other_oserrors_are_retryable(self) -> None:
         resolver = _resolver()
         with (
-            patch("dns.query.udp_with_fallback", side_effect=OSError(errno.ECONNREFUSED, "refused")),
+            patch("dns.query.udp", side_effect=OSError(errno.ECONNREFUSED, "refused")),
             pytest.raises(_RetryableError),
         ):
             _query_once(resolver)
 
-    def test_unexpected_source_is_retryable_not_malformed(self) -> None:
-        """A stray packet must not be treated as 'this server speaks bad DNS'."""
+    def test_packets_from_other_addresses_are_ignored_not_fatal(self) -> None:
+        """A datagram from a third address must not end the query.
+
+        dnspython raises UnexpectedSource for one unless asked to ignore it, and
+        it does so before `ignore_errors` is consulted, so anyone able to reach
+        our ephemeral port could abort a lookup without spoofing anything.
+        """
         resolver = _resolver()
+        good = make_response(answer=[("example.com.", 300, "A", ["1.1.1.1"])])
+        with patch("dns.query.udp", return_value=good) as udp:
+            _query_once(resolver)
+        assert udp.call_args.kwargs["ignore_unexpected"] is True
+        assert udp.call_args.kwargs["ignore_errors"] is True
+
+    @staticmethod
+    def _udp_taking(clock: list[float], seconds: float):
+        """A UDP exchange that ends truncated after that long on ``clock``."""
+        truncated = make_response(answer=[("example.com.", 300, "A", ["1.1.1.1"])], tc=True)
+
+        def udp(*args, **kwargs):
+            clock[0] += seconds
+            raise dns.message.Truncated(message=truncated)
+
+        return udp
+
+    def test_tcp_fallback_gets_the_remaining_time_not_a_fresh_allowance(self) -> None:
+        resolver = _resolver(timeout=2.0, max_resolution_time=1.0)
+        good = make_response(answer=[("example.com.", 300, "A", ["1.1.1.1"])])
+        clock = [1000.0]
         with (
-            patch("dns.query.udp_with_fallback", side_effect=dns.query.UnexpectedSource("bad source")),
-            pytest.raises(_RetryableError),
+            patch("time.monotonic", side_effect=lambda: clock[0]),
+            patch("dns.query.udp", side_effect=self._udp_taking(clock, 0.75)),
+            patch("dns.query.tcp", return_value=good) as tcp,
+        ):
+            assert _query_once(resolver) is good
+        assert tcp.call_args.kwargs["timeout"] == pytest.approx(0.25)
+
+    def test_tcp_fallback_is_skipped_when_udp_used_up_the_deadline(self) -> None:
+        resolver = _resolver(timeout=2.0, max_resolution_time=1.0)
+        clock = [1000.0]
+        with (
+            patch("time.monotonic", side_effect=lambda: clock[0]),
+            patch("dns.query.udp", side_effect=self._udp_taking(clock, 1.0)),
+            patch("dns.query.tcp") as tcp,
+            pytest.raises(_RetryableError, match="no time left"),
+        ):
+            _query_once(resolver)
+        tcp.assert_not_called()
+
+    def test_a_truncated_answer_shows_the_family_is_reachable(self) -> None:
+        resolver = _resolver()
+        ctx = resolver._new_context()
+        truncated = make_response(answer=[("example.com.", 300, "A", ["1.1.1.1"])], tc=True)
+        with (
+            patch("dns.query.udp", side_effect=dns.message.Truncated(message=truncated)),
+            patch("dns.query.tcp", side_effect=OSError(errno.ENETUNREACH, "unreachable")),
+            pytest.raises(_FatalServerError),
+        ):
+            resolver._query_once(QNAME, dns.rdatatype.A, "9.9.9.9", 1232, 1.0, ctx)
+        assert ctx.reachable_families == {4}
+
+    def test_tcp_fallback_is_skipped_once_the_deadline_has_passed(self) -> None:
+        import time
+
+        resolver = _resolver()
+        truncated = make_response(answer=[("example.com.", 300, "A", ["1.1.1.1"])], tc=True)
+        ctx = resolver._new_context(deadline=time.monotonic() - 1)
+        with (
+            patch("dns.query.udp", side_effect=dns.message.Truncated(message=truncated)),
+            patch("dns.query.tcp") as tcp,
+            pytest.raises(_RetryableError, match="no time left"),
+        ):
+            resolver._query_once(QNAME, dns.rdatatype.A, "9.9.9.9", 1232, 1.0, ctx)
+        tcp.assert_not_called()
+
+    def test_a_truncated_tcp_response_is_never_used(self) -> None:
+        """TCP has no size limit, so TC there is a broken server; the partial answer must go."""
+        resolver = _resolver()
+        truncated = make_response(answer=[("example.com.", 300, "A", ["1.1.1.1"])], tc=True)
+        with (
+            patch("dns.query.udp", side_effect=dns.message.Truncated(message=truncated)),
+            patch("dns.query.tcp", return_value=truncated),
+            pytest.raises(_FatalServerError, match="over TCP"),
         ):
             _query_once(resolver)
 
     def test_form_error_is_malformed(self) -> None:
         resolver = _resolver()
         with (
-            patch("dns.query.udp_with_fallback", side_effect=dns.exception.FormError("bad wire")),
+            patch("dns.query.udp", side_effect=dns.exception.FormError("bad wire")),
             pytest.raises(_MalformedResponseError),
         ):
             _query_once(resolver)
@@ -88,7 +165,7 @@ class TestExceptionTranslation:
         """BadResponse (ID/question mismatch) is a FormError subclass."""
         resolver = _resolver()
         with (
-            patch("dns.query.udp_with_fallback", side_effect=dns.query.BadResponse),
+            patch("dns.query.udp", side_effect=dns.query.BadResponse),
             pytest.raises(_MalformedResponseError),
         ):
             _query_once(resolver)
@@ -96,7 +173,7 @@ class TestExceptionTranslation:
     def test_other_dns_exceptions_are_malformed(self) -> None:
         resolver = _resolver()
         with (
-            patch("dns.query.udp_with_fallback", side_effect=dns.exception.SyntaxError("nope")),
+            patch("dns.query.udp", side_effect=dns.exception.SyntaxError("nope")),
             pytest.raises(_MalformedResponseError),
         ):
             _query_once(resolver)
@@ -131,7 +208,7 @@ class TestExceptionTranslation:
 
         resolver = _resolver()
         good = make_response(answer=[("example.com.", 300, "A", ["1.1.1.1"])])
-        with patch("dns.query.udp_with_fallback", return_value=(good, False)) as udp:
+        with patch("dns.query.udp", return_value=good) as udp:
             _query_once(resolver)
         assert not (udp.call_args.args[0].flags & dns.flags.RD)
 
@@ -173,8 +250,10 @@ class TestServerRotation:
         assert payloads == [1232, None], "one EDNS downgrade, then abandon the server"
 
     def test_deadline_stops_the_send_loop(self) -> None:
-        resolver = _resolver(max_resolution_time=0.0)
-        ctx = resolver._new_context()
+        import time
+
+        resolver = _resolver()
+        ctx = resolver._new_context(deadline=time.monotonic() - 1)
         response, server = resolver._send_query(QNAME, dns.rdatatype.A, ["9.9.9.9"], ctx)
         assert response is None
         assert server == ""

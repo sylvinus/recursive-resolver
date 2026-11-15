@@ -27,7 +27,8 @@ Unbound              ``MAX_REFERRAL_COUNT``              130
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
+from typing import Any
 
 from .exceptions import QueryBudgetExceededError
 
@@ -63,7 +64,7 @@ DEFAULT_MAX_SIGNATURE_VALIDATIONS = 96
 DEFAULT_MAX_NSEC3_HASHES = 600
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class Limits:
     """Immutable hardening limits, shared by every resolution a resolver runs.
 
@@ -103,6 +104,12 @@ class Limits:
     max_signature_validations: int = DEFAULT_MAX_SIGNATURE_VALIDATIONS
     max_nsec3_hashes: int = DEFAULT_MAX_NSEC3_HASHES
 
+    def __post_init__(self) -> None:
+        for limit in fields(self):
+            value = getattr(self, limit.name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f"{limit.name} must be a positive integer, got {value!r}")
+
     def budget(self, deadline: float) -> QueryBudget:
         """Return a fresh per-resolution counter enforcing these limits."""
         return QueryBudget(
@@ -141,12 +148,18 @@ class QueryBudget:
     referrals_followed: int = field(default=0, init=False)
     signature_validations: int = field(default=0, init=False)
     nsec3_hashes: int = field(default=0, init=False)
+    # Verdicts already reached in this resolution; see DNSSECValidator.validated_rrsig.
+    signature_memo: dict[Any, Any] = field(default_factory=dict, init=False, repr=False, compare=False)
 
     def spend_query(self, qname: str, rdtype: str) -> None:
         """Account for one outgoing query. Raises when the budget is exhausted."""
         if self.queries_sent >= self.max_queries:
             raise QueryBudgetExceededError(qname, rdtype, "queries", self.max_queries)
         self.queries_sent += 1
+
+    def refund_query(self) -> None:
+        """Give back a query that failed locally, before any packet left the host."""
+        self.queries_sent = max(0, self.queries_sent - 1)
 
     def note_referral(self, qname: str, rdtype: str) -> None:
         """Account for one followed referral."""
@@ -164,13 +177,13 @@ class QueryBudget:
         """Account for one signature verification (KeyTrap control)."""
         self.signature_validations += 1
         if self.signature_validations > self.max_signature_validations:
-            raise QueryBudgetExceededError("<dnssec>", "RRSIG", "signature validations", self.max_signature_validations)
+            raise QueryBudgetExceededError(None, None, "signature validations", self.max_signature_validations)
 
     def spend_nsec3_hash(self) -> None:
         """Account for one NSEC3 hash computation (KeyTrap control)."""
         self.nsec3_hashes += 1
         if self.nsec3_hashes > self.max_nsec3_hashes:
-            raise QueryBudgetExceededError("<dnssec>", "NSEC3", "NSEC3 hash computations", self.max_nsec3_hashes)
+            raise QueryBudgetExceededError(None, None, "NSEC3 hash computations", self.max_nsec3_hashes)
 
     def remaining_queries(self) -> int:
         """Number of queries still permitted."""

@@ -80,6 +80,15 @@ class TestAuthenticatedTTLIsCappedBySignatureValidity:
         cap = min(data.ttl, sig.ttl, int(signature.original_ttl), int(signature.expiration) - int(time.time()))
         assert cap <= 30, "a day-long TTL survived a 30-second signature"
 
+    def test_a_remembered_signature_is_not_reused_past_its_expiry(self, zone: SignedZone) -> None:
+        """A resolution checks the same records more than once, and can outlast a signature."""
+        data = rrset_of("example.test.", "A", "192.0.2.1", ttl=300)
+        sig = self._signed_for(zone, data, 30)
+        validator, keys, budget = DNSSECValidator(), zone.keyring(), QueryBudget()
+        assert validator.validated_rrsig(data, sig, keys, budget=budget) is not None
+        with patch("time.time", return_value=time.time() + 60):
+            assert validator.validated_rrsig(data, sig, keys, budget=budget) is None
+
     def test_a_long_lived_signature_does_not_shorten_the_ttl(self, zone: SignedZone) -> None:
         data = rrset_of("example.test.", "A", "192.0.2.1", ttl=300)
         signature = DNSSECValidator().validated_rrsig(data, zone.sign(data), zone.keyring())
@@ -757,7 +766,7 @@ class TestWildcardExpansion:
             nsec3 = rrset_of(
                 "00000000000000000000000000000000.test.",
                 "NSEC3",
-                "1 1 0 - ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ A RRSIG",
+                "1 1 0 - VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV A RRSIG",
             )
             answer_response.authority.append(nsec3)
             answer_response.authority.append(leaf.sign(nsec3))
@@ -988,14 +997,14 @@ class TestUnverifiableZoneResolvesAsUnsigned:
     @staticmethod
     def _unverifiable(resolver: RecursiveResolver, leaf: SignedZone):
         """Make only the leaf zone's keys unverifiable; the root stays sound."""
-        real = resolver._validator.validate_dnskey
+        real = resolver._validator.check_dnskey
 
         def stub(zone, dnskey_rrset, rrsig_rrset, ds_rdataset, budget=None):
             if zone == leaf.name:
-                return ValidationState.INSECURE
+                return ValidationState.INSECURE, None
             return real(zone, dnskey_rrset, rrsig_rrset, ds_rdataset, budget=budget)
 
-        return patch.object(resolver._validator, "validate_dnskey", side_effect=stub)
+        return patch.object(resolver._validator, "check_dnskey", side_effect=stub)
 
     def test_a_positive_answer_is_insecure(self) -> None:
         def answer(leaf: SignedZone):
@@ -1558,6 +1567,29 @@ class TestSignedDNAME:
         resolver = RecursiveResolver(dnssec=True, cache_enabled=False)
         with pytest.raises((DNSSECValidationError, DNSSECMaterialUnavailableError)):
             self._validate(resolver, zone, [self._dname(zone)])
+
+    def test_a_cname_query_below_a_dname_gets_the_synthesised_cname(self, zone: SignedZone) -> None:
+        """The answer to a CNAME query here is the CNAME the DNAME implies, authenticated by it."""
+        resolver = RecursiveResolver(dnssec=True, cache_enabled=False)
+        dname = self._dname(zone)
+        response = make_response()
+        response.answer = [dname, zone.sign(dname), rrset_of(str(self.QNAME), "CNAME", "elsewhere.test.")]
+        classification = resolver._classify_response(response, self.QNAME, dns.rdatatype.CNAME, zone.name)
+        assert classification["type"] == "answer"
+        assert str(classification["rrset"][0].target) == "foo.target.example.test."
+        with patch.object(resolver, "_get_zone_keys", return_value=_zone_keys(zone)):
+            answer = resolver._handle_answer(
+                response,
+                classification,
+                self.QNAME,
+                dns.rdatatype.CNAME,
+                resolver._new_context(),
+                zone.name,
+                ["9.9.9.9"],
+                ValidationState.SECURE,
+                None,
+            )
+        assert answer.dnssec is ValidationState.SECURE
 
     def test_a_dname_signed_by_another_zone_is_bogus(self, zone: SignedZone) -> None:
         other = SignedZone.create("elsewhere.test.")

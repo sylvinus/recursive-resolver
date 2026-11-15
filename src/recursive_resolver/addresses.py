@@ -18,7 +18,7 @@ did not always refuse. Two kinds: addresses that look public but serve instance
 metadata (Azure's ``168.63.129.16``), and the IPv6 transition prefixes that
 carry an IPv4 address inside them. CVE-2024-4032 corrected
 ``is_private``/``is_global`` for several of those prefixes, so an interpreter
-older than 3.10.14 does not agree with a current one about, say,
+older than 3.11.10 does not agree with a current one about, say,
 ``2002:a9fe:a9fe::1`` - link-local metadata wrapped in 6to4. The rest of the
 family a current stdlib does refuse; they are listed anyway, as policy, because
 none of them is a nameserver location and the control should not read

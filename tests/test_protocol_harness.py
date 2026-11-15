@@ -17,6 +17,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import dns.flags
+import dns.message
 import dns.name
 import dns.rcode
 import dns.rdatatype
@@ -26,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 from audit import Fetch, Ledger, audited  # noqa: E402
 from cassette import apply_fault, outcome_of, transition_allowed  # noqa: E402
+from mutation_check import PYTEST_EXIT_CODES, copy_package, run, unit_command  # noqa: E402
 from verdict_harness import (  # noqa: E402
     BOGUS,
     FAILED,
@@ -41,6 +43,7 @@ from verdict_harness import (  # noqa: E402
     gates_release,
     leaked,
     our_outcome,
+    reference_verdict,
 )
 
 from recursive_resolver import (  # noqa: E402
@@ -225,6 +228,48 @@ class TestReferencePanel:
         panel = self._panel("bogus", "insecure", "insecure", "insecure", "insecure")
         assert compare(Outcome("insecure", ""), panel) == ""
 
+    def test_a_reference_that_could_not_resolve_it_is_no_verdict_on_our_answer(self) -> None:
+        """SERVFAIL under CD too: a nameserver that mostly times out, not a signature."""
+        panel = self._panel("servfail", "servfail", "timeout", "timeout", "timeout")
+        assert compare(Outcome("insecure", ""), panel) == ""
+        assert compare(Outcome(NODATA, ""), panel) == ""
+        panel = self._panel("servfail", "servfail", "insecure", "timeout", "timeout")
+        assert compare(Outcome("insecure", ""), panel) == ""
+
+    def test_nor_does_it_dilute_the_references_that_did_reach_one(self) -> None:
+        panel = self._panel("bogus", "bogus", "servfail", "servfail", "insecure")
+        assert compare(Outcome(NODATA, ""), panel) == "we-answered-they-refused"
+
+    def test_it_still_agrees_with_a_refusal_or_a_failure_of_ours(self) -> None:
+        panel = self._panel("bogus", "servfail", "servfail", "servfail", "insecure")
+        assert compare(Outcome(BOGUS, ""), panel) == ""
+        assert compare(Outcome(FAILED, ""), panel) == ""
+        panel = self._panel("servfail", "servfail", "servfail", "servfail", "insecure")
+        assert compare(Outcome(FAILED, ""), panel) == ""
+
+    @staticmethod
+    def _asked(under_cd: dns.rcode.Rcode) -> dict[str, str]:
+        """Three references that SERVFAIL, then answer ``under_cd`` with CD=1."""
+
+        def answer(query: dns.message.Message, server: str, timeout: float) -> tuple[dns.message.Message, bool]:
+            response = dns.message.make_response(query)
+            response.set_rcode(under_cd if query.flags & dns.flags.CD else dns.rcode.SERVFAIL)
+            return response, False
+
+        with patch("verdict_harness.dns.query.udp_with_fallback", side_effect=answer):
+            return {ref: reference_verdict("gone.test.", "A", ref, 1.0) for ref in ("ref0", "ref1", "ref2")}
+
+    def test_a_denial_refused_until_cd_is_a_refusal(self) -> None:
+        """NXDOMAIN under CD: the references resolved the name and refused its denial."""
+        panel = self._asked(dns.rcode.NXDOMAIN)
+        assert set(panel.values()) == {BOGUS}
+        assert compare(Outcome(NXDOMAIN, ""), panel) == "we-answered-they-refused"
+
+    def test_a_servfail_that_stays_one_under_cd_is_not(self) -> None:
+        panel = self._asked(dns.rcode.SERVFAIL)
+        assert set(panel.values()) == {"servfail"}
+        assert compare(Outcome(NXDOMAIN, ""), panel) == ""
+
 
 class TestEveryDisagreementIsClassified:
     """A label `compare` can return must be a deliberate gate-or-not decision.
@@ -349,3 +394,17 @@ class TestALeakedExceptionFailsTheRun:
         panel = {"ref0": "servfail", "ref1": "servfail", "ref2": "servfail"}
         assert compare(Outcome(LEAKED, ""), panel) == ""
         assert gates_release("we-leaked-a-non-resolver-error")
+
+
+class TestTheMutationCheckCanTellMutantsApart:
+    """A suite that cannot start in the copy reads as every mutant caught.
+
+    Under -x pytest exits 1 for a module it cannot import, the same as for a
+    failed test. One such module had the whole catalogue reported as caught by
+    the unit suite, a comment-only change included.
+    """
+
+    def test_the_copied_suite_collects(self, tmp_path: Path) -> None:
+        copy_package(tmp_path)
+        command = [*unit_command(sys.executable, tmp_path), "--collect-only"]
+        assert run(command, tmp_path, tmp_path, expected=PYTEST_EXIT_CODES)

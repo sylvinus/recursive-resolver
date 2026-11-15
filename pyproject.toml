@@ -8,12 +8,12 @@ build-backend = "hatchling.build"
 
 [project]
 name = "recursive-resolver"
-version = "0.2.0"
+version = "0.3.0"
 description = "Pure-Python iterative DNS resolver: resolves from the root servers with DNSSEC validation"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE", "THIRD-PARTY.md"]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 authors = [
     { name = "Sylvain Zimmer", email = "sylvain@sylvainzimmer.com" },
 ]
@@ -26,32 +26,32 @@ classifiers = [
     # `license = "MIT"` expression above, which PyPI reads instead.
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Topic :: Internet :: Name Service (DNS)",
     "Topic :: System :: Networking",
     "Topic :: Security",
     "Typing :: Typed",
 ]
 dependencies = [
-    # >=2.6.1 is a security floor: 2.6.0 and earlier are affected by
-    # CVE-2023-29483 (TuDoor), and 2.6.0 additionally regressed truncation
-    # handling, which breaks UDP->TCP failover. 2.7.0 is the first release
-    # with the EDNS and DNSSEC behaviour this package relies on; 2.8.0 (Sep 2025)
-    # is the current release and there are no advisories after 2.6.1.
+    # >=2.9.2 is a security floor: earlier releases are affected by
+    # CVE-2026-114605 (CPU exhaustion on crafted name compression, reachable
+    # from any authoritative server we query) and CVE-2026-128089. See the
+    # README and SECURITY.md. dnspython 2.9 requires Python 3.11.
     # The dnssec extra pulls in `cryptography` (DNSSEC validation) and the
     # idna extra pulls in `idna` (IDNA 2008; without it, internationalised
     # names fall back to IDNA 2003 and resolve to different domains).
-    "dnspython[dnssec,idna]>=2.8.0",
+    "dnspython[dnssec,idna]>=2.9.2",
 ]
 
 [project.optional-dependencies]
 # Kept as an explicit extra so `pip install recursive-resolver[dnssec]` works
 # for anyone pinning the base dnspython without extras.
-dnssec = ["cryptography>=42"]
+# >=50 matches dnspython 2.9, which disables DNSSEC with an older cryptography.
+dnssec = ["cryptography>=50"]
 
 [project.urls]
 Homepage = "https://github.com/sylvinus/recursive-resolver"
@@ -83,8 +83,10 @@ include = [
     "/CHANGELOG.md",
     "/SECURITY.md",
     "/CONTRIBUTING.md",
+    "/TESTING.md",
     "/THIRD-PARTY.md",
     "/Makefile",
+    "/Dockerfile",
 ]
 
 [tool.pytest.ini_options]
@@ -116,14 +118,14 @@ exclude_also = [
 ]
 
 [tool.ruff]
-target-version = "py310"
+target-version = "py311"
 line-length = 120
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "B", "SIM"]
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.11"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true

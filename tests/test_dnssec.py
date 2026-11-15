@@ -14,7 +14,6 @@ import dns.rdataset
 import dns.rdatatype
 import dns.rrset
 import pytest
-from dns.rdtypes.ANY.NSEC3 import b32_normal_to_hex
 
 from recursive_resolver import ValidationState
 from recursive_resolver.dnssec import (
@@ -178,21 +177,21 @@ class TestNSEC3:
 
     def test_iteration_cap_rejects_absurd_values(self) -> None:
         v = DNSSECValidator()
-        nsec3 = self._nsec3("example.com.", "AAAA", "ZZZZ", "NS", iterations=MAX_NSEC3_ITERATIONS + 1)
+        nsec3 = self._nsec3("example.com.", "AAAA", "VVVG", "NS", iterations=MAX_NSEC3_ITERATIONS + 1)
         v._validated_nsec_rrsets = lambda authority, keys, rdtype, budget=None: (  # type: ignore[method-assign]
             [nsec3] if rdtype == dns.rdatatype.NSEC3 else []
         )
         assert not v.prove_no_ds(dns.name.from_text("child.example.com."), [], {})
 
     def test_opt_out_flag_is_recognised(self) -> None:
-        nsec3 = self._nsec3("example.com.", "AAAA", "ZZZZ", "NS", flags=NSEC3_OPT_OUT)
+        nsec3 = self._nsec3("example.com.", "AAAA", "VVVG", "NS", flags=NSEC3_OPT_OUT)
         assert nsec3[0].flags & NSEC3_OPT_OUT
 
     def test_next_hash_round_trips_through_base32hex(self) -> None:
         """The decoder must match dnspython's own presentation encoding."""
         nsec3 = self._nsec3("example.com.", "AAAA", "2VPTU5TIMAMQTTGL4LUU9KG21E0AOR3S", "A RRSIG")
         params = nsec3[0]
-        encoded = base64.b32encode(params.next).translate(b32_normal_to_hex).decode("ascii")
+        encoded = base64.b32hexencode(params.next).decode("ascii")
         assert encoded.lower() == params.to_text().split()[4].lower()
 
 
@@ -238,7 +237,7 @@ class TestValidatorBasics:
         assert v.validate_rrset(data, sig, {dns.name.from_text("example.com."): data}) is False
 
     def test_validation_states(self) -> None:
-        assert {s.value for s in ValidationState} == {"secure", "insecure", "bogus"}
+        assert {s.value for s in ValidationState} == {"secure", "insecure", "bogus", "disabled"}
 
     def test_cryptography_is_available_in_the_test_env(self) -> None:
         assert cryptography_available() is True
@@ -433,6 +432,8 @@ class TestKeyTrapHardening:
 
 
 def _nsec3(zone: str, owner_hash: str, next_b32: str, types: str, flags: int = 0, iterations: int = 10):
+    # dnspython >= 2.9 requires next_b32 to be canonical base32hex: "VVVG" is
+    # 0xFFFF, "VVVV" would leave non-zero unused bits.
     return rrset(f"{owner_hash}.{zone}", "NSEC3", f"1 {flags} {iterations} AABBCCDD {next_b32} {types}")
 
 
@@ -472,19 +473,17 @@ def _stub_nsec(v, nsecs=(), nsec3s=()):
 
 class TestValidatorEdgeCases:
     def test_cryptography_unavailable_is_reported(self) -> None:
-        import builtins
+        """What counts is whether dnspython enabled DNSSEC, not whether the package imports.
 
+        dnspython switches its DNSSEC code off when `cryptography` is older than
+        it needs, and an importable but too-old package used to let the
+        resolver start and then fail every lookup as if under attack.
+        """
         from recursive_resolver.dnssec import cryptography_available
 
-        real_import = builtins.__import__
-
-        def blocked(name, *args, **kwargs):
-            if name == "cryptography":
-                raise ImportError("blocked")
-            return real_import(name, *args, **kwargs)
-
-        with patch.object(builtins, "__import__", blocked):
+        with patch("dns._features.have", side_effect=lambda feature: feature != "dnssec"):
             assert cryptography_available() is False
+        assert cryptography_available() is True
 
     def test_trim_keyring_skips_empty_keysets(self) -> None:
         from recursive_resolver.dnssec import _trim_keyring
@@ -524,9 +523,18 @@ class TestValidatorEdgeCases:
         v = DNSSECValidator()
         keys = TestKeyTrapHardening._dnskey_rrset(1)
         ds = dns.rdataset.Rdataset(dns.rdataclass.IN, dns.rdatatype.DS)
+        # Digest type 3 is GOST R 34.11-94, which dnspython cannot compute.
+        ds.add(dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.DS, "12345 8 3 " + "AB" * 32), ttl=300)
+        assert v.validate_dnskey(dns.name.from_text("evil.test."), keys, None, ds) is ValidationState.INSECURE
+
+    def test_a_supported_digest_that_fails_to_compute_is_bogus_not_insecure(self) -> None:
+        """Only the DS decides what is unverifiable; a key we cannot digest is just a mismatch."""
+        v = DNSSECValidator()
+        keys = TestKeyTrapHardening._dnskey_rrset(1)
+        ds = dns.rdataset.Rdataset(dns.rdataclass.IN, dns.rdatatype.DS)
         ds.add(dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.DS, "12345 8 2 " + "AB" * 32), ttl=300)
-        with patch("dns.dnssec.make_ds", side_effect=ValueError("unsupported digest")):
-            assert v.validate_dnskey(dns.name.from_text("evil.test."), keys, None, ds) is ValidationState.INSECURE
+        with patch("dns.dnssec.make_ds", side_effect=ValueError("broken key")):
+            assert v.validate_dnskey(dns.name.from_text("evil.test."), keys, None, ds) is ValidationState.BOGUS
 
     def test_single_nsec_zone_covers_everything_but_its_owner(self) -> None:
         v = DNSSECValidator()
@@ -536,16 +544,20 @@ class TestValidatorEdgeCases:
 
     def test_nsec3_hash_failure_is_handled(self) -> None:
         v = DNSSECValidator()
-        n3 = _nsec3("example.com.", "AAAA", "ZZZZ", "NS")
+        n3 = _nsec3("example.com.", "AAAA", "VVVG", "NS")
         with patch("dns.dnssec.nsec3_hash", side_effect=ValueError("bad salt")):
             assert v._nsec3_owner(dns.name.from_text("x.example.com."), n3.name, n3[0]) is None
             assert v._nsec3_covers(dns.name.from_text("x.example.com."), n3, n3[0]) is False
 
     def test_undecodable_next_hash_is_handled(self) -> None:
         v = DNSSECValidator()
-        n3 = _nsec3("example.com.", "AAAA", "ZZZZ", "NS")
-        with patch("base64.b32encode", side_effect=TypeError("bad bytes")):
+        n3 = _nsec3("example.com.", "AAAA", "VVVG", "NS")
+        # Only our module's base64: dns.dnssec.nsec3_hash uses it too, and
+        # failing there would test the hashing branch instead.
+        with patch("recursive_resolver.dnssec.base64") as b64:
+            b64.b32hexencode.side_effect = TypeError("bad bytes")
             assert v._nsec3_covers(dns.name.from_text("x.example.com."), n3, n3[0]) is False
+        b64.b32hexencode.assert_called_once()
 
 
 class TestNoDSProofBranches:
@@ -572,7 +584,7 @@ class TestNoDSProofBranches:
         v = DNSSECValidator()
         child = dns.name.from_text("child.example.com.")
         digest = dns.dnssec.nsec3_hash(child, "AABBCCDD", 10, 1)
-        n3 = _nsec3("example.com.", digest, "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ", "NS RRSIG")
+        n3 = _nsec3("example.com.", digest, "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV", "NS RRSIG")
         _stub_nsec(v, nsec3s=[n3])
         assert v.prove_no_ds(child, [], {}) is True
 
@@ -580,7 +592,7 @@ class TestNoDSProofBranches:
         v = DNSSECValidator()
         child = dns.name.from_text("child.example.com.")
         digest = dns.dnssec.nsec3_hash(child, "AABBCCDD", 10, 1)
-        n3 = _nsec3("example.com.", digest, "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ", "NS DS RRSIG")
+        n3 = _nsec3("example.com.", digest, "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV", "NS DS RRSIG")
         _stub_nsec(v, nsec3s=[n3])
         assert v.prove_no_ds(child, [], {}) is False
 
@@ -687,7 +699,7 @@ class TestNXDOMAINProofBranches:
 
     def test_nsec3_iteration_cap(self) -> None:
         v = DNSSECValidator()
-        n3 = _nsec3("example.com.", "AAAA", "ZZZZ", "A", iterations=MAX_NSEC3_ITERATIONS + 1)
+        n3 = _nsec3("example.com.", "AAAA", "VVVG", "A", iterations=MAX_NSEC3_ITERATIONS + 1)
         _stub_nsec(v, nsec3s=[n3])
         assert v.prove_nxdomain(dns.name.from_text("x.example.com."), [], {}) is ValidationState.BOGUS
 
@@ -732,7 +744,7 @@ class TestNODATAProofBranches:
         v = DNSSECValidator()
         qname = dns.name.from_text("x.example.com.")
         digest = dns.dnssec.nsec3_hash(qname, "AABBCCDD", 10, 1)
-        n3 = _nsec3("example.com.", digest, "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ", "A RRSIG")
+        n3 = _nsec3("example.com.", digest, "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV", "A RRSIG")
         _stub_nsec(v, nsec3s=[n3])
         assert v.prove_nodata(qname, dns.rdatatype.MX, [], {}) is ValidationState.SECURE
 
@@ -740,13 +752,13 @@ class TestNODATAProofBranches:
         v = DNSSECValidator()
         qname = dns.name.from_text("x.example.com.")
         digest = dns.dnssec.nsec3_hash(qname, "AABBCCDD", 10, 1)
-        n3 = _nsec3("example.com.", digest, "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ", "A MX RRSIG")
+        n3 = _nsec3("example.com.", digest, "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV", "A MX RRSIG")
         _stub_nsec(v, nsec3s=[n3])
         assert v.prove_nodata(qname, dns.rdatatype.MX, [], {}) is ValidationState.BOGUS
 
     def test_nsec3_iteration_cap(self) -> None:
         v = DNSSECValidator()
-        n3 = _nsec3("example.com.", "AAAA", "ZZZZ", "A", iterations=MAX_NSEC3_ITERATIONS + 1)
+        n3 = _nsec3("example.com.", "AAAA", "VVVG", "A", iterations=MAX_NSEC3_ITERATIONS + 1)
         _stub_nsec(v, nsec3s=[n3])
         assert v.prove_nodata(dns.name.from_text("x.example.com."), dns.rdatatype.MX, [], {}) is ValidationState.BOGUS
 
@@ -758,7 +770,7 @@ class TestNODATAProofBranches:
         lo, hi = "0" * 32, "V" * 32
         assert lo < nc_hash < hi
         return [
-            _nsec3("example.com.", apex_hash, "Z" * 32, "A SOA RRSIG"),
+            _nsec3("example.com.", apex_hash, "V" * 32, "A SOA RRSIG"),
             _nsec3("example.com.", lo, hi, "NS", flags=NSEC3_OPT_OUT),
         ]
 
@@ -1217,22 +1229,28 @@ class TestOptOutNXDOMAINIsNotAuthenticated:
     QNAME = dns.name.from_text("x.example.")
 
     @staticmethod
-    def _proof(opt_out: bool):
+    def _proof(opt_out: bool, wildcard_opt_out: bool = False):
         def hashed(name: str) -> str:
             return dns.dnssec.nsec3_hash(dns.name.from_text(name), "AABBCCDD", 10, 1)
 
         apex, nc, wild = hashed("example."), hashed("x.example."), hashed("*.example.")
         flags = NSEC3_OPT_OUT if opt_out else 0
+        wild_flags = NSEC3_OPT_OUT if wildcard_opt_out else 0
         # Each record brackets one name, so the three roles cannot overlap.
         return [
             _nsec3("example.", apex, _successor(apex), "NS SOA RRSIG DNSKEY"),
             _nsec3("example.", _predecessor(nc), _successor(nc), "NS", flags=flags),
-            _nsec3("example.", _predecessor(wild), _successor(wild), "A RRSIG"),
+            _nsec3("example.", _predecessor(wild), _successor(wild), "A RRSIG", flags=wild_flags),
         ]
 
     def test_an_opt_out_cover_for_the_next_closer_is_insecure(self) -> None:
         v = DNSSECValidator()
         _stub_nsec(v, nsec3s=self._proof(opt_out=True))
+        assert v.prove_nxdomain(self.QNAME, [], {}) is ValidationState.INSECURE
+
+    def test_an_opt_out_cover_for_the_wildcard_is_insecure_too(self) -> None:
+        v = DNSSECValidator()
+        _stub_nsec(v, nsec3s=self._proof(opt_out=False, wildcard_opt_out=True))
         assert v.prove_nxdomain(self.QNAME, [], {}) is ValidationState.INSECURE
 
     def test_the_same_proof_without_opt_out_is_secure(self) -> None:
@@ -1374,6 +1392,15 @@ class TestWildcardNODATA:
         _stub_nsec(v, nsecs=[covering, wildcard])
         assert v.prove_nodata(dns.name.from_text("x.example.com."), dns.rdatatype.TXT, [], {}) is ValidationState.SECURE
 
+    def test_nsec_wildcard_two_labels_above_the_name_proves_nodata(self) -> None:
+        """The wildcard sits at the closest encloser, which need not be the parent."""
+        v = DNSSECValidator()
+        covering = rrset("a.example.com.", "NSEC", "y.example.com. A RRSIG NSEC")
+        wildcard = rrset("*.example.com.", "NSEC", "a.example.com. A AAAA RRSIG NSEC")
+        _stub_nsec(v, nsecs=[covering, wildcard])
+        qname = dns.name.from_text("p.x.example.com.")
+        assert v.prove_nodata(qname, dns.rdatatype.TXT, [], {}) is ValidationState.SECURE
+
     def test_nsec_wildcard_holding_the_type_proves_nothing(self) -> None:
         v = DNSSECValidator()
         covering = rrset("a.example.com.", "NSEC", "y.example.com. A RRSIG NSEC")
@@ -1425,7 +1452,7 @@ class TestTrimmingGuards:
 
     def test_unhashable_name_is_skipped_in_the_no_ds_proof(self) -> None:
         v = DNSSECValidator()
-        n3 = _nsec3("example.com.", "AAAA", "ZZZZ", "NS")
+        n3 = _nsec3("example.com.", "AAAA", "VVVG", "NS")
         _stub_nsec(v, nsec3s=[n3])
         with patch("dns.dnssec.nsec3_hash", side_effect=ValueError("bad salt")):
             assert v.prove_no_ds(dns.name.from_text("child.example.com."), [], {}) is False
@@ -1434,7 +1461,7 @@ class TestTrimmingGuards:
         """A next-hashed-owner that is not decodable must fail closed."""
 
         class _BadRdata:
-            next = "not-bytes"  # b32encode expects bytes and will raise
+            next = "not-bytes"  # b32hexencode expects bytes and will raise
             salt = "AABBCCDD"
             iterations = 10
             algorithm = 1
@@ -1501,7 +1528,7 @@ class TestWildcardProofNSEC3:
     def test_a_covering_nsec3_proves_the_expansion(self) -> None:
         v = DNSSECValidator()
         covering = _nsec3(
-            "example.test.", "00000000000000000000000000000000", "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ", "A RRSIG"
+            "example.test.", "00000000000000000000000000000000", "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV", "A RRSIG"
         )
         _stub_nsec(v, nsec3s=[covering])
         assert v.prove_wildcard(self.QNAME, self.LABELS, [], {}) is ValidationState.SECURE
@@ -1518,7 +1545,7 @@ class TestWildcardProofNSEC3:
         covering = _nsec3(
             "example.test.",
             "00000000000000000000000000000000",
-            "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ",
+            "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV",
             "A RRSIG",
             flags=1,
         )
@@ -1528,10 +1555,10 @@ class TestWildcardProofNSEC3:
     def test_a_non_opt_out_cover_alongside_an_opt_out_one_still_proves_it(self) -> None:
         v = DNSSECValidator()
         opt_out = _nsec3(
-            "example.test.", "00000000000000000000000000000000", "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ", "A RRSIG", flags=1
+            "example.test.", "00000000000000000000000000000000", "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV", "A RRSIG", flags=1
         )
         solid = _nsec3(
-            "example.test.", "00000000000000000000000000000000", "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ", "A RRSIG"
+            "example.test.", "00000000000000000000000000000000", "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV", "A RRSIG"
         )
         _stub_nsec(v, nsec3s=[opt_out, solid])
         assert v.prove_wildcard(self.QNAME, self.LABELS, [], {}) is ValidationState.SECURE
@@ -1540,7 +1567,7 @@ class TestWildcardProofNSEC3:
         """A record whose owner IS the hash proves the name exists, not that it does not."""
         v = DNSSECValidator()
         digest = dns.dnssec.nsec3_hash(self.QNAME, "AABBCCDD", 10, 1)
-        matching = _nsec3("example.test.", digest, "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ", "A RRSIG")
+        matching = _nsec3("example.test.", digest, "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV", "A RRSIG")
         _stub_nsec(v, nsec3s=[matching])
         assert v.prove_wildcard(self.QNAME, self.LABELS, [], {}) is ValidationState.BOGUS
 
@@ -1553,7 +1580,7 @@ class TestWildcardProofNSEC3:
         """labels >= the owner's label count is not a wildcard expansion at all."""
         v = DNSSECValidator()
         covering = _nsec3(
-            "example.test.", "00000000000000000000000000000000", "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ", "A RRSIG"
+            "example.test.", "00000000000000000000000000000000", "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV", "A RRSIG"
         )
         _stub_nsec(v, nsec3s=[covering])
         assert v.prove_wildcard(self.QNAME, 3, [], {}) is ValidationState.BOGUS
@@ -1688,7 +1715,7 @@ class TestNSEC3IterationCapActuallyBites:
             covering = _nsec3(
                 self.ZONE,
                 "00000000000000000000000000000000",
-                "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ",
+                "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV",
                 "A RRSIG",
                 iterations=iterations,
             )
